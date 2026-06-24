@@ -769,14 +769,31 @@ def _format_recent_approval_feedback(limit: int = 20) -> str:
     return "\n".join(lines)
 
 
+_REGISTRY_TERMINAL_STATUSES = {"archived", "rejected"}
+_REGISTRY_MAX_ROWS = 150
+
+
 def _format_strategy_registry() -> str:
-    """Format strategy registry for context."""
-    strategies = get_strategies()
+    """Format the ACTIVE strategy registry for context.
+
+    Excludes terminal strategies (archived / rejected). They accumulate without
+    bound — once the table held ~4K rows, dumping every one ballooned the Brain
+    prompt to ~79K tokens, burying the model (near-empty outputs) and burning
+    provider quota. Only live/in-flight strategies inform Brain decisions, and a
+    hard cap keeps the block bounded even as the active set grows. get_strategies()
+    returns rows ordered by ``updated_at DESC``, so the cap retains the most
+    recently-touched strategies and notes how many were elided.
+    """
+    strategies = [
+        s for s in get_strategies()
+        if str(s.get("status") or "").strip().lower() not in _REGISTRY_TERMINAL_STATUSES
+    ]
     if not strategies:
         return ""
 
+    total = len(strategies)
     lines = ["# STRATEGIES"]
-    for s in strategies:
+    for s in strategies[:_REGISTRY_MAX_ROWS]:
         metrics = _coerce_metrics(s.get("metrics"))
 
         fitness = metrics.get("fitness_score", "?")
@@ -785,6 +802,11 @@ def _format_strategy_registry() -> str:
             f"- [{s.get('status', '?')}] {s.get('name', s['id'])} "
             f"| Fitness: {fitness} | Sharpe: {sharpe} "
             f"| {s.get('symbol', '')} {s.get('timeframe', '')}"
+        )
+    if total > _REGISTRY_MAX_ROWS:
+        lines.append(
+            f"- … and {total - _REGISTRY_MAX_ROWS} more active strategies "
+            f"(showing the {_REGISTRY_MAX_ROWS} most recently updated)"
         )
     return "\n".join(lines)
 
