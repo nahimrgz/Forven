@@ -310,10 +310,17 @@ def _setup_tool_loop(monkeypatch, impls: dict, executed: list):
     monkeypatch.setattr(runner, "_provider_has_credentials", lambda p: True)
     monkeypatch.setattr(runner, "_resolve_backup_provider", lambda p: None)
     monkeypatch.setattr(runner, "normalize_provider_and_model", lambda p, m: (p, m))
-    monkeypatch.setattr(
-        runner, "get_fallback_chain",
-        lambda p: [("openai", "gpt-5.2"), ("minimax", "MiniMax-M2.5")],
-    )
+    # _resolve_tool_call_chain no longer reads the per-provider default chain
+    # (those are fail-closed now); it uses the primary + the agent's explicit
+    # per-slot fallbacks. Simulate an operator-configured fallback so this helper
+    # still exercises the runner's multi-provider fallback loop.
+    def _chain(provider, model_id, agent_id=None):
+        chain = [(provider, model_id)]
+        for entry in (("openai", "gpt-5.2"), ("minimax", "MiniMax-M2.5")):
+            if entry not in chain:
+                chain.append(entry)
+        return chain
+    monkeypatch.setattr(runner, "_resolve_tool_call_chain", _chain)
     monkeypatch.setattr(auth_store, "get_token", lambda p: "tok")
     monkeypatch.setattr(billing_guard, "check_daily_cost_cap", lambda: (True, ""))
     monkeypatch.setattr(providers_mod, "get_provider", lambda p: impls[p])

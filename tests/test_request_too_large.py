@@ -85,14 +85,14 @@ def test_spend_cap_is_not_request_too_large():
     assert ai._is_quota_exhausted(err) is True
 
 
-def test_groq_fallback_chain_routes_to_gemini():
+def test_groq_fallback_chain_is_self_only():
     from forven.model_routing import get_fallback_chain
 
     chain = get_fallback_chain("groq")
     providers = [entry[0] if isinstance(entry, tuple) else entry.get("provider") for entry in chain]
-    assert "gemini" in providers
-    # Gemini (free, large context) must come before any paid provider.
-    assert providers.index("gemini") < providers.index("openai")
+    # Fail-closed default: no auto cross-provider fallback (groq used to degrade
+    # to Gemini). Operators opt into a fallback per-slot in the Routing tab.
+    assert providers == ["groq"]
 
 
 def test_provider_quota_alert_dedupes(forven_db):

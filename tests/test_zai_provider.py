@@ -48,8 +48,8 @@ def test_zai_fallback_chain_exists():
     assert "zai" in _DEFAULT_MODEL_ROUTING["fallback_chains"]
     chain = _DEFAULT_MODEL_ROUTING["fallback_chains"]["zai"]
     providers_in_chain = [entry["provider"] for entry in chain]
-    assert "zai" in providers_in_chain
-    assert "openai" in providers_in_chain
+    # Self-only (fail-closed) by default — no auto cross-provider fallback.
+    assert providers_in_chain == ["zai"]
 
 
 # Task 2 tests
