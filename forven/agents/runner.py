@@ -557,9 +557,18 @@ def _exception_summary(error: Exception) -> str:
 def _error_detail(error: Exception, body_limit: int = 4000) -> str:
     """Like _exception_summary but APPENDS the provider's HTTP response BODY when
     present — so a bare '400 Bad Request for url X' becomes the actual reason the
-    provider rejected the call (e.g. 'model not loaded', 'unknown parameter'). This
-    is what turns an opaque provider failure into a diagnosable one in the Logs tab."""
+    provider rejected the call (e.g. 'model not loaded', 'unknown parameter').
+
+    SECRET-REDACTED at the source (forven.redact): this string is persisted to
+    agent_tasks.output_data, surfaced in the Logs "calls" view, AND (via the
+    per-attempt log_activity warning) written to activity_log which live_ws.py
+    broadcasts over the live WebSocket — so a provider error body that echoes a
+    key/token must be scrubbed before it leaves this function. This is the single
+    chokepoint for every error-body consumer (trace, failure detail, the warning)."""
+    from forven.redact import redact
+
     summary = _exception_summary(error)
+    detail = summary
     for current in _walk_exception_chain(error):
         response = getattr(current, "response", None)
         if response is None:
@@ -569,8 +578,9 @@ def _error_detail(error: Exception, body_limit: int = 4000) -> str:
         except Exception:
             body = ""
         if body:
-            return f"{summary}\n{body[:body_limit]}"
-    return summary
+            detail = f"{summary}\n{body[:body_limit]}"
+            break
+    return redact(detail)[0]
 
 
 def _requeue_agent_task(
@@ -1260,7 +1270,8 @@ async def _run_agent_task_inner(
         output = {"response": response, "completed_at": datetime.now(timezone.utc).isoformat()}
         # Request + per-provider attempt trace so the Logs tab can show the full
         # request -> response back-and-forth (incl. any fallback hops).
-        output["request"] = {"system": (context or "")[:12000], "messages": messages}
+        from forven.redact import redact_dict
+        output["request"] = redact_dict({"system": (context or "")[:12000], "messages": messages})[0]
         if ai_trace:
             output["ai_trace"] = ai_trace
         if tool_trace:
@@ -1486,16 +1497,18 @@ async def _run_agent_task_inner(
         # FAILED task is diagnosable in the Logs tab — the primary's error (e.g. GLM)
         # survives even when a configured fallback (e.g. LM Studio) masks it with its own.
         try:
+            from forven.redact import redact_dict
+
             _fail_trace = getattr(e, "ai_attempts", [])
             with get_db() as conn:
                 conn.execute(
                     "UPDATE agent_tasks SET output_data=? WHERE id=?",
                     (json.dumps({
-                        "request": {
+                        "request": redact_dict({
                             "title": task.get("title"),
                             "description": task.get("description"),
                             "input_data": input_data,
-                        },
+                        })[0],
                         "ai_trace": _fail_trace,
                         "error_detail": _error_detail(e),
                     }), task_id),

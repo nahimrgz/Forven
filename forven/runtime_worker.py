@@ -1005,6 +1005,15 @@ async def _run_brain_task(task: dict) -> None:
     if post_mortems:
         _clear_post_mortems()
 
+    from forven.redact import redact_dict
+
+    # Scrub any secret-shaped content from the persisted Brain request before it lands
+    # in tasks.result and the Logs "calls" view (defense-in-depth; the system context
+    # carries no credentials today, but redact_dict matches the codebase convention).
+    _brain_request, _ = redact_dict({
+        "system": (context or "")[:12000],
+        "messages": [{"role": "user", "content": message}],
+    })
     with get_db() as conn:
         conn.execute(
             "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
@@ -1012,10 +1021,7 @@ async def _run_brain_task(task: dict) -> None:
                 datetime.now(timezone.utc).isoformat(),
                 json.dumps({
                     "response": _brain_response_text(response),
-                    "request": {
-                        "system": (context or "")[:12000],
-                        "messages": [{"role": "user", "content": message}],
-                    },
+                    "request": _brain_request,
                     "ai_trace": brain_trace,
                 }),
                 task["id"],

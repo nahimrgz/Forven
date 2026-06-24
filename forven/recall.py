@@ -305,10 +305,12 @@ def _record_cost_row(
     # Logs tab "Recent calls" view shows the recall back-and-forth, not just a blank
     # diagnostic row. (These are RAG memory lookups; the Brain's own reasoning is a
     # separate brain_invoke task.)
+    from forven.redact import redact
+
     output = json.dumps({
         "latency_ms": latency_ms,
-        "request": query[:6000],
-        "response": (summary or "")[:8000],
+        "request": redact(query[:6000])[0],
+        "response": redact((summary or "")[:8000])[0],
     })
     try:
         with get_db() as conn:

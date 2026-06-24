@@ -3208,9 +3208,29 @@ def _strict_robustness_reject(strategy_id: str, row, metrics: dict, config: dict
             return f"Live gate: Monte-Carlo percentile {float(pct):.0%} below {mc_min:.0%} target"
 
     cost = verdict_payloads.get("cost_stress")
-    if isinstance(cost, dict):
-        # Reworked: gate on SURVIVAL (positive stressed Sharpe) AND bounded degradation,
-        # not just an absolute floor.
+    cost_unusable = (
+        not isinstance(cost, dict)
+        or bool(cost.get("non_required_failure"))
+        or (cost.get("stressed_sharpe") is None and cost.get("degradation_pct") is None)
+    )
+    # FAIL CLOSED on a missing/errored cost_stress — but ONLY when the strategy actually
+    # ran the gauntlet (walk_forward present, since it is a required test). cost_stress is
+    # non-required at the gauntlet->paper gate (Default preset "achievable paper, strict
+    # live"), so an ERRORED probe (gauntlet._non_required_skip) leaves no usable survival
+    # result here; without this guard the cost-survival checks below silently no-op and a
+    # strategy whose edge does NOT survive 2x fees/slippage could graduate to REAL MONEY.
+    # Gating on wfa avoids over-blocking direct/test promotions that carry no gauntlet
+    # validations at all (cost would also be absent there, but for a benign reason). This
+    # runs only when live_strict_robustness_enabled, so failing closed is safe: the
+    # strategy stays in paper, no capital at risk, until a clean cost-stress result exists.
+    if isinstance(wfa, dict) and cost_unusable:
+        return (
+            "Live gate: cost-stress survival could not be verified (no usable cost_stress "
+            "result) — failing closed before real capital"
+        )
+    # Gate on SURVIVAL (positive stressed Sharpe) AND bounded degradation, not just an
+    # absolute floor.
+    if isinstance(cost, dict) and not cost_unusable:
         ss = cost.get("stressed_sharpe")
         cmin = float(rob.get("cost_stress_min_sharpe", 0.3))
         if ss is not None and float(ss) < cmin:
