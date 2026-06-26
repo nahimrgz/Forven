@@ -11,6 +11,7 @@
 		getReplayBars,
 		getSessionIndicators,
 		getTradeMarkers,
+		getPaperSessionChart,
 		getPaperTrades,
 		closePaperPosition,
 		partialClosePaperPosition,
@@ -200,6 +201,10 @@
 	let subIndicators: IndicatorConfig[] = [];
 	let entryMarkers: SignalMarker[] = [];
 	let exitMarkers: SignalMarker[] = [];
+	// Full-history strategy triggers (entry/exit signals incl. pre-live) + active
+	// position levels (SL/TP/trailing) — fed to the chart by the parity bundle.
+	let triggerMarkers: SignalMarker[] = [];
+	let positionPriceLines: Array<{ id: string; price: number; color?: string; title?: string; dashed?: boolean }> = [];
 	let blockedMarkers: TradeMarker[] = [];
 	let indicatorConfig: Record<string, SessionIndicatorConfig> = {};
 	let sessionIndicatorHistory: SessionIndicatorsResponse['indicators'] = {};
@@ -735,17 +740,11 @@
 	async function loadLiveChart() {
 		if (!selectedSession) return;
 		const sessionId = selectedSession.id;
-		const chartTimeframe = activeVisualChartTimeframe;
 		if (chartBars.length === 0) {
 			loadingBars = true;
 		}
 		try {
-			const liveBars = await getReplayBars(sessionId, 500, chartTimeframe);
-			if (selectedSession?.id !== sessionId) return;
-			chartBars = [...liveBars];
-			applyLatestRealtimeSnapshot();
-			loadingBars = false;
-			void loadIndicatorsAndMarkers(sessionId);
+			await loadChartBundle(sessionId);
 		} catch (e) {
 			console.error('Failed to load live chart:', e);
 		} finally {
@@ -1456,6 +1455,56 @@
 		}
 		lastIndicatorCursor = cursor;
 		await loadIndicatorsAndMarkers(sessionId);
+	}
+
+	// Parity overhaul: one bundle call returns bars + REAL registry indicators +
+	// full-history triggers + actual trade markers — all matching what paper trades.
+	async function loadChartBundle(sessionId: string) {
+		const chartTimeframe = activeVisualChartTimeframe;
+		let bundle;
+		try {
+			bundle = await getPaperSessionChart(sessionId, { limit: 2000, timeframe: chartTimeframe });
+		} catch (e) {
+			console.error('Failed to load chart bundle:', e);
+			return;
+		}
+		if (selectedSession?.id !== sessionId) return;
+
+		chartBars = [...(bundle.bars ?? [])];
+		applyLatestRealtimeSnapshot();
+		loadingBars = false;
+
+		const toConfig = (s: { name: string; panel: string; color?: string; data: Array<{ timestamp: string; value: number | null }> }): IndicatorConfig => ({
+			id: s.name,
+			name: s.name,
+			params: {},
+			color: s.color || getIndicatorColor(s.name),
+			panel: s.panel === 'main' ? 'main' : 'sub1',
+			visible: indicatorVisibility[s.name] ?? true,
+			data: s.data
+				.filter((p) => p.value !== null && p.value !== undefined)
+				.map((p) => ({ timestamp: p.timestamp, value: p.value as number })),
+		});
+		mainIndicators = (bundle.main_indicators ?? []).map(toConfig);
+		subIndicators = (bundle.sub_indicators ?? []).map(toConfig);
+		for (const s of [...(bundle.main_indicators ?? []), ...(bundle.sub_indicators ?? [])]) {
+			if (!(s.name in indicatorVisibility)) indicatorVisibility[s.name] = true;
+		}
+		indicatorVisibility = indicatorVisibility;
+
+		applyTradeMarkers({ entries: bundle.entry_markers ?? [], exits: bundle.exit_markers ?? [], blocked: [] });
+		triggerMarkers = [
+			...(bundle.trigger_entries ?? []).map((m) => toSignalMarker(m, 'entry')),
+			...(bundle.trigger_exits ?? []).map((m) => toSignalMarker(m, 'exit')),
+		];
+
+		// Active stop / take-profit / trailing lines for the open position.
+		const levels = bundle.active_levels ?? { stop: [], take_profit: [], trail: [] };
+		const lines: typeof positionPriceLines = [];
+		for (const s of levels.stop ?? []) lines.push({ id: 'sl', price: s.price, color: '#ef4444', title: 'SL' });
+		for (const t of levels.take_profit ?? []) lines.push({ id: 'tp', price: t.price, color: '#22c55e', title: 'TP' });
+		for (const tr of levels.trail ?? []) lines.push({ id: 'trail', price: tr.price, color: '#f59e0b', title: 'Trail', dashed: true });
+		positionPriceLines = lines;
 	}
 
 	function toggleIndicatorVisibility(name: string) {
@@ -3173,6 +3222,8 @@
 											data={chartBars}
 											entryMarkers={entryMarkers}
 											exitMarkers={exitMarkers}
+											triggerMarkers={triggerMarkers}
+											priceLines={positionPriceLines}
 											mainIndicators={mainIndicators.filter(i => i.visible !== false)}
 											subIndicators={subIndicators.filter(i => i.visible !== false)}
 											strategyName={selectedSession.strategy_name}

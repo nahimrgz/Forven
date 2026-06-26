@@ -1590,6 +1590,271 @@ def get_paper_session_markers(
     return {"entries": entries, "exits": exits, "blocked": blocked}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart bundle (paper↔backtest parity overhaul, Phase 4)
+#
+# ONE endpoint that returns everything the trading chart needs, driven by the
+# REAL indicator registry + the strategy's own signal function — so the chart
+# shows exactly what the strategy trades on (no guessed reimplementation):
+#   - main/sub indicator overlays from forven.strategies.indicators (the registry)
+#   - trigger markers over the FULL history (every generate_signals entry/exit,
+#     including bars from BEFORE the strategy went live)
+#   - trade markers for every ACTUAL recorded paper trade
+#   - the active stop / take-profit (and trailing) levels of the open position
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _chart_indicator_specs(strategy_type: str, params: dict) -> list[dict]:
+    """Resolve a strategy's REAL chart indicators to registry specs {id,kind,params}.
+
+    rule_engine carries declared specs in params['indicators']; the builtins are
+    mapped to the registry kinds they actually compute (param names translated to
+    registry keys). Strategies with no resolvable specs return [] — the chart shows
+    bars + triggers + trades with NO overlay (never a guessed reimplementation)."""
+    p = params if isinstance(params, dict) else {}
+    stype = str(strategy_type or "").strip().lower()
+
+    if stype in ("rule_engine", "rule") or isinstance(p.get("indicators"), list):
+        specs = p.get("indicators")
+        return [s for s in specs if isinstance(s, dict) and s.get("kind")] if isinstance(specs, list) else []
+
+    def _i(key, default):
+        try:
+            return int(p.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _f(key, default):
+        try:
+            return float(p.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    builders: dict[str, list[dict]] = {
+        "rsi_momentum": [
+            {"id": "rsi", "kind": "rsi", "params": {"length": _i("rsi_period", 14)}},
+            {"id": "ema_fast", "kind": "ema", "params": {"length": _i("ema_fast", 50)}},
+            {"id": "ema_slow", "kind": "ema", "params": {"length": _i("ema_slow", 200)}},
+        ],
+        "ema_cross": [
+            {"id": "ema_fast", "kind": "ema", "params": {"length": _i("ema_fast", 20)}},
+            {"id": "ema_slow", "kind": "ema", "params": {"length": _i("ema_slow", 50)}},
+            {"id": "ema_regime", "kind": "ema", "params": {"length": _i("ema_regime", 200)}},
+        ],
+        "bollinger": [
+            {"id": "bb", "kind": "bollinger", "params": {"length": _i("bb_period", 20), "num_std": _f("bb_std", 2.0)}},
+            {"id": "rsi", "kind": "rsi", "params": {"length": _i("rsi_period", 14)}},
+        ],
+        "keltner": [{"id": "kc", "kind": "keltner", "params": {"length": _i("kc_period", 20), "atr_length": _i("kc_period", 20), "mult": _f("kc_mult", 2.0)}}],
+        "macd": [{"id": "macd", "kind": "macd", "params": {"fast": _i("fast", 12), "slow": _i("slow", 26), "signal": _i("signal", 9)}}],
+        "supertrend": [{"id": "st", "kind": "supertrend", "params": {"length": _i("atr_period", 10), "mult": _f("multiplier", 3.0)}}],
+        "stochastic": [{"id": "stoch", "kind": "stochastic", "params": {"k": _i("k", 14), "d": _i("d", 3), "smooth": _i("smooth", 3)}}],
+        "donchian": [{"id": "dc", "kind": "donchian", "params": {"length": _i("donchian_period", 20)}}],
+        "parabolic_sar": [{"id": "psar", "kind": "psar", "params": {"step": _f("step", 0.02), "max_step": _f("max_step", 0.2)}}],
+        "williams_r": [{"id": "wr", "kind": "williams_r", "params": {"length": _i("wr_period", _i("period", 14))}}],
+        "ichimoku": [{"id": "ich", "kind": "ichimoku", "params": {"conversion": _i("tenkan_period", 9), "base": _i("kijun_period", 26), "span_b": _i("senkou_b_period", 52)}}],
+        "funding": [{"id": "fz", "kind": "funding_zscore", "params": {"length": _i("zscore_period", 96)}}],
+        "vwap": [{"id": "vwap", "kind": "vwap", "params": {"length": _i("vwap_period", 0)}}],
+    }
+    return builders.get(stype, [])
+
+
+def _bars_to_frame(bars: list[dict]):
+    import pandas as pd
+
+    if not bars:
+        return None
+    idx = pd.to_datetime([b.get("timestamp") for b in bars], utc=True, errors="coerce")
+    frame = pd.DataFrame(
+        {
+            "open": [trading_domain._coerce_optional_float(b.get("open")) or 0.0 for b in bars],
+            "high": [trading_domain._coerce_optional_float(b.get("high")) or 0.0 for b in bars],
+            "low": [trading_domain._coerce_optional_float(b.get("low")) or 0.0 for b in bars],
+            "close": [trading_domain._coerce_optional_float(b.get("close")) or 0.0 for b in bars],
+            "volume": [trading_domain._coerce_optional_float(b.get("volume")) or 0.0 for b in bars],
+        },
+        index=idx,
+    )
+    return frame[frame.index.notna()]
+
+
+def _compute_chart_indicators(frame, specs: list[dict]) -> tuple[list[dict], list[dict], list[str]]:
+    """Compute each spec via the registry into chart line series, split by panel."""
+    import pandas as pd
+    from forven.strategies import indicators as _ind
+
+    main: list[dict] = []
+    sub: list[dict] = []
+    warnings: list[str] = []
+    ts = [t.isoformat() for t in frame.index]
+    for spec in specs:
+        kind = str(spec.get("kind") or "").strip().lower()
+        if not kind:
+            continue
+        panel = _ind.default_panel(kind)
+        try:
+            outputs = _ind.compute_indicator(frame, spec)
+        except Exception as exc:  # one bad indicator must not break the chart
+            warnings.append(f"indicator '{kind}' failed: {exc}")
+            continue
+        for name, series in outputs.items():
+            vals = [
+                {"timestamp": t, "value": (float(v) if (v is not None and pd.notna(v)) else None)}
+                for t, v in zip(ts, list(series))
+            ]
+            cfg = {"name": name, "panel": panel, "type": "line", "color": _indicator_color(name), "data": vals}
+            (main if panel == "main" else sub).append(cfg)
+    return main, sub, warnings
+
+
+def _resolve_chart_strategy(session: dict, params: dict):
+    strat_id = str(session.get("strategy_id") or session.get("id") or "")
+    asset = trading_domain._normalize_asset_key(str(session.get("symbol") or ""))
+    try:
+        from forven.strategies.registry import _TYPE_MAP, get_active, resolve_runtime_type
+
+        inst = get_active().get(strat_id)
+        if inst is not None:
+            return inst
+        runtime_type, _meta = resolve_runtime_type(str(session.get("type") or ""), session.get("runtime_type"))
+        cls = _TYPE_MAP.get(runtime_type or "")
+        if cls is not None:
+            cp = dict(params)
+            if asset:
+                cp.setdefault("_asset", asset)
+            return cls(strat_id, cp)
+    except Exception:
+        return None
+    return None
+
+
+def _kernel_trigger_markers(strat, frame, *, params, leverage, strategy_type, cutoff):
+    """Discrete historical trigger points = the entries/exits the KERNEL would make
+    over the whole frame (ungated). These are EVENTS (one per would-be position
+    open/close), not raw per-bar signal states — so a strategy whose exit condition
+    holds for long stretches doesn't light up every candle.
+
+    Only triggers strictly BEFORE ``cutoff`` (the first actual paper trade) are
+    emitted, so the live period is shown by real trade markers and the pre-live
+    period by would-be triggers — the 'what it would have done before it went live'
+    the operator asked for. When there are no real trades yet, the full would-be
+    history is shown."""
+    import pandas as pd
+    from forven.strategies import backtest as _bt
+
+    entries: list[dict] = []
+    exits: list[dict] = []
+    if strat is None:
+        return entries, exits
+    try:
+        res = _bt.run_strategy_execution(
+            frame, strat, params=params, warmup=200, leverage=leverage,
+            regime_gate=False, execution_controls=None, strategy_type=strategy_type,
+        )
+    except Exception:
+        return entries, exits
+    if res is None:  # no vectorized signals (per-bar-only strategy) → no triggers
+        return entries, exits
+
+    def _before(ts) -> bool:
+        if cutoff is None:
+            return True
+        t = pd.to_datetime(ts, utc=True, errors="coerce")
+        return t is not None and not pd.isna(t) and t < cutoff
+
+    for t in res.closed_trades:
+        d = str(t.get("direction") or "long")
+        if t.get("entry_time") and _before(t["entry_time"]):
+            entries.append({"timestamp": str(t["entry_time"]), "price": float(t["entry_price"]), "direction": d, "marker_kind": "signal"})
+        if t.get("exit_time") and _before(t["exit_time"]):
+            exits.append({"timestamp": str(t["exit_time"]), "price": float(t["exit_price"]), "direction": d, "marker_kind": "signal"})
+    for d, pos in (res.open_positions or {}).items():
+        if pos.get("entry_time") and _before(pos["entry_time"]):
+            entries.append({"timestamp": str(pos["entry_time"]), "price": float(pos["entry_price"]), "direction": str(d), "marker_kind": "signal"})
+    return entries, exits
+
+
+def get_paper_session_chart(
+    session_id: str,
+    limit: int = 2000,
+    timeframe: str | None = None,
+):
+    """The single chart bundle: bars + real indicators + full-history triggers +
+    actual trade markers + the open position's active stop/take-profit/trailing.
+
+    Read-only and REST-only (kept off the WS loop to avoid single-worker starvation)."""
+    session = _find_compat_paper_session(session_id, include_deployed=True)
+    params = session.get("decision_params") if isinstance(session.get("decision_params"), dict) else session.get("params")
+    params = params if isinstance(params, dict) else {}
+    strategy_type = str(session.get("runtime_type") or session.get("type") or "").strip()
+
+    bars = _load_session_bars(session, limit=max(min(int(limit or 2000), 2000), 100), timeframe_override=timeframe)
+    frame = _bars_to_frame(bars)
+
+    import pandas as pd
+
+    main_indicators: list[dict] = []
+    sub_indicators: list[dict] = []
+    trigger_entries: list[dict] = []
+    trigger_exits: list[dict] = []
+    warnings: list[str] = []
+
+    # Actual recorded trades → trade markers (reuse the existing marker builder's trade legs).
+    marker_bundle = get_paper_session_markers(session_id, limit=limit, include_generated=False)
+    entry_markers = [m for m in marker_bundle.get("entries", []) if m.get("marker_kind") == "trade"]
+    exit_markers = [m for m in marker_bundle.get("exits", []) if m.get("marker_kind") == "trade"]
+
+    # Pre-live cutoff = the FIRST actual paper trade; would-be triggers are only shown
+    # before it (the live period is covered by the real trade markers).
+    _entry_ts = [pd.to_datetime(m.get("timestamp"), utc=True, errors="coerce") for m in entry_markers]
+    _entry_ts = [t for t in _entry_ts if t is not None and not pd.isna(t)]
+    cutoff = min(_entry_ts) if _entry_ts else None
+    leverage = float(params.get("leverage", 1.0) or 1.0)
+
+    if frame is not None and len(frame) >= 2:
+        specs = _chart_indicator_specs(strategy_type, params)
+        if specs:
+            main_indicators, sub_indicators, warnings = _compute_chart_indicators(frame, specs)
+        else:
+            warnings.append(f"No indicator overlay available for strategy type '{strategy_type or 'unknown'}'.")
+        strat = _resolve_chart_strategy(session, params)
+        trigger_entries, trigger_exits = _kernel_trigger_markers(
+            strat, frame, params=params, leverage=leverage, strategy_type=strategy_type, cutoff=cutoff,
+        )
+
+    # Active levels from the open position.
+    position = session.get("position") if isinstance(session.get("position"), dict) else None
+    active_levels: dict[str, list[dict]] = {"stop": [], "take_profit": [], "trail": []}
+    if position:
+        side = str(position.get("side") or "long").strip().lower()
+        entry_time = str(position.get("entry_time") or "")
+        sl = trading_domain._coerce_optional_float(position.get("stop_loss_price"))
+        tp = trading_domain._coerce_optional_float(position.get("take_profit_price"))
+        if sl is not None:
+            active_levels["stop"].append({"price": sl, "direction": side, "from_time": entry_time})
+        if tp is not None:
+            active_levels["take_profit"].append({"price": tp, "direction": side, "from_time": entry_time})
+        trail = trading_domain._coerce_optional_float(
+            parse_trade_signal_data(position.get("signal_data")).get("trailing_stop_price")
+        )
+        if trail is not None:
+            active_levels["trail"].append({"price": trail, "direction": side, "from_time": entry_time})
+
+    return {
+        "session_id": str(session.get("id") or session_id),
+        "bars": bars,
+        "main_indicators": main_indicators,
+        "sub_indicators": sub_indicators,
+        "entry_markers": entry_markers,
+        "exit_markers": exit_markers,
+        "trigger_entries": trigger_entries,
+        "trigger_exits": trigger_exits,
+        "active_levels": active_levels,
+        "strategy_type": strategy_type,
+        "warnings": warnings,
+    }
+
+
 def get_paper_session_indicators(
     session_id: str,
     indicators: str | None = None,

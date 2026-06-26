@@ -29,6 +29,11 @@
 	export let drawings: ChartDrawing[] = [];
 	export let activeTool: ChartDrawingTool = 'cursor';
 	export let fitContentToken = 0;
+	// Full-history strategy trigger points (entry/exit signals, incl. pre-live) —
+	// rendered as dim circles, distinct from the solid trade arrows.
+	export let triggerMarkers: SignalMarker[] = [];
+	// Active position levels (stop / take-profit / trailing) drawn as horizontal lines.
+	export let priceLines: Array<{ id: string; price: number; color?: string; title?: string; dashed?: boolean }> = [];
 
 	const dispatch = createEventDispatcher<{
 		drawingPoint: ChartDrawingPoint;
@@ -43,6 +48,7 @@
 	let subSeriesMap = new Map<string, ISeriesApi<'Line'>>();
 	let drawingSeriesMap = new Map<string, ISeriesApi<'Line'>>();
 	let priceLinesMap = new Map<string, IPriceLine>();
+	let positionLinesMap = new Map<string, IPriceLine>();
 
 	let resizeObserver: ResizeObserver | null = null;
 	let latestCandleData: Array<{ time: Time; open: number; high: number; low: number; close: number }> = [];
@@ -241,9 +247,10 @@
 
 	// React to changes
 	$: if (chart && data) updateData();
-	$: if (chart && (entryMarkers || exitMarkers)) updateMarkers();
+	$: if (chart && (entryMarkers || exitMarkers || triggerMarkers)) updateMarkers();
 	$: if (chart && (mainIndicators || subIndicators)) updateIndicators();
 	$: if (chart && drawings) updateDrawings();
+	$: if (chart && priceLines) updatePositionLines();
 	$: if (chart && fitContentToken !== appliedFitContentToken) {
 		appliedFitContentToken = fitContentToken;
 		// "Reset View" / session switch: resume following the most-recent window until
@@ -313,6 +320,7 @@
 		updateMarkers();
 		updateIndicators();
 		updateDrawings();
+		updatePositionLines();
 
 		// While following (initial mode), re-anchor to the most-recent window on every
 		// data update. This keeps the chart pinned to the current timeframe as bars
@@ -349,8 +357,10 @@
 	}
 
 	function markerText(marker: SignalMarker, fallback: string): string | undefined {
-		if (markerSource(marker) === 'signal') return undefined;
-		return marker.label || fallback;
+		// Markers render as clean arrows/dots (color + shape convey side/entry-exit);
+		// per-marker text labels stack and overlap badly when trades cluster, so the
+		// chart stays label-free and trade details live in the trades table.
+		return undefined;
 	}
 
 	function updateMarkers() {
@@ -390,9 +400,53 @@
 			});
 		}
 
+		// Full-history strategy triggers — dim circles, distinct from solid trade arrows,
+		// and no text (there can be many). Entries below the bar, exits above (mirrored
+		// for shorts), so a trigger that became a trade lines up under its arrow.
+		for (const m of triggerMarkers) {
+			const raw = parseTimestamp(m.timestamp);
+			if (isNaN(raw)) continue;
+			const t = snapToBar(raw);
+			if (t === null) continue;
+			const direction = markerDirection(m);
+			const isExit = String((m as { type?: string }).type || 'entry').toLowerCase() === 'exit';
+			const below = isExit ? direction === 'short' : direction !== 'short';
+			markers.push({
+				time: t,
+				position: below ? 'belowBar' : 'aboveBar',
+				color: 'rgba(148, 163, 184, 0.5)',
+				shape: 'circle',
+			});
+		}
+
 		// Lightweight charts requires markers to be sorted by time
 		markers.sort((a, b) => (a.time as number) - (b.time as number));
 		candleSeries.setMarkers(markers);
+	}
+
+	function updatePositionLines() {
+		if (!chart || !candleSeries) return;
+		const ids = new Set(priceLines.map((l) => l.id));
+		for (const [id, line] of positionLinesMap.entries()) {
+			if (!ids.has(id)) {
+				candleSeries.removePriceLine(line);
+				positionLinesMap.delete(id);
+			}
+		}
+		for (const level of priceLines) {
+			if (!Number.isFinite(level.price)) continue;
+			const options = {
+				price: level.price,
+				color: level.color || '#f59e0b',
+				lineWidth: 2 as const,
+				lineStyle: level.dashed ? LineStyle.Dashed : LineStyle.Solid,
+				axisLabelVisible: true,
+				title: level.title || `@ ${level.price.toFixed(2)}`,
+			};
+			const existing = positionLinesMap.get(level.id);
+			if (existing) existing.applyOptions(options);
+			else positionLinesMap.set(level.id, candleSeries.createPriceLine(options));
+		}
 	}
 
 	function updateIndicators() {

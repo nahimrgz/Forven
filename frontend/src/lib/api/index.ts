@@ -750,6 +750,7 @@ export {
 	getPaperWebSocketUrl,
 	getSessionIndicators,
 	getTradeMarkers,
+	getPaperSessionChart,
 } from './paper';
 export type {
 	PaperPosition,
@@ -774,6 +775,9 @@ export type {
 	TradeMarker,
 	TradeMarkersResponse,
 	OpenManualPaperPositionOptions,
+	ChartIndicatorSeries,
+	ActiveLevel,
+	PaperSessionChart,
 } from './paper';
 
 export {

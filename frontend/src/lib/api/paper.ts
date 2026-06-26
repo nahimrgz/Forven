@@ -578,3 +578,48 @@ export async function getTradeMarkers(
 		options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined
 	);
 }
+
+// ============== Chart bundle (parity overhaul) ==============
+// One call returns everything the chart needs, driven by the real indicator
+// registry + the strategy's own signal function (no guessed reimplementation).
+
+export interface ChartIndicatorSeries {
+	name: string;
+	panel: 'main' | 'sub';
+	type: 'line';
+	color?: string;
+	data: IndicatorHistoryPoint[];
+}
+
+export interface ActiveLevel {
+	price: number;
+	direction?: string;
+	from_time?: string;
+}
+
+export interface PaperSessionChart {
+	session_id: string;
+	bars: OHLCVBar[];
+	main_indicators: ChartIndicatorSeries[];
+	sub_indicators: ChartIndicatorSeries[];
+	entry_markers: TradeMarker[];
+	exit_markers: TradeMarker[];
+	trigger_entries: TradeMarker[];
+	trigger_exits: TradeMarker[];
+	active_levels: { stop: ActiveLevel[]; take_profit: ActiveLevel[]; trail: ActiveLevel[] };
+	strategy_type: string;
+	warnings: string[];
+}
+
+export async function getPaperSessionChart(
+	sessionId: string,
+	options: { limit?: number; timeframe?: string; timeoutMs?: number } = {}
+): Promise<PaperSessionChart> {
+	const params = new URLSearchParams();
+	params.set('limit', String(options.limit ?? 2000));
+	if (options.timeframe) params.set('timeframe', options.timeframe);
+	return fetchApi(
+		`/paper/sessions/${sessionId}/chart?${params.toString()}`,
+		options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined
+	);
+}

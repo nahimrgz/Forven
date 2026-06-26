@@ -77,6 +77,21 @@ def get_paper_session_indicators(
     )
 
 
+@router.get("/api/paper/sessions/{session_id}/chart")
+def get_paper_session_chart(
+    session_id: str,
+    limit: int = 2000,
+    timeframe: str | None = None,
+):
+    """Single chart bundle: bars + real registry indicators + full-history triggers
+    + actual trade markers + the open position's active stop/take-profit/trailing."""
+    return paper_domain.get_paper_session_chart(
+        session_id,
+        limit=limit,
+        timeframe=timeframe,
+    )
+
+
 @router.get("/api/paper/sessions/{session_id}/replay/bars")
 def get_paper_session_replay_bars(
     session_id: str,
