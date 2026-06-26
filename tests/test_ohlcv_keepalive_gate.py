@@ -111,3 +111,22 @@ def test_collect_fetches_when_bar_is_due(monkeypatch, tmp_path):
     assert len(calls) == 1
     # One bar-width gap past the last stored bar so the last closed bar isn't refetched.
     assert calls[0]["since_ms"] == last_open + _TF_MS
+
+
+def test_keepalive_selector_round_robins_by_last_checked(monkeypatch, tmp_path):
+    """The gate skips not-due pairs WITHOUT rewriting parquet, so the selector must
+    rank by last-CHECKED time, not stale parquet mtime. Otherwise a not-due pair
+    keeps its old mtime and re-occupies a slot every run, starving pairs that DO
+    have a closed bar to fetch (a live-data-freshness regression)."""
+    monkeypatch.setattr(d, "DATA_DIR", tmp_path)  # no real parquet -> mtime tiebreak is 0 for all
+    from forven.data_manager import DataManager
+
+    dm = DataManager()
+    pairs = [("BTC-USDT", "1h"), ("ETH-USDT", "1h"), ("SOL-USDT", "1h"), ("AVAX-USDT", "1h")]
+    # BTC + ETH were just checked this run; SOL + AVAX never checked (default 0.0).
+    dm._keepalive_last_checked[("BTC-USDT", "1h")] = 10_000.0
+    dm._keepalive_last_checked[("ETH-USDT", "1h")] = 10_000.0
+
+    selected = dm._select_keepalive_pairs(pairs, max_pairs_per_run=2)
+    # The un-checked pairs must win the slots over the recently-checked ones.
+    assert set(selected) == {("SOL-USDT", "1h"), ("AVAX-USDT", "1h")}

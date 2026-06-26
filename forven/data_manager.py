@@ -1211,6 +1211,14 @@ class DataManager:
 
     def __init__(self) -> None:
         self._ohlcv = OHLCVCollector()
+        # Round-robin freshness tracking for the OHLCV keep-alive. The selector
+        # ranks pairs by last-CHECKED time (updated on every collect, below), NOT
+        # by parquet mtime: the keep-alive gate skips a collect (returns 0 without
+        # rewriting) when no new closed bar is due, so a not-due pair keeps its
+        # stale mtime and — ranked by mtime — would re-occupy a slot every run,
+        # starving pairs that DO have a bar to fetch. Last-checked rotates every
+        # serviced pair to the back, preserving the no-pair-starves invariant.
+        self._keepalive_last_checked: dict[tuple[str, str], float] = {}
         self._funding = FundingCollector()
         self._oi = OICollector()
         self._lsr = LongShortRatioCollector()
@@ -1401,12 +1409,16 @@ class DataManager:
     ) -> list[tuple[str, str]]:
         """Pick which (symbol, timeframe) pairs to refresh this run.
 
-        Ranks by STALENESS — least-recently-written parquet first — instead of a
-        blind round-robin cursor. The previous cursor refreshed N fixed pairs per
-        run regardless of need, so with max_pairs_per_run=1 and many pairs each
-        one only refreshed every N runs (hours of staleness while the job showed
-        green). Staleness-ranking always picks the most overdue pairs, so no pair
-        starves and freshness is bounded by throughput, not universe size.
+        Ranks by LAST-CHECKED time (round-robin), with parquet mtime as the
+        tiebreak for pairs not yet checked this process. Ranking on parquet mtime
+        ALONE is wrong now that the keep-alive gate skips a collect (returns 0
+        without rewriting) when no new closed bar is due: a not-due pair keeps its
+        stale mtime and gets re-selected as a no-op every run, hogging slots and
+        starving pairs that DO have a closed bar to fetch. Tracking last-checked
+        (updated on every collect in ``collect_ohlcv``, due or not) rotates each
+        serviced pair to the back, so no pair starves and freshness is bounded by
+        throughput, not universe size. On a fresh process last-checked is empty, so
+        the mtime tiebreak makes the first runs fetch the genuinely-stalest pairs.
         """
         if not (max_pairs_per_run and max_pairs_per_run > 0) or len(pairs) <= max_pairs_per_run:
             return list(pairs)
@@ -1419,7 +1431,10 @@ class DataManager:
             except OSError:
                 return 0.0  # never written -> treat as most stale
 
-        return sorted(pairs, key=_last_refresh)[:max_pairs_per_run]
+        def _rank(pair: tuple[str, str]) -> tuple[float, float]:
+            return (self._keepalive_last_checked.get(pair, 0.0), _last_refresh(pair))
+
+        return sorted(pairs, key=_rank)[:max_pairs_per_run]
 
     def collect_ohlcv(self, max_pairs_per_run: int | None = None) -> dict[str, Any]:
         """Collect OHLCV keep-alive for active symbols.
@@ -1441,10 +1456,14 @@ class DataManager:
 
                 summary: dict[str, Any] = {}
                 tally = _PerSymbolTally()
+                _checked_at = datetime.now(timezone.utc).timestamp()
                 for symbol, tf in selected_pairs:
                     summary.setdefault(symbol, {})
                     added = tally.run(f"{symbol}:{tf}", lambda s=symbol, t=tf: self._ohlcv.collect(s, t))
                     summary[symbol][tf] = added
+                    # Rotate this pair to the back of the staleness queue whether or
+                    # not the gate actually fetched, so not-due pairs can't hog slots.
+                    self._keepalive_last_checked[(symbol, tf)] = _checked_at
                 total = sum(v for sym in summary.values() for v in sym.values())
                 log.info(
                     "OHLCV keep-alive: %d/%d pairs processed (stalest first), %d rows added, %d failed",
