@@ -266,8 +266,12 @@ def close_trade_record(
             pnl_usd = None
             if entry_price is not None and entry_price > 0:
                 pnl_pct = ((resolved_exit_price - entry_price) / entry_price) * signed * leverage
-                pnl_usd_multiplier = 1.0 if resolved_price_source == "fill_exit_price" else leverage
-                pnl_usd = (resolved_exit_price - entry_price) * size * signed * pnl_usd_multiplier
+                # ``size`` is contract UNITS, which already embed leverage
+                # (position_units = equity*leverage*size_fraction/entry). The dollar
+                # P&L is therefore just price_move * units; the old code multiplied by
+                # leverage AGAIN on the non-fill branch — a leverage^2 double-count
+                # that overstated pnl_usd (and the promotion-gate metrics it feeds).
+                pnl_usd = (resolved_exit_price - entry_price) * size * signed
 
         if close_reason is not None:
             signal_data["close_reason"] = str(close_reason)

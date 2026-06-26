@@ -81,7 +81,9 @@ def test_reconcile_exchange_positions_closes_ghost_trade_with_price(forven_db, m
     assert trade["exit_price"] == 110.0
     assert trade["signal_exit_price"] == 110.0
     assert trade["pnl_pct"] == 0.2
-    assert trade["pnl_usd"] == 30.0
+    # size embeds leverage → pnl_usd = price_move * units; was 30.0 under the old
+    # leverage^2 double-count (leverage=2).
+    assert trade["pnl_usd"] == 15.0
     assert json.loads(trade["signal_data"])["close_reason"] == "reconcile_missing_on_exchange"
     assert int(remaining["count"]) == 0
 

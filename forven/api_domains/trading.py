@@ -877,7 +877,9 @@ def _calculate_closed_trade_pnl(
 
     signed = -1.0 if _normalize_trade_direction(direction) == "short" else 1.0
     applied_leverage = float(leverage or 1.0)
-    pnl_usd = (exit_price - entry_price) * float(size) * signed * applied_leverage
+    # size is contract UNITS (already leverage-embedded), so dollar P&L is just
+    # price_move * units — multiplying by leverage again double-counts it.
+    pnl_usd = (exit_price - entry_price) * float(size) * signed
     pnl_pct = ((exit_price - entry_price) / entry_price) * signed * applied_leverage
     return pnl_pct, pnl_usd
 

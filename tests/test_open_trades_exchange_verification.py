@@ -369,7 +369,9 @@ def test_force_close_trade_closes_exchange_backed_position(forven_db, monkeypatc
     assert result["close_side"] == "sell"
     assert result["exit_price"] == 110.0
     assert result["pnl_pct"] == 0.2
-    assert result["pnl_usd"] == 20.0
+    # size embeds leverage → pnl_usd = price_move * units (no extra ×leverage).
+    # Was 20.0 under the old leverage^2 double-count (leverage=2).
+    assert result["pnl_usd"] == 10.0
     assert result["cancelled_reduce_only_orders"] == 1
     assert cancelled == [("BTC", 101, True)]
     assert logged and "exchange-backed position" in logged[0][2]

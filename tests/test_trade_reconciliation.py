@@ -67,7 +67,9 @@ def test_stale_close_uses_price_map_and_writes_pnl(forven_db):
     assert row["exit_price"] == 110.0
     assert row["signal_exit_price"] == 110.0
     assert row["pnl_pct"] == 0.2
-    assert row["pnl_usd"] == 30.0
+    # size embeds leverage → pnl_usd = price_move * units; was 30.0 under the old
+    # leverage^2 double-count (leverage=2).
+    assert row["pnl_usd"] == 15.0
 
 
 def test_stale_close_falls_back_to_fill_exit_price(forven_db):
