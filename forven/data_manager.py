@@ -687,6 +687,7 @@ def _fetch_stream_via_source_registry(
     since: object | None = None,
 ) -> pd.DataFrame:
     from forven.dataeng.ccxt_source import CcxtSource
+    from forven.dataeng.errors import NoData
     from forven.dataeng.identity import to_ref
     from forven.dataeng.source import Stream, get_source_registry
 
@@ -704,6 +705,15 @@ def _fetch_stream_via_source_registry(
             stream,
             since=since,
         )
+    except NoData:
+        # An empty window is NOT a source failure: it is the normal case when we
+        # poll OI/funding more often than new bars close (e.g. ADA 4h between 4h
+        # boundaries) or for a symbol the exchange has no OI for. Counting it as a
+        # breaker failure tripped the shared "binance" breaker every cycle, which
+        # then latched OI+funding "Down" for ALL symbols. Record the source as
+        # healthy and return an empty frame -> collector saves 0 rows, no error.
+        registry.record_success(source.id)
+        return pd.DataFrame()
     except Exception as exc:
         registry.record_failure(source.id, str(exc))
         raise
