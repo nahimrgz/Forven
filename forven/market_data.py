@@ -186,8 +186,11 @@ def fetch_hyperliquid_candles(
     interval: str = "1h",
     end_time: int | None = None,
     clean: bool = False,
+    include_unclosed: bool = False,
 ) -> pd.DataFrame:
-    """Fetch OHLCV candles from HyperLiquid and return a normalized dataframe."""
+    """Fetch OHLCV candles from HyperLiquid and return a normalized dataframe.
+    Drops the unclosed active candle unless ``include_unclosed`` (the chart wants the
+    live forming bar)."""
     normalized_coin = str(coin or "").strip().upper()
     if not normalized_coin:
         raise ValueError("coin is required")
@@ -232,8 +235,10 @@ def fetch_hyperliquid_candles(
         df[column] = df[column].astype(float)
         
     # Prevent lookahead bias / repainting by dropping the unclosed active candle
-    reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
-    df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
+    # (kept when include_unclosed — the chart shows the live forming bar).
+    if not include_unclosed:
+        reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
+        df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
     
     normalized = df.rename(
         columns={
@@ -360,12 +365,16 @@ def fetch_binance_candles(
     interval: str = "1h",
     end_time: int | None = None,
     clean: bool = False,
+    include_unclosed: bool = False,
 ) -> pd.DataFrame:
     """Fetch OHLCV candles from BINANCE — a drop-in for ``fetch_hyperliquid_candles``.
 
-    Returns the same normalized frame (UTC open-time index; open/high/low/close/volume;
-    the unclosed active candle dropped). Paginates Binance's 1000-bar/call cap so the
-    scanner's long kernel window and the chart's 2000-bar window are served.
+    Returns the same normalized frame (UTC open-time index; open/high/low/close/volume).
+    The unclosed active candle is dropped (no lookahead/repaint for signals) UNLESS
+    ``include_unclosed`` is True — the CHART passes True so it shows the live forming
+    bar like TradingView, while the scanner keeps closed bars. Paginates Binance's
+    1000-bar/call cap so the scanner's long window and the chart's 2000-bar window
+    are served.
     """
     normalized_coin = str(coin or "").strip().upper()
     if not normalized_coin:
@@ -414,9 +423,11 @@ def fetch_binance_candles(
     for column in ("open", "high", "low", "close", "volume"):
         df[column] = df[column].astype(float)
 
-    # Drop the unclosed active candle (no lookahead / repaint), mirroring HL fetch.
-    reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
-    df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
+    # Drop the unclosed active candle (no lookahead / repaint), mirroring HL fetch —
+    # unless the caller (the chart) wants the live forming bar shown.
+    if not include_unclosed:
+        reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
+        df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
     df = df[["open", "high", "low", "close", "volume"]].tail(requested_bars)
 
     if clean:
@@ -482,14 +493,16 @@ def fetch_market_candles(
     interval: str = "1h",
     end_time: int | None = None,
     clean: bool = False,
+    include_unclosed: bool = False,
 ) -> pd.DataFrame:
     """Source-aware candle fetch: Binance (default) or HyperLiquid, per the
     ``market_data_source`` setting. When the source is Binance it does NOT silently
     fall back to HyperLiquid on error (that would reintroduce the wrong prices) —
-    it raises, and the caller skips."""
+    it raises, and the caller skips. ``include_unclosed`` keeps the live forming bar
+    (the chart wants it; the scanner does not)."""
     if resolve_market_data_source() == "binance":
-        return fetch_binance_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean)
-    return fetch_hyperliquid_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean)
+        return fetch_binance_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean, include_unclosed=include_unclosed)
+    return fetch_hyperliquid_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean, include_unclosed=include_unclosed)
 
 
 class BinancePriceFeed:

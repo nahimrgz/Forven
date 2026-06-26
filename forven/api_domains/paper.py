@@ -763,13 +763,15 @@ def _load_session_bars(
 
     # Source-aware (Binance by default) so the chart shows the SAME real-exchange
     # prices the strategy trades on — not HyperLiquid testnet (which drifts).
+    # include_unclosed=True keeps the live FORMING bar so the chart matches
+    # TradingView/Binance (not one closed bar behind); signals still use closed bars.
     try:
-        frame = fetch_market_candles(asset, bars=requested, interval=interval)
+        frame = fetch_market_candles(asset, bars=requested, interval=interval, include_unclosed=True)
     except Exception:
         if timeframe_override:
             return []
         try:
-            frame = fetch_market_candles(asset, bars=requested, interval="1h")
+            frame = fetch_market_candles(asset, bars=requested, interval="1h", include_unclosed=True)
         except Exception:
             return []
 
