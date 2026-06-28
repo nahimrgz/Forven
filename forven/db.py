@@ -766,6 +766,7 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS strategies (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    display_name TEXT,
     type TEXT,
     runtime_type TEXT,
     symbol TEXT,
@@ -1871,6 +1872,10 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "strategies", "stage", "TEXT DEFAULT 'quick_screen'")
     _ensure_column(conn, "strategies", "base_id", "INTEGER")
     _ensure_column(conn, "strategies", "display_id", "TEXT")
+    # Operator-editable friendly name that overrides the canonical {ASSET}-{TYPE}-{ID}
+    # name in the UI. NULL = fall back to the canonical name. Kept separate from `name`
+    # so the placeholder-repair pass and naming convention never clobber operator intent.
+    _ensure_column(conn, "strategies", "display_name", "TEXT")
     _ensure_column(conn, "strategies", "audit_summary", "JSON")
     _ensure_column(conn, "strategies", "market_pot", "TEXT")
     _ensure_column(conn, "strategies", "last_prefix", "TEXT")
@@ -3538,6 +3543,18 @@ def kv_set(key: str, value):
             "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
             (key, json.dumps(value), _now()),
         )
+
+
+def live_equity_baseline_kv_key(strategy_id: str) -> str:
+    """KV key holding a live strategy's go-live account equity baseline.
+
+    Stamped (by brain.transition_stage) with the REAL Hyperliquid account equity
+    at the moment a strategy graduates to live_graduated, so the live "Capital"
+    card can report a true return % against the equity it deployed against instead
+    of a fabricated $10k sandbox base. Read by api_domains.paper when building the
+    live session view.
+    """
+    return f"live_baseline:{str(strategy_id or '').strip()}"
 
 
 def kv_set_best_effort(key: str, value, *, timeout_seconds: float = 0.25) -> bool:

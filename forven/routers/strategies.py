@@ -443,6 +443,16 @@ def update_strategy_default_params(strategy_id: str, body: PatchResultParamsBody
     )
 
 
+class PatchDisplayNameBody(BaseModel):
+    # None/blank clears the override and falls back to the canonical name.
+    display_name: str | None = Field(default=None, max_length=140)
+
+
+@router.patch("/api/strategies/{strategy_id}/display-name")
+def update_strategy_display_name(strategy_id: str, body: PatchDisplayNameBody):
+    return lifecycle.set_strategy_display_name(strategy_id, body.display_name, actor="ui")
+
+
 @router.get("/api/strategies/{strategy_id}/open-position")
 def get_strategy_open_position(strategy_id: str):
     """Is this strategy currently in a trade? Drives the pre-edit warning so the

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from forven.db import (
     _now,
+    append_audit_summary,
     create_strategy_container,
     get_db,
     get_recent_strategy_events,
@@ -230,6 +231,7 @@ def _row_to_lifecycle_strategy(row: dict) -> dict:
         "id": strategy_id,
         "display_id": display_id,
         "name": strategy_name,
+        "display_name": (str((row or {}).get("display_name") or "").strip() or None),
         "hypothesis_id": (row or {}).get("hypothesis_id") or None,
         "hypothesis_display_id": (row or {}).get("hypothesis_display_id") or None,
         "state": _to_lifecycle_state(status),
@@ -1004,6 +1006,55 @@ def read_strategies(status: str | None = None, limit: int | None = None, offset:
         row["recovery_last_error"] = recovery.get("last_error")
         row["recovery_cooldown_until"] = recovery.get("cooldown_until")
     return [_scrub_nonfinite(_compact_strategy_list_row(row)) for row in enriched_rows]
+
+
+def set_strategy_display_name(strategy_id: str, display_name: str | None, actor: str = "ui") -> dict:
+    """Set or clear the operator-facing display-name override for a strategy.
+
+    A blank/empty value clears the override so the UI falls back to the canonical
+    {ASSET}-{TYPE}-{ID} name. The canonical `name` column is never touched, so the
+    placeholder-repair pass and naming convention keep working underneath.
+    """
+    target = str(strategy_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="strategy_id is required")
+
+    cleaned = str(display_name or "").strip()[:140]
+    resolved = cleaned or None
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, name, display_name FROM strategies WHERE id = ?",
+            (target,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"strategy not found: {target}")
+
+        previous = row["display_name"] or None
+        if previous != resolved:
+            conn.execute(
+                "UPDATE strategies SET display_name = ?, updated_at = ? WHERE id = ?",
+                (resolved, _now(), target),
+            )
+            append_audit_summary(
+                conn,
+                target,
+                {
+                    "event": "display_name_changed",
+                    "from": previous,
+                    "to": resolved,
+                    "actor": actor,
+                    "timestamp": _now(),
+                },
+            )
+        canonical_name = str(row["name"] or target)
+
+    return {
+        "ok": True,
+        "strategy_id": target,
+        "name": canonical_name,
+        "display_name": resolved,
+    }
 
 
 def promote_strategy(strategy_id: str, body: StrategyPromoteBody):

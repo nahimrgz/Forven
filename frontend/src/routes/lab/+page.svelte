@@ -658,6 +658,7 @@
 			if (query) {
 				if (
 					!row.name.toLowerCase().includes(query)
+					&& !(row.display_name ?? '').toLowerCase().includes(query)
 					&& !row.symbol.toLowerCase().includes(query)
 					&& !row.timeframe.toLowerCase().includes(query)
 					&& !row.id.toLowerCase().includes(query)
@@ -684,6 +685,7 @@
 			if (!query) return true;
 			return (
 				row.name.toLowerCase().includes(query)
+				|| (row.display_name ?? '').toLowerCase().includes(query)
 				|| row.symbol.toLowerCase().includes(query)
 				|| row.timeframe.toLowerCase().includes(query)
 				|| row.id.toLowerCase().includes(query)
@@ -707,6 +709,7 @@
 			if (!query) return true;
 			return (
 				row.name.toLowerCase().includes(query)
+				|| (row.display_name ?? '').toLowerCase().includes(query)
 				|| row.symbol.toLowerCase().includes(query)
 				|| row.timeframe.toLowerCase().includes(query)
 				|| row.id.toLowerCase().includes(query)
@@ -1223,7 +1226,7 @@
 										<td class="py-2 px-2 text-white font-medium max-w-[360px]">
 											<StrategyLink
 												strategyId={row.id}
-												label={row.name}
+												label={row.display_name || row.name}
 												returnTo="/lab"
 												className="max-w-full truncate bg-transparent border-0 px-0 py-0 text-left text-white hover:text-cyan-300"
 											/>
@@ -1319,7 +1322,7 @@
 										<td class="py-2 px-2 text-white font-medium max-w-[420px]">
 											<StrategyLink
 												strategyId={row.id}
-												label={row.name}
+												label={row.display_name || row.name}
 												returnTo="/lab"
 												className="max-w-full truncate bg-transparent border-0 px-0 py-0 text-left text-white hover:text-cyan-300"
 											/>
@@ -1395,7 +1398,7 @@
 										<td class="py-2 px-2 text-white font-medium max-w-[420px]">
 											<StrategyLink
 												strategyId={row.id}
-												label={row.name}
+												label={row.display_name || row.name}
 												returnTo="/lab"
 												className="max-w-full truncate bg-transparent border-0 px-0 py-0 text-left text-white hover:text-cyan-300"
 											/>

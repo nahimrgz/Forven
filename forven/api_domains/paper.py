@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from forven import api_core as core
 from forven.api_domains import trading as trading_domain
-from forven.db import _now, get_db, kv_get, kv_set
+from forven.db import _now, get_db, kv_get, kv_set, live_equity_baseline_kv_key
 from forven.market_data import fetch_market_candles
 from forven.scheduler import enable_job
 from forven.trade_state import parse_trade_signal_data
@@ -95,6 +95,7 @@ def _build_session_position_view(
     *,
     current_price: float,
     fallback_time: str,
+    exchange_positions: dict | None = None,
 ) -> tuple[dict | None, float]:
     entry_price = (
         trading_domain._coerce_optional_float(active_trade.get("entry_price"))
@@ -117,6 +118,27 @@ def _build_session_position_view(
     else:
         unrealized_pnl = trading_domain._coerce_optional_float(active_trade.get("pnl_usd")) or 0.0
         unrealized_pnl_pct = _normalize_trade_percent_value(active_trade.get("pnl_pct")) or 0.0
+
+    # LIVE positions: prefer the EXCHANGE's reported unrealized PnL (and entry) so the
+    # live card reconciles to Hyperliquid (it folds in funding/fees the local estimate
+    # omits). Gated to genuine live trades and matched by asset+direction so a paper
+    # position on the same coin can never pick up a live strategy's exchange figure.
+    # Falls back to the local estimate above when no snapshot/match exists.
+    is_live_trade = str(active_trade.get("execution_type") or "").strip().lower() == "live"
+    if is_live_trade and isinstance(exchange_positions, dict) and exchange_positions:
+        asset_key = trading_domain._normalize_asset_key(active_trade.get("asset"))
+        match = exchange_positions.get(f"{asset_key}:{direction}") if asset_key else None
+        if isinstance(match, dict):
+            exch_upnl = trading_domain._coerce_optional_float(match.get("unrealized_pnl"))
+            exch_entry = trading_domain._coerce_optional_float(match.get("entry_price"))
+            if exch_upnl is not None:
+                unrealized_pnl = exch_upnl
+                basis_entry = exch_entry if (exch_entry and exch_entry > 0) else entry_price
+                if basis_entry > 0 and size > 0:
+                    # Return on margin: exchange $PnL relative to the position's margin
+                    # (notional / leverage), so the % stays consistent with the $ figure.
+                    margin = (basis_entry * size) / max(leverage, 1e-9)
+                    unrealized_pnl_pct = (exch_upnl / margin) * 100.0 if margin > 0 else unrealized_pnl_pct
 
     return (
         {
@@ -489,6 +511,60 @@ def _build_session_runtime_fields(
     return indicators, pending_signals, last_signal
 
 
+def _resolve_real_account_snapshot(daemon_state: dict) -> dict:
+    """Resolve the REAL Hyperliquid account balance the daemon caches each risk tick.
+
+    The daemon persists the authoritative account equity (perp + spot, book-aware)
+    into ``daemon_state['exchange_account']`` / ``daemon_state['account_equity']``
+    every cycle, so the live "Capital" can show the true wallet WITHOUT any extra
+    exchange round-trip from this (hot, list) endpoint — important because a
+    synchronous exchange call here would risk starving the single-worker WebSocket.
+
+    ``source`` distinguishes a genuine read ('exchange' master / 'books_aggregate')
+    from the credentials-missing paper fallback ('paper'): only the former is a real
+    balance, so a paper/missing snapshot must surface as unavailable rather than
+    silently re-introducing the fabricated $10k base.
+    """
+    exch = daemon_state.get("exchange_account") if isinstance(daemon_state, dict) else None
+    exch = exch if isinstance(exch, dict) else {}
+    source = str(exch.get("source") or "").strip().lower()
+    account_value = trading_domain._coerce_optional_float(exch.get("accountValue"))
+    if account_value is None and isinstance(daemon_state, dict):
+        account_value = trading_domain._coerce_optional_float(daemon_state.get("account_equity"))
+    available = bool(
+        account_value is not None
+        and account_value > 0
+        and source in {"exchange", "books_aggregate"}
+    )
+    return {
+        "available": available,
+        "account_value": account_value if available else None,
+        "withdrawable": trading_domain._coerce_optional_float(exch.get("withdrawable")) if available else None,
+        "margin_used": trading_domain._coerce_optional_float(exch.get("totalMarginUsed")) if available else None,
+        "source": source if available else None,
+        "network": (str(exch.get("network") or "").strip() or None) if available else None,
+        "synced_at": (str(exch.get("synced_at") or "").strip() or None) if available else None,
+    }
+
+
+def _resolve_live_equity_baseline(strategy_id: str) -> float | None:
+    """Stamped go-live account equity for a live strategy (its deploy-time cost
+    basis), or None when no baseline was stamped (legacy/pre-stamp live rows)."""
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return None
+    try:
+        stored = kv_get(live_equity_baseline_kv_key(sid), None)
+    except Exception:
+        return None
+    value = trading_domain._coerce_optional_float(
+        stored.get("equity") if isinstance(stored, dict) else stored
+    )
+    if value is not None and value > 0:
+        return value
+    return None
+
+
 def _collect_compat_paper_sessions(
     include_deployed: bool = False,
     session_limit: int | None = None,
@@ -542,11 +618,17 @@ def _collect_compat_paper_sessions(
     daemon_state = kv_get("daemon_state", {}) or {}
     raw_prices = daemon_state.get("last_prices", {})
     price_map = raw_prices if isinstance(raw_prices, dict) else {}
+    raw_exch_positions = daemon_state.get("exchange_positions", {})
+    exchange_positions = raw_exch_positions if isinstance(raw_exch_positions, dict) else {}
     scanner_state = kv_get("scanner_state", {}) or {}
     scanner_signals = scanner_state.get("signals", {}) if isinstance(scanner_state, dict) else {}
     scanner_diagnostics = scanner_state.get("diagnostics", {}) if isinstance(scanner_state, dict) else {}
     scanner_ts = str(scanner_state.get("last_scan") or _now()) if isinstance(scanner_state, dict) else _now()
     recent_trades = trading_domain.read_recent_trades(limit=5000)
+
+    # Real Hyperliquid balance for DEPLOYED/live sessions, read once from the cached
+    # daemon snapshot (no per-session exchange round-trip — WS-starvation safe).
+    real_account = _resolve_real_account_snapshot(daemon_state)
 
     sessions: list[dict] = []
     for row in rows:
@@ -621,6 +703,7 @@ def _collect_compat_paper_sessions(
                 open_trade,
                 current_price=float(current_price),
                 fallback_time=fallback_time,
+                exchange_positions=exchange_positions,
             )
             if position_view is None:
                 continue
@@ -654,12 +737,55 @@ def _collect_compat_paper_sessions(
             or 1.0
         )
 
-        initial_capital = 10_000.0
-        total_pnl = total_closed_pnl + unrealized_pnl
-        capital = initial_capital + total_pnl
-        total_pnl_pct = (total_pnl / initial_capital) * 100.0 if initial_capital > 0 else 0.0
         stage_status = core._to_core_status(str(strategy_row.get("stage") or strategy_row.get("status") or "")) or ""
         is_deployed = stage_status == "live_graduated"
+        total_pnl = total_closed_pnl + unrealized_pnl
+
+        # Capital semantics differ by stage:
+        #  - PAPER: an isolated $10k sandbox; capital = base + reconstructed PnL.
+        #  - LIVE/deployed: the REAL Hyperliquid wallet equity. accountValue already
+        #    embeds realized+unrealized PnL on-exchange, so we set capital to it
+        #    DIRECTLY (adding total_pnl would double-count). The % return is anchored
+        #    to the stamped go-live baseline (its true deploy basis), falling back to
+        #    a derived cost basis (equity - this strategy's PnL) for legacy live rows
+        #    with no stamp. When no real snapshot is available (daemon not yet synced
+        #    / creds missing) we DO NOT present the $10k sandbox as if it were the
+        #    live wallet — balance_source='unavailable' tells the UI to say so.
+        account_value: float | None = None
+        account_withdrawable: float | None = None
+        account_margin_used: float | None = None
+        account_network: str | None = None
+        account_synced_at: str | None = None
+        if is_deployed:
+            if real_account["available"]:
+                account_value = float(real_account["account_value"])
+                account_withdrawable = real_account["withdrawable"]
+                account_margin_used = real_account["margin_used"]
+                account_network = real_account["network"]
+                account_synced_at = real_account["synced_at"]
+                balance_source = real_account["source"]
+                capital = account_value
+                baseline = _resolve_live_equity_baseline(strategy_id)
+                if baseline is None or baseline <= 0:
+                    derived = account_value - total_pnl
+                    baseline = derived if derived > 0 else account_value
+                initial_capital = baseline
+                total_pnl_pct = (total_pnl / baseline) * 100.0 if baseline > 0 else 0.0
+            else:
+                # Deployed but the real balance has not synced (daemon not yet ticked
+                # / creds missing). Anchor NOTHING to the fabricated $10k sandbox base:
+                # capital/initial_capital are unavailable and the % is undefined, so the
+                # UI shows "balance unavailable" / "--" rather than a $10k-derived value.
+                # total_pnl (this strategy's own realized/unrealized $) is still real.
+                balance_source = "unavailable"
+                initial_capital = None
+                capital = None
+                total_pnl_pct = None
+        else:
+            balance_source = "simulated"
+            initial_capital = 10_000.0
+            capital = initial_capital + total_pnl
+            total_pnl_pct = (total_pnl / initial_capital) * 100.0 if initial_capital > 0 else 0.0
         session_trade_mode = _resolve_session_trade_mode(decision_params or params_dict, position_sides)
         session_position_model = "hedged" if session_trade_mode == "both" else "single_side"
         session_status = "position_open" if positions else _to_paper_session_status(
@@ -736,6 +862,16 @@ def _collect_compat_paper_sessions(
                 "pending_signals": pending_signals,
                 "last_signal": last_signal,
                 "capital": capital,
+                # Real Hyperliquid balance fields (deployed/live only). For paper
+                # sessions account_value is None and balance_source='simulated';
+                # the UI uses these to show the true wallet for live cards and a
+                # 'balance unavailable' state instead of a fabricated number.
+                "account_value": account_value,
+                "account_withdrawable": account_withdrawable,
+                "account_margin_used": account_margin_used,
+                "balance_source": balance_source,
+                "account_network": account_network,
+                "account_synced_at": account_synced_at,
                 "total_pnl": total_pnl,
                 "total_pnl_pct": total_pnl_pct,
                 "total_trades": len(all_closed_trade_views),

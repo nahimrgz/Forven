@@ -5,6 +5,8 @@
 export interface ManagerRow {
 	id: string;
 	name: string;
+	// Operator-editable friendly name; null = fall back to `name`.
+	display_name: string | null;
 	hypothesis_id: string | null;
 	hypothesis_display_id?: string | null;
 	symbol: string;
@@ -271,6 +273,7 @@ export function parseManagerRow(raw: any, deletedAt?: string): ManagerRow {
 	return {
 		id: String(raw.id || ''),
 		name: String(raw.name || raw.id || 'Unnamed Strategy'),
+		display_name: raw.display_name ? String(raw.display_name).trim() || null : null,
 		hypothesis_id: raw.hypothesis_id ? String(raw.hypothesis_id) : null,
 		hypothesis_display_id: raw.hypothesis_display_id ? String(raw.hypothesis_display_id) : null,
 		symbol: String(raw.symbol || 'MULTI'),

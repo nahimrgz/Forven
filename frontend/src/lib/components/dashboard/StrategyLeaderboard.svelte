@@ -83,6 +83,13 @@
 		return String(raw.strategy_name ?? raw.name ?? entry.id ?? 'Unnamed Strategy');
 	}
 
+	// What the operator sees: the friendly display name when set, else the canonical
+	// name. Navigation still resolves via getStrategyName so links never break.
+	function getDisplayLabel(entry: LeaderboardEntry): string {
+		const friendly = String(entry.display_name ?? '').trim();
+		return friendly || getStrategyName(entry);
+	}
+
 	function toLifecycleSource(source: string | undefined): 'manual' | 'scan' | 'autopilot' | 'code' | 'campaign' {
 		if (source === 'scan' || source === 'autopilot' || source === 'manual' || source === 'code' || source === 'campaign') {
 			return source;
@@ -174,7 +181,7 @@
 						}}
 						on:keydown={(ev) => handleRowKeydown(ev, e)}
 					>
-						<td class="px-2 py-1 truncate max-w-[160px] font-mono" title={getStrategyName(e)}>
+						<td class="px-2 py-1 truncate max-w-[160px] font-mono" title={getDisplayLabel(e)}>
 							{#if isWinnerRow(e)}
 								<span
 									data-testid={`winner-badge-${e.id || e.strategy_name}`}
@@ -190,7 +197,7 @@
 								tabindex="0"
 								on:click={(ev) => handleStrategyNameClick(ev, e)}
 								on:keydown={(ev) => handleStrategyNameKeydown(ev, e)}
-							>{displayName(getStrategyName(e))}</span>
+							>{displayName(getDisplayLabel(e))}</span>
 						</td>
 						<td class="px-1 py-1 text-center"><TierBadge tier={e.tier ?? 'weak'} /></td>
 						<td class="px-1 py-1"><Sparkline data={e.mini_equity ?? []} width={60} height={18} /></td>

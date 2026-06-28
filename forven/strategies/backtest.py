@@ -6756,6 +6756,322 @@ def _allowed_modes_for(trade_mode: str) -> tuple[str, ...]:
     return ("long",)
 
 
+def _per_bar_kernel_adapter_enabled() -> bool:
+    """Gate for the per-bar→kernel adapter (default ON). When on, a strategy that
+    exposes only a per-bar generate_signal (no vectorized generate_signals) is run on
+    the SHARED kernel via signal-walk adaptation — full backtest parity — instead of
+    the divergent legacy/full-notional slow path. Operator can disable to restore the
+    legacy slow path.
+
+    Reads the cheap scanner KV flag (one kv_get), NOT get_settings() — which rebuilds
+    preset bundles + loads regime/notification/secrets on every call — because this
+    runs on the per-scan hot path and the single backend worker can't afford it.
+    """
+    try:
+        from forven.scanner import _scanner_bool_setting
+        return _scanner_bool_setting("per_bar_kernel_adapter", True)
+    except Exception:
+        return True
+
+
+from collections import OrderedDict as _OrderedDict  # noqa: E402
+
+_PER_BAR_SIGNALS_CACHE: "_OrderedDict[tuple, DirectionalSignals]" = _OrderedDict()
+_PER_BAR_SIGNALS_CACHE_MAX = 256
+
+
+def _per_bar_params_signature(strategy_obj) -> str:
+    """Cheap stable signature of a strategy's params, folded into the adapter cache key
+    so a param change can't return stale signals (and a same-strategy_id param sweep
+    can't collide)."""
+    try:
+        params = getattr(strategy_obj, "params", {}) or {}
+        return repr(sorted((str(k), str(v)) for k, v in params.items()))[:300]
+    except Exception:
+        return ""
+
+
+def _per_bar_checker(obj):
+    if obj is None:
+        return None
+    return getattr(obj, "check_signal", None) or getattr(obj, "generate_signal", None)
+
+
+def _per_bar_sig_key(sig):
+    """Normalize a per-bar signal to a comparable (entry, exit, direction) tuple."""
+    if sig is None:
+        return None
+    if not isinstance(sig, dict):
+        to_dict = getattr(sig, "to_dict", None)
+        if not callable(to_dict):
+            return None
+        try:
+            sig = to_dict()
+        except Exception:
+            return "ERR"
+    return (bool(sig.get("entry_signal")), bool(sig.get("exit_signal")), str(sig.get("direction") or "").lower())
+
+
+def _clone_strategy(strategy_obj):
+    """A FRESH instance of the same strategy/params (for purity probing), or None."""
+    try:
+        return type(strategy_obj)(
+            getattr(strategy_obj, "strategy_id", "clone"),
+            dict(getattr(strategy_obj, "params", {}) or {}),
+        )
+    except Exception:
+        return None
+
+
+_PER_BAR_PURITY_CACHE: "_OrderedDict[tuple, bool]" = _OrderedDict()
+_PER_BAR_PURITY_CACHE_MAX = 512
+# Strategy ids already alerted as impure — so the operator notice (and warning log)
+# fires ONCE per strategy, not on every scan.
+_PER_BAR_IMPURE_LOGGED: set = set()
+
+
+def _probe_per_bar_pure(strategy_obj, df: "pd.DataFrame", warmup: int) -> bool:
+    """True when a strategy's per-bar generate_signal is PURE enough for the kernel —
+    i.e. the signal at a bar is a deterministic function of the trailing window only.
+
+    Catches the hazards that make a per-bar strategy SILENTLY WRONG on the kernel
+    (and across scan-reused instances / trailing-window replay):
+      (1) non-determinism — randomness, or per-call self-mutation that changes the
+          output: detected by evaluating the SAME window twice and requiring an
+          identical signal. NOTE this does NOT reliably catch wall-clock / external
+          reads that are STABLE across two back-to-back calls (e.g. a now() time-of-day
+          gate read in the same microsecond) — those need an AST/source check (a
+          follow-up); the legacy path is equally exposed to them.
+      (2) cross-bar state — output depends on bars seen earlier in the walk (state
+          accumulated in self): detected (best-effort, needs a clone) by checking a
+          sequential walk reproduces the cold per-bar value at sampled bars.
+
+    Determinism (1) runs on a CLONE so the probe never pollutes the instance the real
+    walk uses, and tolerates a bar that raises (skips it, like the walk's warmup-band
+    tolerance) — but requires at least one cleanly-evaluated bar to certify.
+    """
+    n = len(df)
+    lo = max(int(warmup), 0)
+    if n - lo < 3:
+        return True  # too few tradeable bars to probe — don't block (warmup region)
+    window = max(int(warmup) * 3, 1000)
+    span = n - 1 - lo
+    bars = sorted({lo + (span * j) // 5 for j in range(6)})
+
+    # (1) determinism / per-call statelessness (on a clone; warmup-band errors skipped)
+    det_obj = _clone_strategy(strategy_obj) or strategy_obj
+    chk = _per_bar_checker(det_obj)
+    if chk is None:
+        return False
+    clean = 0
+    for k in bars:
+        w = df.iloc[max(0, k + 1 - window): k + 1]
+        try:
+            a = _per_bar_sig_key(chk(w))
+            b = _per_bar_sig_key(chk(w))
+        except Exception:
+            continue  # a single bar (often the warmup edge) raising is not a verdict
+        if a == "ERR" or b == "ERR":
+            continue
+        clean += 1
+        if a != b:
+            return False  # non-deterministic
+    if clean == 0:
+        return False  # could not evaluate any sampled bar cleanly → cannot certify
+    # (2) cross-bar state independence (best-effort)
+    cold_obj = _clone_strategy(strategy_obj)
+    walk_obj = _clone_strategy(strategy_obj)
+    cold_chk = _per_bar_checker(cold_obj)
+    walk_chk = _per_bar_checker(walk_obj)
+    if cold_chk is not None and walk_chk is not None:
+        try:
+            cold = {}
+            for k in bars:
+                w = df.iloc[max(0, k + 1 - window): k + 1]
+                cold[k] = _per_bar_sig_key(cold_chk(w))
+            walk_vals = {}
+            for i in range(lo, n):
+                w = df.iloc[max(0, i + 1 - window): i + 1]
+                v = _per_bar_sig_key(walk_chk(w))
+                if i in cold:
+                    walk_vals[i] = v
+            for k in bars:
+                if cold.get(k) != walk_vals.get(k):
+                    return False
+        except Exception:
+            pass  # best-effort — determinism (1) already certified the dominant hazard
+    return True
+
+
+def _certify_per_bar_pure(strategy_obj, df: "pd.DataFrame", warmup: int) -> bool:
+    """Cached purity verdict (probed once per strategy+params).
+
+    A frame too short to probe (warmup band / a tiny WFA fold) returns True
+    TRANSIENTLY — WITHOUT caching — so a later real probe on a full frame supersedes
+    it (otherwise an impure strategy first seen on a tiny frame would be certified
+    pure forever and run on the kernel exactly where the guard meant to refuse it).
+    """
+    n = len(df)
+    lo = max(int(warmup), 0)
+    if n - lo < 3:
+        return True  # too few tradeable bars to probe — allow transiently, do NOT cache
+    sid = str(getattr(strategy_obj, "strategy_id", "") or id(strategy_obj))
+    key = (sid, _per_bar_params_signature(strategy_obj))
+    cached = _PER_BAR_PURITY_CACHE.get(key)
+    if cached is not None:
+        _PER_BAR_PURITY_CACHE.move_to_end(key)
+        return cached
+    verdict = _probe_per_bar_pure(strategy_obj, df, warmup)
+    _PER_BAR_PURITY_CACHE[key] = verdict
+    if len(_PER_BAR_PURITY_CACHE) > _PER_BAR_PURITY_CACHE_MAX:
+        _PER_BAR_PURITY_CACHE.popitem(last=False)
+    return verdict
+
+
+def _signals_from_per_bar(
+    strategy_obj, df: "pd.DataFrame", *, warmup: int, trade_mode: str = "long_only",
+) -> "DirectionalSignals | None":
+    """ADAPTER: build vectorized directional signals by walking a strategy's per-bar
+    ``generate_signal`` / ``check_signal`` across the frame, so the kernel can run
+    strategies that expose NO vectorized ``generate_signals``.
+
+    Each bar's signal is computed from a bounded TRAILING window (``iloc[i+1-W:i+1]``),
+    so the value at bar i is independent of any later bars — the prefix-stability the
+    kernel + scanner-replay parity relies on (the window matches the legacy slow path's
+    ``max(warmup*3, 1000)``, so a given timestamp yields the identical signal whether
+    over the backtest's full frame or the scanner's trailing window).
+
+    Direction routing:
+      - single-side modes (long_only / short_only): an ``entry_signal`` opens in the
+        MODE's direction (the per-bar ``Signal.direction`` is NOT consulted — it defaults
+        to 'long' on every Signal, so it can't distinguish an explicit long from a
+        defaulted one, which is why a short_only strategy that omitted direction used to
+        silently stop trading).
+      - ``both`` mode: each entry/exit is routed to the long OR short side BY the
+        signal's ``direction`` (matching the legacy 'both' loop, where a default-'long'
+        Signal is a long). One walk produces a proper directional 4-series that the
+        kernel runs as a single both-mode pass — NOT a long+short straddle on every bar.
+
+    Returns None when the strategy has no usable per-bar method, is impure (the purity
+    guard refuses it), or the walk errors on the latest bar or on most bars (a broken
+    strategy must be SURFACED/flagged, not silently emit an all-False "no trades").
+    """
+    mode = str(trade_mode or "long_only").strip().lower()
+    route_by_signal = (mode == "both")
+    is_short_mode = (mode == "short_only")
+
+    checker = _per_bar_checker(strategy_obj)
+    if checker is None or df is None or len(df) == 0:
+        return None
+
+    sid = str(getattr(strategy_obj, "strategy_id", "") or id(strategy_obj))
+    # PURITY GUARD: only run a per-bar strategy on the kernel if its generate_signal is
+    # a deterministic, stateless function of the trailing window. An impure one (random
+    # / cross-bar state / per-call mutation) would run SILENTLY WRONG on the kernel and
+    # diverge under scanner trailing-window replay — refuse it rather than trust it.
+    if not _certify_per_bar_pure(strategy_obj, df, warmup):
+        if sid not in _PER_BAR_IMPURE_LOGGED:
+            _PER_BAR_IMPURE_LOGGED.add(sid)
+            log.warning(
+                "per-bar adapter %s: generate_signal is non-deterministic/stateful — refusing the "
+                "kernel; its results are untrustworthy on ANY engine, fix or archive it",
+                sid,
+            )
+            try:  # operator-visible, distinct from a merely-non-vectorized strategy
+                from forven.db import log_activity
+                log_activity(
+                    "warning", "scanner",
+                    f"NON-DETERMINISTIC: {sid} generate_signal is non-deterministic/stateful — its "
+                    "backtest/paper/live results are untrustworthy; fix or archive it",
+                )
+            except Exception:
+                pass
+        return None
+
+    n = len(df)
+    idx = df.index
+    cache_key = (sid, _per_bar_params_signature(strategy_obj), mode, n, int(warmup), str(idx[0]), str(idx[-1]))
+    cached = _PER_BAR_SIGNALS_CACHE.get(cache_key)
+    if cached is not None:
+        _PER_BAR_SIGNALS_CACHE.move_to_end(cache_key)
+        return cached
+
+    long_e = np.zeros(n, dtype=bool)
+    long_x = np.zeros(n, dtype=bool)
+    short_e = np.zeros(n, dtype=bool)
+    short_x = np.zeros(n, dtype=bool)
+    window = max(int(warmup) * 3, 1000)
+    start = max(int(warmup), 0)
+    evaluated = 0
+    errors = 0
+    first_error: object = None
+    last_bar_errored = False
+    for i in range(start, n):
+        evaluated += 1
+        is_last = (i == n - 1)
+        w = df.iloc[max(0, i + 1 - window): i + 1]
+        try:
+            sig = checker(w)
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            first_error = first_error or exc
+            last_bar_errored = last_bar_errored or is_last
+            continue
+        if sig is None:
+            continue
+        if not isinstance(sig, dict):
+            to_dict = getattr(sig, "to_dict", None)
+            if not callable(to_dict):
+                continue
+            try:
+                sig = to_dict()
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                first_error = first_error or exc
+                last_bar_errored = last_bar_errored or is_last
+                continue
+        if route_by_signal:
+            # 'both': route to the side the signal names (default 'long'), so a
+            # directional 'both' strategy opens long OR short per bar — never both.
+            d = str(sig.get("direction") or "long").strip().lower()
+            side_short = d in ("short", "sell", "s")
+        else:
+            side_short = is_short_mode  # single-side: force the mode's direction
+        if sig.get("entry_signal"):
+            if side_short:
+                short_e[i] = True
+            else:
+                long_e[i] = True
+        if sig.get("exit_signal"):
+            if side_short:
+                short_x[i] = True
+            else:
+                long_x[i] = True
+
+    if errors:
+        log.warning(
+            "per-bar adapter %s: generate_signal raised on %d/%d bars (first: %r)",
+            sid, errors, evaluated, first_error,
+        )
+        # A broken strategy must be SURFACED, not silently turned into an all-False
+        # "no trades". Fail closed (→ None → flagged non-parity / legacy crashes loudly)
+        # when the LATEST bar (the one the scanner acts on) raised, or when most bars
+        # raised. Tolerate the occasional bad bar.
+        if last_bar_errored or errors * 2 >= max(evaluated, 1):
+            return None
+
+    result = DirectionalSignals(
+        long_entries=pd.Series(long_e, index=idx),
+        long_exits=pd.Series(long_x, index=idx),
+        short_entries=pd.Series(short_e, index=idx),
+        short_exits=pd.Series(short_x, index=idx),
+    )
+    _PER_BAR_SIGNALS_CACHE[cache_key] = result
+    if len(_PER_BAR_SIGNALS_CACHE) > _PER_BAR_SIGNALS_CACHE_MAX:
+        _PER_BAR_SIGNALS_CACHE.popitem(last=False)
+    return result
+
+
 def run_strategy_execution(
     df: "pd.DataFrame",
     strategy_obj,
@@ -6788,8 +7104,18 @@ def run_strategy_execution(
     """
     runtime_params = _strategy_runtime_params(params, strategy_obj)
     vectorized = _resolve_strategy_vectorized_signals(strategy_obj, df)
+    if vectorized is None and _per_bar_kernel_adapter_enabled():
+        # ADAPTER: the strategy has no vectorized generate_signals, but the kernel can
+        # still run it by walking its per-bar generate_signal into signal series — so
+        # per-bar strategies get FULL backtest parity (kernel entry/exit/sizing/costs)
+        # in the backtest, paper, AND live, instead of the divergent legacy slow path.
+        # trade_mode is threaded so a short_only strategy shorts and a 'both' strategy
+        # routes each entry/exit by the signal's direction (one both-mode kernel run, no
+        # long+short straddle). Backtest reaches this BEFORE _run_signal_walk's 'both'
+        # split (run_strategy_execution is tried first), so backtest+scanner agree.
+        vectorized = _signals_from_per_bar(strategy_obj, df, warmup=warmup, trade_mode=trade_mode)
     if vectorized is None:
-        return None  # no vectorized signals → caller uses the per-bar slow path
+        return None  # no vectorized AND no per-bar signals → caller uses the slow path
     if len(df) < warmup + 2:
         return _kernel.KernelResult()  # signals exist but not enough bars → no trades
 

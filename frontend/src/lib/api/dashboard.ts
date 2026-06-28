@@ -79,6 +79,8 @@ export interface DashboardActionItem {
 export interface LeaderboardEntry {
 	id?: string;
 	strategy_name: string;
+	// Operator-editable friendly name; null = fall back to strategy_name.
+	display_name?: string | null;
 	symbol: string;
 	timeframe: string;
 	sharpe_ratio: number;
@@ -214,9 +216,11 @@ function normalizeLeaderboardEntry(raw: unknown, index: number): LeaderboardEntr
 	const entryId = String(
 		row.id ?? lifecycleStrategyId ?? scanId ?? `${strategyName}:${symbol}:${timeframe}:${index}`
 	).trim();
+	const displayName = String(row.display_name ?? '').trim() || null;
 	return {
 		id: entryId || `${strategyName}:${symbol}:${timeframe}:${index}`,
 		strategy_name: strategyName,
+		display_name: displayName,
 		symbol,
 		timeframe,
 		sharpe_ratio: sharpe,
@@ -310,6 +314,7 @@ async function getLegacyLeaderboardEntries(): Promise<LeaderboardEntry[]> {
 		mapped.push({
 			id: String(row.id ?? ''),
 			strategy_name: String(row.name ?? row.id ?? 'Unnamed Strategy'),
+			display_name: String(row.display_name ?? '').trim() || null,
 			symbol: String(row.symbol ?? 'BTC').toUpperCase(),
 			timeframe: String(row.timeframe ?? '1h'),
 			sharpe_ratio: sharpe,

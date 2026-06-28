@@ -502,8 +502,15 @@ def _opposite_book_would_cross(asset: str, open_book: str) -> tuple[bool, str | 
         return False, None
 
 
-def _get_account_equity() -> float:
-    """Read account equity from daemon/risk state without direct exchange calls."""
+def _get_real_account_equity() -> float | None:
+    """Account equity from daemon/risk/sim state, or None when none is available.
+
+    Identical resolution order to _get_account_equity() but returns None instead of
+    the hardcoded _ACCOUNT_FALLBACK sentinel when no real snapshot exists. The LIVE
+    sizing path uses this so it FAILS CLOSED (skips the open) rather than sizing a
+    real-money order off a fabricated $1004.13 constant when the daemon/exchange
+    equity is momentarily unavailable.
+    """
     from forven.sim.clock import is_sim_active, sim_kv_key
 
     try:
@@ -561,7 +568,19 @@ def _get_account_equity() -> float:
     except Exception:
         pass
 
-    return _ACCOUNT_FALLBACK
+    return None
+
+
+def _get_account_equity() -> float:
+    """Read account equity from daemon/risk state without direct exchange calls.
+
+    Falls back to _ACCOUNT_FALLBACK when no real snapshot exists. Paper/sim sizing
+    tolerates the fallback (an isolated sandbox), but the LIVE order path MUST use
+    _get_real_account_equity() and fail closed instead — never size real money off
+    the fallback constant.
+    """
+    real = _get_real_account_equity()
+    return real if real is not None else _ACCOUNT_FALLBACK
 
 
 _PAPER_SANDBOX_INITIAL_CAPITAL = 10_000.0
@@ -1398,6 +1417,24 @@ def _paper_test_high_activity_enabled() -> bool:
 
 def _paper_stage_local_execution_only_enabled() -> bool:
     return _scanner_bool_setting("paper_stage_local_execution_only", True)
+
+
+def _paper_test_local_execution_for(strat: dict) -> bool:
+    """True when a strategy should execute LOCALLY (record a SIMULATED fill, place
+    NO real order) under paper-stage-local / paper-test settings.
+
+    This is the "no real orders while testing" contract. BOTH execution engines must
+    honor it identically: the legacy per-bar manage_positions AND the parity kernel
+    (manage_positions_via_kernel). Keeping it in one helper is what prevents the two
+    from diverging — the exact gap that let a live-typed strategy place real orders on
+    the kernel path under paper-test mode.
+    """
+    stage = str(strat.get("stage") or strat.get("status") or "").strip().lower()
+    is_paper_stage = stage in ("paper", "paper_trading")
+    if is_paper_stage and _paper_stage_local_execution_only_enabled():
+        return True
+    return _paper_test_mode_enabled() and _scanner_bool_setting("paper_test_local_execution_only", True)
+
 
 # ─── Strategy Definitions ─────────────────────────────────────────────────────
 
@@ -3844,11 +3881,7 @@ def manage_positions(
     mode_label = mode.upper()
     paper_test_mode = _paper_test_mode_enabled()
     paper_test_bypass_gates = _paper_test_bypass_gates_enabled()
-    is_paper_stage = str(strat.get("stage") or strat.get("status") or "").strip().lower() in ("paper", "paper_trading")
-    paper_stage_local_execution = is_paper_stage and _paper_stage_local_execution_only_enabled()
-    paper_test_local_execution = paper_stage_local_execution or (
-        paper_test_mode and _scanner_bool_setting("paper_test_local_execution_only", True)
-    )
+    paper_test_local_execution = _paper_test_local_execution_for(strat)
     execution_fast_path = _execution_fast_path_enabled()
     stop_loss_pct = _coerce_positive_float(p.get("stop_loss_pct"))
     take_profit_pct = _coerce_positive_float(p.get("take_profit_pct"))
@@ -4248,8 +4281,33 @@ def manage_positions(
         # The live book override below may further refine the live value.
         if execution_type in ("paper", "paper_challenger", "simulation"):
             sizing_equity = _get_paper_strategy_equity(strat_id)
-        else:
+        elif paper_test_local_execution:
+            # A "live"-typed strategy executing LOCALLY (paper-test mode): no real
+            # order is placed, so the resolved/injected account_equity is fine.
             sizing_equity = account_equity
+        else:
+            # GENUINE LIVE order: size off REAL account equity only. If the
+            # daemon/exchange equity snapshot is unavailable, FAIL CLOSED (skip the
+            # open) — never size a real-money order off the _ACCOUNT_FALLBACK
+            # constant. A funded book read below may refine this to the routed
+            # sub-account's balance.
+            sizing_equity = _get_real_account_equity()
+            if sizing_equity is None or sizing_equity <= 0:
+                msg = (
+                    "real account equity unavailable (daemon/exchange not synced) — "
+                    f"skipping live {strat['asset']} to avoid sizing off a fabricated fallback"
+                )
+                log.warning("[%s] BLOCKED %s — %s", strat_id, strat["asset"], msg)
+                try:
+                    log_activity("warning", "scanner", f"LIVE-EQUITY: {strat['asset']} ({strat_id}) — {msg}")
+                except Exception:
+                    pass
+                strategy_diag["execution_decision"] = "blocked"
+                strategy_diag["blocked_reason"] = msg
+                actions.append(f"BLOCKED {strat['asset']} — {msg}")
+                if diagnostics is not None:
+                    diagnostics[strat_id] = strategy_diag
+                return actions
         live_books_on = False
         if execution_type == "live":
             from forven.exchange import books
@@ -5152,12 +5210,20 @@ def _paper_kernel_execution_enabled() -> bool:
 
 
 def _paper_legacy_fallback_enabled() -> bool:
-    """When False (default), a kernel-eligible strategy that exposes NO vectorized
-    signals is flagged as non-parity and NOT traded on the divergent legacy per-bar
-    engine — a strategy that cannot run the kernel cannot reproduce its backtest, so
-    fail closed (the operator's no-auto-fallback stance). Set true to restore the
-    legacy fallback for non-vectorizable strategies."""
-    return _scanner_bool_setting("paper_legacy_fallback_enabled", False)
+    """When True (DEFAULT), a kernel-eligible strategy that exposes NO vectorized
+    signals is traded on the legacy per-bar engine rather than being silently not
+    traded — an operator can't have a strategy that looks deployed but never opens a
+    position. The strategy is clearly FLAGGED non-parity (its paper results won't
+    match its backtest, so it must not be promoted to live on those numbers).
+
+    Set false to restore the strict fail-closed parity stance (skip it instead).
+
+    NOTE: the proper fix is the per-bar→kernel adapter (walk generate_signal across
+    bars to feed the kernel), which gives these strategies FULL backtest parity
+    instead of the divergent legacy engine; this flag is the visible safety net
+    until that lands.
+    """
+    return _scanner_bool_setting("paper_legacy_fallback_enabled", True)
 
 
 def _paper_include_funding_enabled() -> bool:
@@ -5704,8 +5770,17 @@ def _kernel_handle_late_entry_exits(strat_id: str, strat: dict, df: "pd.DataFram
 
 def _live_kernel_execution_enabled() -> bool:
     """Gate for routing LIVE-stage strategies through the kernel (same decisions as
-    paper/backtest, REAL fills). Default OFF — opt-in, testnet-first."""
-    return _scanner_bool_setting("live_kernel_execution", False)
+    paper/backtest, REAL fills).
+
+    Default ON: deployed strategies execute on the SAME validated parity kernel that
+    drives the backtest and paper, so live behaviour matches the results the
+    promotion gate approved (the legacy engine's entry-timing/exit/PnL conventions
+    diverge from the backtest — "achievable backtest returns" requires the kernel).
+    Live still trades Hyperliquid TESTNET unless FORVEN_ALLOW_MAINNET=1, so the
+    default-on blast radius is testnet-bounded. An operator can set
+    live_kernel_execution=false to fall back to the legacy live engine.
+    """
+    return _scanner_bool_setting("live_kernel_execution", True)
 
 
 def _is_live_kernel_stage(strat: dict) -> bool:
@@ -5905,7 +5980,23 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             log.warning("[%s] kernel paper: funding application failed (%s); net-of-fees only", strat_id, exc)
 
     is_live = str(execution_type).strip().lower() == "live"
-    sizing_equity = _get_account_equity() if is_live else _get_paper_strategy_equity(strat_id)
+    # Honor the paper-test "no real orders" contract the legacy path enforces: a
+    # live-typed strategy running under paper-test LOCAL execution must record a
+    # SIMULATED fill (paper appliers), never place a real Hyperliquid order. Without
+    # this, flipping live_kernel_execution ON would route such a strategy to the real
+    # _kernel_open_live_trade path. Downgrade to the paper path (sim fills, paper
+    # sizing) exactly as _open_via_execution/_close_via_execution do.
+    if is_live and _paper_test_local_execution_for(strat):
+        is_live = False
+    # LIVE sizes off REAL equity only; if unavailable, OPENs fail closed below
+    # (never size real money off the _ACCOUNT_FALLBACK constant), but close/refresh
+    # actions still run so a live position can always be managed/exited.
+    live_equity_unavailable = False
+    if is_live:
+        sizing_equity = _get_real_account_equity()
+        live_equity_unavailable = sizing_equity is None or sizing_equity <= 0
+    else:
+        sizing_equity = _get_paper_strategy_equity(strat_id)
     # Only RECORD activity from go-live forward — never replay the strategy's entire
     # would-be history as trades (that floods a fresh/reset book). Pre-cutoff trades show
     # on the chart as triggers, not recorded trades; closes/refreshes of already-recorded
@@ -5963,6 +6054,14 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     for a in actions_plan:
         try:
             if a.kind == "open":
+                if is_live and live_equity_unavailable:
+                    log.warning(
+                        "[%s] kernel live: real account equity unavailable — skipping OPEN %s "
+                        "to avoid sizing off a fabricated fallback",
+                        strat_id, asset,
+                    )
+                    out.append(f"BLOCKED {asset} — real account equity unavailable for live sizing")
+                    continue
                 msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage,
                                    current_price=hop_price, current_time=hop_time)
             elif a.kind in ("close", "backfill"):
@@ -6431,17 +6530,17 @@ def _apply_execution_actions(signal_rows: list[dict], diagnostics_out: dict[str,
             strat = item["strategy"]
             signal = item["signal"]
             actions = None
-            kernel_attempted = False
+            kernel_mode: str | None = None  # 'paper' | 'live'
             # Parity path: strategies with vectorized signals are managed by the shared
             # backtest kernel (paper trades == backtest trades; live takes the SAME
             # decisions with real fills).
             if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
-                kernel_attempted = True
+                kernel_mode = "paper"
                 actions = manage_positions_via_kernel(
                     strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
                 )
             elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
-                kernel_attempted = True
+                kernel_mode = "live"
                 actions = manage_positions_via_kernel(
                     strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
                 )
@@ -6454,24 +6553,77 @@ def _apply_execution_actions(signal_rows: list[dict], diagnostics_out: dict[str,
             if actions is None:
                 # actions is None means: kernel not attempted (disabled / not a kernel
                 # stage) OR the strategy is genuinely non-vectorizable.
-                if kernel_attempted and not _paper_legacy_fallback_enabled():
-                    # Kernel-eligible but non-vectorizable: a strategy that cannot run
-                    # the kernel cannot reproduce its backtest. Fail closed — flag it
-                    # as non-parity instead of trading it on the divergent legacy path.
+                if kernel_mode == "paper":
+                    if not _paper_legacy_fallback_enabled():
+                        # Strict fail-closed (operator opted OUT of the fallback): a
+                        # strategy that cannot run the kernel cannot reproduce its
+                        # backtest, so flag non-parity and don't trade it.
+                        if diagnostics_out is not None:
+                            diagnostics_out[strat_id] = {
+                                "strategy_id": strat_id,
+                                "execution_decision": "non_vectorizable_no_parity",
+                                "reason": "strategy exposes no vectorized generate_signals; "
+                                          "not traded (paper_legacy_fallback_enabled is off)",
+                                "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                            }
+                        log.warning(
+                            "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
+                            "(paper_legacy_fallback_enabled is off)",
+                            strat_id,
+                        )
+                        continue
+                    # Fallback ON (default): trade it on the legacy per-bar engine rather
+                    # than letting it silently never trade — but FLAG it loudly so the
+                    # operator knows it is NOT on the backtest-parity path (and must not be
+                    # promoted to live on these numbers).
                     if diagnostics_out is not None:
                         diagnostics_out[strat_id] = {
                             "strategy_id": strat_id,
-                            "execution_decision": "non_vectorizable_no_parity",
-                            "reason": "strategy exposes no vectorized generate_signals; "
-                                      "not traded on the legacy engine (set paper_legacy_fallback_enabled to override)",
+                            "execution_decision": "non_vectorizable_legacy",
+                            "reason": "no vectorized generate_signals; traded on the legacy per-bar "
+                                      "engine (NOT kernel/backtest parity)",
                             "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
                         }
                     log.warning(
-                        "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
-                        "(enable paper_legacy_fallback_enabled to trade it on the legacy path)",
+                        "[%s] paper: non-vectorizable strategy has no parity engine; trading on the "
+                        "legacy per-bar engine (NOT backtest parity)",
                         strat_id,
                     )
-                    continue
+                    try:
+                        log_activity(
+                            "warning", "scanner",
+                            f"NON-PARITY: {strat_id} has no vectorized signals; traded on the legacy "
+                            "per-bar engine (not kernel/backtest parity)",
+                        )
+                    except Exception:
+                        pass
+                if kernel_mode == "live":
+                    # LIVE, non-vectorizable: the kernel can't reproduce it, but a REAL
+                    # open position must stay strategy-managed (entry AND exit) — going
+                    # dark would leave it protected only by resting exchange SL/TP. Fall
+                    # through to the legacy live engine (pre-kernel behaviour) and surface
+                    # the loss of backtest parity to the operator.
+                    if diagnostics_out is not None:
+                        diagnostics_out[strat_id] = {
+                            "strategy_id": strat_id,
+                            "execution_decision": "live_non_vectorizable_legacy",
+                            "reason": "no vectorized generate_signals; managed on the legacy live "
+                                      "engine (NOT kernel/backtest parity)",
+                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                        }
+                    log.warning(
+                        "[%s] live: non-vectorizable strategy has no parity kernel; managing on the "
+                        "legacy live engine (not backtest parity)",
+                        strat_id,
+                    )
+                    try:
+                        log_activity(
+                            "warning", "scanner",
+                            f"LIVE-NON-PARITY: {strat_id} has no vectorized signals; managed on the "
+                            "legacy live engine (not kernel/backtest parity)",
+                        )
+                    except Exception:
+                        pass
                 actions = manage_positions(
                     strat_id,
                     strat,

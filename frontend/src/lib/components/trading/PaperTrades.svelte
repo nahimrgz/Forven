@@ -262,6 +262,32 @@
 		return kind === 'deployed';
 	}
 
+	// Capital to render on a card: deployed/live -> the REAL Hyperliquid wallet equity
+	// (account_value); paper -> the simulated sandbox capital. Returns null for a
+	// deployed session whose real balance has not synced yet, so the UI shows
+	// "balance unavailable" instead of the fabricated $10k sandbox base.
+	function displayCapital(session: PaperTradingSession | null | undefined): number | null {
+		if (!session) return null;
+		if (isDeployedCompatSession(session)) {
+			// Nullish FIRST — Number(null) === 0 would render a fabricated "$0.00 · real"
+			// wallet for a deployed session whose balance hasn't synced (account_value null).
+			if (session.account_value == null) return null;
+			const v = Number(session.account_value);
+			return Number.isFinite(v) ? v : null;
+		}
+		const c = Number(session.capital);
+		return Number.isFinite(c) ? c : null;
+	}
+
+	// 'real' when a deployed session is showing a genuine exchange balance,
+	// 'unavailable' when it is deployed but the balance has not synced, else null
+	// (paper). Drives the small tag next to the live Capital figure.
+	function balanceState(session: PaperTradingSession | null | undefined): 'real' | 'unavailable' | null {
+		if (!isDeployedCompatSession(session)) return null;
+		const src = String(session?.balance_source ?? '').toLowerCase();
+		return src === 'exchange' || src === 'books_aggregate' ? 'real' : 'unavailable';
+	}
+
 	// Manual controls are enabled for every compat session — paper AND deployed/live.
 	// On a deployed session the backend routes actions to REAL Hyperliquid orders
 	// (close = reduce-only, open = market + resting SL/TP). The backend re-checks
@@ -507,6 +533,22 @@
 				timestamp: indicatorTimestamp,
 			},
 		};
+
+		// Deployed/live sessions: capital, total_pnl and the position's unrealized P&L
+		// are REAL exchange values supplied by the server. A price tick must NOT
+		// recompute them off the synthetic initial_capital — that would re-fake the
+		// live equity between server refreshes. Update only the live price line/marker.
+		if (isDeployedCompatSession(session)) {
+			if (Math.abs((session.current_price ?? 0) - nextPrice) < 1e-9) {
+				return session;
+			}
+			return {
+				...session,
+				current_price: nextPrice,
+				position: session.position ? { ...session.position, current_price: nextPrice } : session.position,
+				indicators: nextIndicators,
+			};
+		}
 
 		if (!session.position) {
 			if (Math.abs((session.current_price ?? 0) - nextPrice) < 1e-9) {
@@ -1080,7 +1122,7 @@
 		editSessionStrategy = session.strategy_name;
 		editSessionSymbol = session.symbol;
 		editSessionTimeframe = session.timeframe;
-		editSessionCapital = session.initial_capital;
+		editSessionCapital = session.initial_capital ?? 10000;
 		editSessionPositionSize = session.position_size_pct;
 		editSessionStopLoss = session.stop_loss_pct;
 		editSessionTakeProfit = session.take_profit_pct;
@@ -2560,7 +2602,15 @@
 									{session.symbol} | {session.timeframe} | {session.mode}
 								</div>
 								<div class="text-[10px] w-full flex justify-between">
-									<span class="text-gray-600">{formatPrice(session.capital)}</span>
+									{#if isDeployedCompatSession(session)}
+										{#if balanceState(session) === 'real'}
+											<span class="text-gray-600" title="Real Hyperliquid balance">{formatPrice(displayCapital(session))}</span>
+										{:else}
+											<span class="text-amber-500" title="Live balance not synced yet">— bal n/a</span>
+										{/if}
+									{:else}
+										<span class="text-gray-600">{formatPrice(session.capital)}</span>
+									{/if}
 									{#if session.position}
 										<span class="{session.position.unrealized_pnl > 0 ? 'text-green-400' : session.position.unrealized_pnl < 0 ? 'text-red-400' : 'text-gray-400'}">
 											[{formatDollarPnl(session.position.unrealized_pnl)} {formatPercent(session.position.unrealized_pnl_pct)}]
@@ -2705,7 +2755,23 @@
 					</span>
 					<span>
 						<span class="text-gray-500">Capital</span>
-						<span class="text-white font-bold ml-1">{formatPrice(selectedSession.capital)}</span>
+						{#if isLiveSelected}
+							{#if balanceState(selectedSession) === 'real'}
+								<span class="text-white font-bold ml-1">{formatPrice(displayCapital(selectedSession))}</span>
+								<span
+									class="text-[9px] uppercase tracking-wider text-green-500 ml-1"
+									title="Real Hyperliquid balance{selectedSession.account_synced_at ? ` (synced ${selectedSession.account_synced_at})` : ''}"
+								>real{selectedSession.account_network ? ` · ${selectedSession.account_network}` : ''}</span>
+							{:else}
+								<span class="text-amber-400 font-bold ml-1">—</span>
+								<span
+									class="text-[9px] uppercase tracking-wider text-amber-400 ml-1"
+									title="The live Hyperliquid balance has not synced yet (daemon/exchange). No fabricated value is shown."
+								>balance unavailable</span>
+							{/if}
+						{:else}
+							<span class="text-white font-bold ml-1">{formatPrice(selectedSession.capital)}</span>
+						{/if}
 					</span>
 					<span>
 						<span class="text-gray-500">P&L</span>
@@ -2969,7 +3035,15 @@
 							{/if}
 						{/if}
 						<span class="text-gray-500">Capital</span>
-						<span class="text-gray-300">{formatPrice(selectedSession.initial_capital)}</span>
+						{#if isLiveSelected}
+							{#if balanceState(selectedSession) === 'real'}
+								<span class="text-gray-300">{formatPrice(displayCapital(selectedSession))}</span>
+							{:else}
+								<span class="text-amber-400">balance unavailable</span>
+							{/if}
+						{:else}
+							<span class="text-gray-300">{formatPrice(selectedSession.initial_capital)}</span>
+						{/if}
 						<span class="text-gray-500">Position Size</span>
 						<span class="text-gray-300">{selectedSession.position_size_pct}%</span>
 						{#if selectedSession.mode === 'replay'}

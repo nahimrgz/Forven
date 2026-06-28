@@ -13,6 +13,7 @@
 		promoteForvenStrategy,
 		submitBacktest,
 		submitOptimization,
+		updateStrategyDisplayName,
 		type BacktestResult,
 		type Dataset,
 		type PipelineSettings,
@@ -85,6 +86,74 @@
 		showImportDialog = false;
 		if (result.ok && result.strategy_id) {
 			void goto(`/lab/strategy/${encodeURIComponent(result.strategy_id)}`);
+		}
+	}
+
+	// ── Display-name editing ─────────────────────────────────────────────────────
+	// Friendly name override for the container; falls back to the canonical
+	// {ASSET}-{TYPE}-{ID} name when blank.
+	let editingName = false;
+	let nameDraft = '';
+	let savingName = false;
+
+	function startEditName(): void {
+		if (!container) return;
+		nameDraft = container.strategy.display_name ?? '';
+		editingName = true;
+	}
+
+	function cancelEditName(): void {
+		editingName = false;
+		nameDraft = '';
+	}
+
+	async function saveName(): Promise<void> {
+		if (!container || savingName) return;
+		const strategyIdValue = container.strategy.id;
+		const next = nameDraft.trim();
+		// No-op if unchanged (treat null/'' as equivalent).
+		if ((container.strategy.display_name ?? '') === next) {
+			cancelEditName();
+			return;
+		}
+		savingName = true;
+		try {
+			const res = await updateStrategyDisplayName(strategyIdValue, next || null);
+			// Reassign container so Svelte picks up the nested change.
+			container = {
+				...container,
+				strategy: { ...container.strategy, display_name: res.display_name },
+			};
+			editingName = false;
+			nameDraft = '';
+			addToast(
+				res.display_name ? `Renamed to "${res.display_name}"` : 'Display name reset to default',
+				'success',
+				`/lab/strategy/${encodeURIComponent(strategyIdValue)}`,
+			);
+		} catch (err) {
+			addToast(
+				err instanceof Error ? err.message : 'Failed to update display name',
+				'error',
+				`/lab/strategy/${encodeURIComponent(strategyIdValue)}`,
+			);
+		} finally {
+			savingName = false;
+		}
+	}
+
+	function focusAndSelect(node: HTMLInputElement): void {
+		node.focus();
+		node.select();
+	}
+
+	function onNameKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void saveName();
+		} else if (event.key === 'Escape') {
+			event.preventDefault();
+			cancelEditName();
 		}
 	}
 
@@ -3462,7 +3531,7 @@
 </script>
 
 <svelte:head>
-	<title>{container?.strategy.name ?? strategyId} · Lab</title>
+	<title>{container?.strategy.display_name || container?.strategy.name || strategyId} · Lab</title>
 </svelte:head>
 
 <div class="h-full flex flex-col overflow-hidden">
@@ -3476,7 +3545,55 @@
 		</button>
 		<span class="text-gray-700">|</span>
 		{#if container}
-			<StrategyLink strategyId={container.strategy.id} label={container.strategy.name} returnTo={returnTo} />
+			{#if editingName}
+				<input
+					use:focusAndSelect
+					class="rounded border border-cyan-700 bg-black px-2 py-0.5 font-mono text-[11px] text-cyan-100 focus:border-cyan-400 focus:outline-none disabled:opacity-50"
+					style="min-width: 220px"
+					maxlength="140"
+					bind:value={nameDraft}
+					placeholder={container.strategy.name}
+					disabled={savingName}
+					on:keydown={onNameKeydown}
+					aria-label="Display name"
+				/>
+				<button
+					type="button"
+					class="rounded border border-emerald-700/60 bg-emerald-950/30 px-2 py-0.5 text-[11px] text-emerald-200 transition hover:bg-emerald-900/40 disabled:opacity-50"
+					title="Save display name (Enter)"
+					disabled={savingName}
+					on:click={saveName}
+				>
+					{savingName ? '…' : 'Save'}
+				</button>
+				<button
+					type="button"
+					class="rounded border border-[#2b2b2b] px-2 py-0.5 text-[11px] text-gray-400 transition hover:text-white disabled:opacity-50"
+					title="Cancel (Esc)"
+					disabled={savingName}
+					on:click={cancelEditName}
+				>
+					Cancel
+				</button>
+			{:else}
+				<StrategyLink strategyId={container.strategy.id} label={container.strategy.display_name || container.strategy.name} returnTo={returnTo} />
+				<button
+					type="button"
+					data-testid="edit-display-name-button"
+					class="text-gray-500 transition-colors hover:text-cyan-300"
+					title="Edit display name"
+					aria-label="Edit display name"
+					on:click={startEditName}
+				>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M12 20h9" />
+						<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+					</svg>
+				</button>
+				{#if container.strategy.display_name}
+					<span class="font-mono text-[10px] text-gray-600" title="Canonical name">({container.strategy.name})</span>
+				{/if}
+			{/if}
 			{#if container.strategy.hypothesis_id}
 				{@const hypothesisHrefId = container.strategy.hypothesis_display_id || container.strategy.hypothesis_id}
 				{@const hypothesisLabelId = container.strategy.hypothesis_display_id || container.strategy.hypothesis_id}

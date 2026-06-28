@@ -21,8 +21,17 @@ def test_is_live_kernel_stage():
     assert scanner._is_live_kernel_stage({"stage": "gauntlet"}) is False
 
 
-def test_live_kernel_execution_is_off_by_default(forven_db):
-    # No setting written → default must be False (opt-in, testnet-first).
+def test_live_kernel_execution_is_on_by_default(forven_db):
+    # Deployed strategies execute on the validated parity kernel by default so live
+    # matches the backtest/paper results the promotion gate approved (testnet-bounded
+    # unless FORVEN_ALLOW_MAINNET=1). Operators can still opt out via the setting.
+    assert scanner._live_kernel_execution_enabled() is True
+
+
+def test_live_kernel_execution_can_be_disabled(forven_db):
+    from forven.db import kv_set
+
+    kv_set("forven:settings", {"live_kernel_execution": False})
     assert scanner._live_kernel_execution_enabled() is False
 
 

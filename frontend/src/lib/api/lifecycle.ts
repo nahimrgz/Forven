@@ -56,6 +56,8 @@ export interface LifecycleStrategy {
 	hypothesis_id?: string | null;
 	hypothesis_display_id?: string | null;
 	name: string;
+	// Operator-editable friendly name; null = fall back to the canonical `name`.
+	display_name?: string | null;
 	type: string | null;
 	state: string;
 	source: string;
@@ -108,6 +110,7 @@ function parseLifecycleStrategy(raw: unknown): LifecycleStrategy {
 	return {
 		...parsed,
 		display_id: displayId,
+		display_name: parsed.display_name == null ? null : String(parsed.display_name).trim() || null,
 		type: parsed.type == null ? null : String(parsed.type).trim() || null,
 		hypothesis_id: parsed.hypothesis_id == null ? null : String(parsed.hypothesis_id).trim() || null,
 		hypothesis_display_id: parsed.hypothesis_display_id == null ? null : String(parsed.hypothesis_display_id).trim() || null,
@@ -871,6 +874,20 @@ export async function transitionStage(
 		from: promoted.from_status,
 		to: promoted.to_status,
 	};
+}
+
+// Set or clear a strategy's operator-facing display name. Pass null/'' to reset to
+// the canonical {ASSET}-{TYPE}-{ID} name. The canonical `name` is never overwritten.
+export async function updateStrategyDisplayName(
+	strategyId: string,
+	displayName: string | null,
+): Promise<{ ok: boolean; strategy_id: string; name: string; display_name: string | null }> {
+	const cleaned = (displayName ?? '').trim();
+	return fetchApi(`/strategies/${encodeURIComponent(strategyId)}/display-name`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ display_name: cleaned || null }),
+	});
 }
 
 export async function getGraveyard(): Promise<{ active: ContainerStrategy[]; archived: ContainerStrategy[] }> {

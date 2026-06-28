@@ -2078,9 +2078,9 @@ def test_transient_kernel_failure_skips_without_legacy(monkeypatch):
     assert legacy == []  # legacy engine never ran
 
 
-def test_non_vectorizable_is_flagged_not_legacy_traded_by_default(monkeypatch):
-    # kernel returns None (genuinely non-vectorizable) + fallback disabled (default)
-    # → flag non-parity, do NOT trade on legacy.
+def test_non_vectorizable_fails_closed_when_fallback_disabled(monkeypatch):
+    # Opt-out: with the fallback OFF, a non-vectorizable strategy is flagged
+    # non-parity and NOT traded on the divergent legacy engine.
     legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=None)
     monkeypatch.setattr(scanner_mod, "_paper_legacy_fallback_enabled", lambda: False)
     diag: dict = {}
@@ -2090,13 +2090,16 @@ def test_non_vectorizable_is_flagged_not_legacy_traded_by_default(monkeypatch):
     assert diag["S-FB"]["execution_decision"] == "non_vectorizable_no_parity"
 
 
-def test_non_vectorizable_uses_legacy_when_fallback_enabled(monkeypatch):
-    # Opt-in: enabling the legacy fallback restores trading non-vectorizable strategies.
+def test_non_vectorizable_trades_on_legacy_and_is_flagged_by_default(monkeypatch):
+    # DEFAULT (fallback on): a non-vectorizable strategy trades on the legacy engine
+    # rather than silently never trading — and is FLAGGED non-parity (not silent).
     legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=None)
     monkeypatch.setattr(scanner_mod, "_paper_legacy_fallback_enabled", lambda: True)
-    actions = scanner_mod._apply_execution_actions(_one_signal_row())
+    diag: dict = {}
+    actions = scanner_mod._apply_execution_actions(_one_signal_row(), diagnostics_out=diag)
     assert actions == ["LEGACY-OPENED"]
     assert legacy == ["S-FB"]
+    assert diag["S-FB"]["execution_decision"] == "non_vectorizable_legacy"
 
 
 # ── orphan converge-close (paper never holds a trade the kernel has exited) ───

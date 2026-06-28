@@ -107,7 +107,7 @@ export interface PaperTradingSession {
 	replay_end?: string | null;
 	replay_speed?: number;
 	replay_state?: ReplayState;
-	initial_capital: number;
+	initial_capital: number | null;
 	position_size_pct: number;
 	stop_loss_pct: number | null;
 	take_profit_pct: number | null;
@@ -131,9 +131,19 @@ export interface PaperTradingSession {
 	indicators: Record<string, LiveIndicator>;
 	pending_signals: PendingSignal[];
 	last_signal: string;
-	capital: number;
+	capital: number | null;
+	// Real Hyperliquid balance (deployed/live sessions only). For paper sessions
+	// account_value is null and balance_source is 'simulated'. balance_source is
+	// 'unavailable' for a deployed session whose real balance hasn't synced yet —
+	// the UI must show "balance unavailable", never the simulated $10k base.
+	account_value?: number | null;
+	account_withdrawable?: number | null;
+	account_margin_used?: number | null;
+	balance_source?: 'exchange' | 'books_aggregate' | 'simulated' | 'unavailable' | string | null;
+	account_network?: string | null;
+	account_synced_at?: string | null;
 	total_pnl: number;
-	total_pnl_pct: number;
+	total_pnl_pct: number | null;
 	total_trades: number;
 	winning_trades: number;
 	performance?: PaperSessionPerformance;

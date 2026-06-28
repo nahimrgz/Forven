@@ -228,6 +228,7 @@ def _compute_dashboard_leaderboard_entries() -> list[dict[str, object]]:
             {
                 "id": strategy_id or f"{row.get('name') or 'strategy'}:{symbol}:{timeframe}",
                 "strategy_name": str(row.get("name") or strategy_id or "Unnamed Strategy").strip() or "Unnamed Strategy",
+                "display_name": str(row.get("display_name") or "").strip() or None,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "sharpe_ratio": sharpe,

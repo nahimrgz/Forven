@@ -679,6 +679,7 @@ export {
 	getContainerAudit,
 	getContainerTasks,
 	transitionStage,
+	updateStrategyDisplayName,
 	getGraveyard,
 	reviveFromGraveyard,
 	deleteStrategy,

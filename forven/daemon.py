@@ -1175,7 +1175,7 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
         return None
 
 
-def _check_liquidation_distances() -> None:
+def _check_liquidation_distances() -> dict:
     """H7: warn the operator when any OPEN position drifts toward liquidation.
 
     The only margin gate today is at OPEN time (80%); nothing watches an open
@@ -1183,7 +1183,14 @@ def _check_liquidation_distances() -> None:
     (master + direction sub-accounts) each tick and alerts (throttled via the
     notification cooldown) at warn / critical distance thresholds. Best-effort —
     never raises into the risk loop.
+
+    Also returns a compact {"ASSET:direction": {...}} snapshot of the exchange's
+    reported mark / unrealized PnL / entry for every open position, so the live
+    session view can show the authoritative exchange P&L without issuing its own
+    (WS-starving) exchange call — it reuses the positions this sweep already fetches.
+    Returns {} on any failure.
     """
+    snapshot: dict[str, dict] = {}
     try:
         from forven.db import kv_get
         from forven.exchange import books
@@ -1228,6 +1235,20 @@ def _check_liquidation_distances() -> None:
                     continue
                 if not coin or szi == 0 or mark <= 0:
                     continue
+                # Record the exchange's authoritative position economics for the live
+                # session view (keyed by asset+direction; last account wins on a dup).
+                try:
+                    direction = "long" if szi > 0 else "short"
+                    snapshot[f"{coin}:{direction}"] = {
+                        "asset": coin,
+                        "direction": direction,
+                        "mark_price": mark,
+                        "entry_price": (float(pos.get("entryPx") or 0) or None),
+                        "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
+                        "size": abs(szi),
+                    }
+                except Exception:
+                    pass
                 if liq <= 0:
                     # Hyperliquid omits per-position liquidationPx for cross-margin
                     # positions (the liq price is account-wide). We can't compute a
@@ -1264,6 +1285,7 @@ def _check_liquidation_distances() -> None:
                     pass
     except Exception as exc:
         log.debug("Liquidation-distance check failed: %s", exc)
+    return snapshot
 
 
 async def _run_risk_cycle() -> dict:
@@ -1403,11 +1425,17 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
     if now - _LAST_LIQ_CHECK[0] >= LIQ_CHECK_INTERVAL_SECONDS:
         _LAST_LIQ_CHECK[0] = now
         try:
-            await _to_thread_with_timeout(
+            positions_snapshot = await _to_thread_with_timeout(
                 "daemon.liquidation_check",
                 RISK_ACCOUNT_TIMEOUT_SECONDS,
                 _check_liquidation_distances,
             )
+            # Cache the exchange's reported mark / unrealized PnL per position so the
+            # live session view shows the authoritative exchange P&L (refreshed on
+            # this 60s cadence) without its own exchange round-trip.
+            if isinstance(positions_snapshot, dict):
+                state["exchange_positions"] = positions_snapshot
+                state["exchange_positions_synced_at"] = _iso_now()
         except Exception:
             pass
 
