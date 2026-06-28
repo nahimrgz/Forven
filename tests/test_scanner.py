@@ -2247,3 +2247,47 @@ def test_kernel_close_orphan_closes_the_trade(forven_db):
     with get_db() as conn:
         row = dict(conn.execute("SELECT status FROM trades WHERE id = ?", (tid,)).fetchone())
     assert row["status"] == "CLOSED"
+
+
+def test_kernel_cross_asset_orphan_is_flat_closed_not_refreshed(forven_db):
+    """Regression (S04545): when a strategy's symbol flips (e.g. an ETH backtest was
+    pinned onto a SOL strategy) while a position is open, the stale-asset open must NOT
+    be reconciled/refreshed against the new asset's kernel position (which spliced the
+    new asset's stop/target onto the old asset's entry → fake -95% loss). It is held out
+    of reconcile and flat-closed at its own entry."""
+    import json as _json
+
+    from forven.db import get_db
+    from forven.scanner import _kernel_close_cross_asset_orphan, _kernel_recorded_trades
+
+    # A SOL strategy with a lingering ETH-entry OPEN paper trade (kernel-managed).
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO trades "
+            "(id, strategy, strategy_id, asset, symbol, direction, entry_price, signal_entry_price, "
+            " fill_entry_price, size, risk_pct, leverage, status, execution_type, source, signal_data, opened_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 'paper', 'paper', ?, datetime('now'))",
+            (
+                "E-XA-1", "S-XA", "S-XA", "ETH", "ETH", "long",
+                1582.86, 1582.86, 1582.86, 6.231725, 0.02, 1.0,
+                _json.dumps({"kernel_managed": True, "kernel_entry_time": "2026-06-28 12:00:00+00:00", "price": 1582.86}),
+            ),
+        )
+
+    # The recorded-trade shaping carries the row (with its ETH asset), so the kernel guard
+    # can tell it is cross-asset relative to the now-SOL strategy.
+    recorded = _kernel_recorded_trades("S-XA")
+    eth_rows = [r for r in recorded if (r.get("_row") or {}).get("asset") == "ETH"]
+    assert eth_rows, "recorded trade should expose its asset via _row"
+
+    msg = _kernel_close_cross_asset_orphan(eth_rows[0]["_row"])
+    assert msg is not None and "CROSS-ASSET" in msg
+
+    with get_db() as conn:
+        t = conn.execute(
+            "SELECT status, exit_price, pnl FROM trades WHERE id = 'E-XA-1'"
+        ).fetchone()
+    assert str(t["status"]).upper() == "CLOSED"
+    assert abs(float(t["exit_price"]) - 1582.86) < 1e-6  # flat at its OWN entry, not SOL price
+    if t["pnl"] is not None:
+        assert abs(float(t["pnl"])) < 1e-6  # no bogus PnL

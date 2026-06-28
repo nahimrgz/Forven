@@ -5651,6 +5651,38 @@ def _kernel_close_orphan(action, *, last_close: float, last_time: str) -> str | 
     return f"KERNEL-CONVERGE-CLOSE {row.get('asset')} {direction} @ {last_close:.6g} (kernel flat)"
 
 
+def _kernel_close_cross_asset_orphan(row: dict) -> str | None:
+    """Flat-close a recorded OPEN PAPER trade whose asset no longer matches the
+    strategy's CURRENT asset — a leftover from a symbol/asset flip while a position
+    was open (e.g. a pinned-backtest sync in update_strategy_default_params that
+    changed the strategy's symbol).
+
+    The reconciler matches only on (direction, entry_time) and never checks asset, so
+    it would ADOPT/refresh this stale-asset open against the new asset's kernel
+    position — splicing the new asset's stop/target onto the old asset's entry, which
+    the UI then mis-values against the new asset's price (the S04545 ETH-entry /
+    SOL-stop / fake -95% corruption). We hold these out of reconcile and close them
+    FLAT at their OWN entry (PnL 0): the position is a config-flip artifact, so zeroing
+    it clears the phantom without inventing a gain or loss.
+    """
+    trade_id = row.get("id")
+    entry_price = _coerce_positive_float(row.get("fill_entry_price")) or _coerce_positive_float(row.get("entry_price"))
+    if not trade_id or entry_price is None:
+        return None
+    # A late hop-in is owned by its own re-anchored stop monitor — never auto-flatten it here.
+    if parse_trade_signal_data(row.get("signal_data")).get("late_entry"):
+        return None
+    close_trade_record(
+        str(trade_id), signal_exit_price=float(entry_price), exit_price=float(entry_price),
+        close_reason="cross_asset_orphan", close_price_source="cross_asset_cleanup",
+        extra_signal_data={"cross_asset_orphan": True, "recorded_asset": row.get("asset")},
+    )
+    return (
+        f"KERNEL-CROSS-ASSET-CLOSE {row.get('asset')} (flat @ {float(entry_price):.6g}; "
+        "strategy asset changed — phantom cleared)"
+    )
+
+
 def _kernel_handle_manual_exits(strat_id: str, current_price: float) -> list[str]:
     """Enforce operator-set ABSOLUTE stop/take-profit on MANUAL positions of a
     kernel-managed strategy.
@@ -6035,8 +6067,23 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # chart trigger only (the pre-feature behaviour) and is NEVER auto-entered. Hard-off (not
     # operator-gateable) so a persisted setting can't silently re-arm the chase entries.
     late_entry_enabled = False
+    # Cross-asset guard: a recorded OPEN whose asset != the strategy's CURRENT asset is a
+    # leftover from a symbol/asset flip while a position was open. The reconciler matches
+    # only on (direction, entry_time) and would splice the new asset's stop/target onto the
+    # stale-asset entry (corrupting it — see _kernel_close_cross_asset_orphan / S04545). Hold
+    # those out of reconcile so they can never be adopted/refreshed across assets.
+    _strat_asset_u = asset.strip().upper()
+    _recorded = _kernel_recorded_trades(strat_id)
+    same_asset_recorded: list[dict] = []
+    cross_asset_open_rows: list[dict] = []
+    for _rec in _recorded:
+        _rec_asset = str((_rec.get("_row") or {}).get("asset") or "").strip().upper()
+        if _rec.get("status") == "open" and _rec_asset and _strat_asset_u and _rec_asset != _strat_asset_u:
+            cross_asset_open_rows.append(_rec["_row"])
+        else:
+            same_asset_recorded.append(_rec)
     actions_plan = reconcile(
-        res, _kernel_recorded_trades(strat_id), recent_cutoff=recent_cutoff, window_start=window_start,
+        res, same_asset_recorded, recent_cutoff=recent_cutoff, window_start=window_start,
         late_entry=late_entry_enabled,
     )
     # Converge-close (orphan rescue) is paper-only and operator-gateable. Drop those
@@ -6064,6 +6111,23 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             pass
 
     out: list[str] = []
+    # Resolve cross-asset orphans held out of reconcile above. Paper: flat-close the
+    # phantom (no real order). Live: never auto-flatten a REAL position off the wrong
+    # asset's price — hold it out of reconcile and surface it for operator review.
+    for _row in cross_asset_open_rows:
+        try:
+            if is_live:
+                log.warning(
+                    "[%s] kernel live: recorded OPEN on %s != strategy asset %s — held out of "
+                    "reconcile (not auto-closed); operator should review the stale-asset position",
+                    strat_id, _row.get("asset"), _strat_asset_u,
+                )
+            else:
+                _msg = _kernel_close_cross_asset_orphan(_row)
+                if _msg:
+                    out.append(_msg)
+        except Exception as exc:
+            log.error("[%s] kernel %s cross-asset orphan handling failed: %s", strat_id, label, exc, exc_info=True)
     for a in actions_plan:
         try:
             if a.kind == "open":
