@@ -51,7 +51,15 @@ Convention decision refined (operator, 2026-06-28): the literal "every close wri
 - **BOOT-1** ✅ — the API startup now stamps the startup-recovery gate `checking` (`daemon.mark_boot_recovery_pending`) BEFORE the scheduler/scanner thread spawns, so a stale `recovery_active=False` from a cleanly-exited prior run can't let a live entry through during the boot window before the daemon's boot reconcile verifies the exchange. A daemon-spawn failure releases the gate (`clear_boot_recovery_pending`) so paper isn't wedged. `api.py` lifespan + `daemon.py`. Tests: `tests/test_engine_audit_phase3.py` (RECONCILE-6 + BOOT-1, 3); 179 risk/reconcile/daemon/trading tests green.
 - **Pending Phase 3 (mediums):** RECONCILE-2/3/4 (fill attribution by oid/hash; ghost-close funding/fee completeness). Auto-recovery wiring for the two new RED freeze checks is a follow-up (the alert fires today). DATA-6 (daemon cache window) follow-up would remove the per-scan re-fetch the RESTART-1 fix can trigger.
 
-**Milestone:** both CRITICALs + every HIGH-severity finding across Phases 1–3 are now fixed and tested. Remaining work is MEDIUM/LOW robustness + cleanup + the population re-baseline.
+### Additional HIGH-severity fixes (a self-recheck caught five HIGHs missed by the first milestone claim)
+- **LATE-1** ✅ — `_resolve_paper_go_live` now fails CLOSED on a reset-anchor read error (clamps the cutoff to now) instead of dropping the reset anchor and replaying pre-reset history into a freshly-emptied book. `scanner.py`.
+- **MANUAL-1** ✅ — a manually PAUSED kernel position is now truly detached: the reconcile close/refresh appliers (paper + live) skip `manual_pause` rows, so pause-then-partial-close can't double-count PnL (paper) or re-close a detached live position. `scanner.py`.
+- **MANUAL-2** ✅ — `_kernel_refresh_paper_trade` no longer clobbers an operator-set SL/TP (`stop_loss_source`/`take_profit_source == 'manual'`); the manual level is enforced, not reverted on the next scan. `scanner.py`.
+- **DATA-1 + DATA-3** ✅ — `market_data.INTERVAL_TO_MS` now covers the HL-native interval set (30m/2h/3m/8h/12h/3d/1w were silently un-tradeable in live/paper), and `scanner._TIMEFRAME_SECONDS` covers the full canonical table so closed-bar trim + the stale-feed gate never silently use a 1h width for a 2h bar (partial-bar trading). 6h/45m remain non-HL-native (promotion-time timeframe validation is the follow-up).
+- **DIRECTION-BOOKS-3** ✅ — `_trade_routed_address` reads books settings via the re-raising `kv_get` and returns an UNRESOLVABLE sentinel on a locked-DB read, so the reconcile scope EXCLUDES a routed sub-account trade rather than mis-scoping it into the master ghost-close pass and auto-closing a real position. `risk.py`.
+- Tests: `tests/test_engine_audit_phase3.py` (DATA/LATE/MANUAL/DIRECTION-BOOKS-3) + the existing manual/scanner/direction-book suites. 183 green.
+
+**Milestone:** both CRITICALs + every HIGH-severity finding across Phases 1–3 are now fixed and tested (19/19 highs + PNL-1's gate impact). Remaining work is MEDIUM/LOW robustness + cleanup + the population re-baseline.
 
 ### Phase 4 — pending
 Parity/cleanup (KERNEL/KCOPY/RECON edges, DATA-1/3/6 timeframe coverage, the many lows) + the population re-baseline. Per-finding detail below.

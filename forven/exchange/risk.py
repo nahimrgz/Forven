@@ -1769,20 +1769,38 @@ def _norm_addr(value: object) -> str | None:
     return addr or None
 
 
+# DIRECTION-BOOKS-3: sentinel returned when a BOOKED trade's routing address can't be
+# resolved reliably (a 'database is locked' settings read). It never equals a real scope
+# address (None master / a sub-account), so the reconcile scope EXCLUDES the trade instead
+# of mis-scoping it into the master ghost-close pass and auto-closing a real position.
+_UNRESOLVABLE_ROUTE = "__route_unresolvable__"
+
+
 def _trade_routed_address(trade: dict) -> str | None:
     """The sub-account address a trade routes to (None = master wallet).
 
     Resolved from the trade's stored direction `book` via the books settings.
     NULL/"main" book and an unconfigured long book resolve to None.
+
+    DIRECTION-BOOKS-3: a BOOKED (long/short) trade must resolve from a RELIABLE settings
+    read. books._settings() swallows a locked-DB read to {}, which would resolve a real
+    sub-account trade to None (master) and let the master reconcile pass ghost-close it.
+    Read settings via the re-raising kv_get and return _UNRESOLVABLE_ROUTE on any read
+    failure so the scope filter skips the trade this pass (never defaults it to master).
     """
     book = trade.get("book")
-    if not book:
-        return None
+    if not book or str(book).strip().lower() in ("", "main"):
+        return None  # genuinely the master wallet
+    try:
+        raw = kv_get("forven:settings", {})
+        settings = raw if isinstance(raw, dict) else {}
+    except Exception:
+        return _UNRESOLVABLE_ROUTE  # locked/unreadable settings — DO NOT assume master
     try:
         from forven.exchange import books
-        return _norm_addr(books.book_address(book))
+        return _norm_addr(books.book_address(book, settings=settings))
     except Exception:
-        return None
+        return _UNRESOLVABLE_ROUTE
 
 
 def _recover_exit_from_fills(

@@ -74,14 +74,27 @@ _ENTRY_SIGNAL_STATE_KEY = "scanner_entry_signal_state"
 _ASSET_ENTRY_STATE_KEY = "scanner_asset_entry_state"
 _CERTIFIED_PAPER_FAMILIES = set(EXECUTION_CERTIFIED_FAMILIES)
 _LAST_STRATEGY_LOAD_DIAGNOSTICS: dict[str, dict] = {}
+# DATA-3: cover the FULL canonical timeframe set (data.TIMEFRAME_MS). The bar-width
+# lookups for closed-bar trimming and the stale-feed gate do `.get(tf, 3600)`; an
+# incomplete table silently used a 1h width for any unlisted timeframe (e.g. a 2h bar
+# trimmed/aged as 1h → partial-bar trading + bogus staleness). Keep this in sync with
+# data.TIMEFRAME_MS so no accepted timeframe ever falls back to 1h.
 _TIMEFRAME_SECONDS = {
     "1m": 60,
+    "3m": 180,
     "5m": 300,
     "15m": 900,
     "30m": 1800,
+    "45m": 2700,
     "1h": 3600,
+    "2h": 7200,
     "4h": 14400,
+    "6h": 21600,
+    "8h": 28800,
+    "12h": 43200,
     "1d": 86400,
+    "3d": 259200,
+    "1w": 604800,
 }
 
 
@@ -5371,8 +5384,16 @@ def _resolve_paper_go_live(strat: dict):
     real entry; one held from BEFORE go-live is the late hop-in (current-price entry)."""
     try:
         reset_raw = kv_get(PAPER_BOOK_RESET_KV_KEY, None)
-    except Exception:
-        reset_raw = None
+    except Exception as exc:
+        # LATE-1: a transient kv_get failure (e.g. SQLite 'database is locked') must NOT be
+        # mistaken for "no reset anchor" — that would drop the reset cutoff and let the
+        # kernel replay PRE-reset history into a freshly-emptied book (persistent
+        # corruption of the paper equity curve the promotion gate reads). Fail CLOSED:
+        # clamp the cutoff to NOW so nothing pre-now is recorded/backfilled on this
+        # uncertain scan; the next successful read resolves the real go-live.
+        log.warning("[%s] paper go-live: reset-anchor read failed (%s); clamping cutoff to now (fail-closed).",
+                    str(strat.get("id") or strat.get("strategy_id") or ""), exc)
+        return get_now()
     candidates = [
         ts for ts in (_parse_iso_ts(strat.get("stage_changed_at")), _parse_iso_ts(reset_raw))
         if ts is not None
@@ -5624,6 +5645,11 @@ def _kernel_close_paper_trade(strat_id: str, strat: dict, action) -> str | None:
     if action.recorded and action.recorded.get("_row"):
         row = action.recorded["_row"]
         sd = parse_trade_signal_data(row.get("signal_data"))
+        if sd.get("manual_pause"):
+            # MANUAL-1: a manually PAUSED kernel position is detached from auto-management;
+            # the reconciler must not auto-close it (the operator closes it manually, and a
+            # partial-close while paused must not be re-closed at full size = double-count).
+            return None
         if sd.get("late_entry"):
             # Never record an exit AT/BEFORE the hop-in entry: a kernel signal/time exit that
             # fills on the very bar we hopped in on would stamp closed_at <= opened_at — a
@@ -5675,22 +5701,35 @@ def _kernel_refresh_paper_trade(action) -> str | None:
     row = (action.recorded or {}).get("_row")
     if row is None:
         return None
+    sd = parse_trade_signal_data(row.get("signal_data"))
+    # MANUAL-1: a manually PAUSED kernel position is detached from auto-management —
+    # the reconciler must not refresh (or re-stamp) it. Leave it entirely alone.
+    if sd.get("manual_pause"):
+        return None
     # A late hop-in entered at a DIFFERENT price than the kernel's historical entry, so its
     # stop/target were re-anchored to the hop-in price. The kernel's pos still carries the
     # OLD (historical-entry) levels — don't clobber the re-anchored ones with them; leave
     # the late trade's own SL/TP intact.
-    if bool(parse_trade_signal_data(row.get("signal_data")).get("late_entry")):
+    if bool(sd.get("late_entry")):
         return None
     pos = action.position or {}
-    updates = {
-        "stop_loss": pos.get("stop_price"), "stop_loss_price": pos.get("stop_price"),
-        "take_profit": pos.get("target_price"), "take_profit_price": pos.get("target_price"),
-    }
+    updates: dict = {}
+    # MANUAL-2: an operator-set SL/TP on a kernel-managed position must be ENFORCED, not
+    # silently reverted to the kernel's level by the next refresh. Skip the side(s) the
+    # operator owns (stop_loss_source / take_profit_source == 'manual'); still refresh the
+    # un-owned side and the orphan-adopt entry stamp.
+    if str(sd.get("stop_loss_source") or "").strip().lower() != "manual":
+        updates["stop_loss"] = pos.get("stop_price")
+        updates["stop_loss_price"] = pos.get("stop_price")
+    if str(sd.get("take_profit_source") or "").strip().lower() != "manual":
+        updates["take_profit"] = pos.get("target_price")
+        updates["take_profit_price"] = pos.get("target_price")
     # When ADOPTING a drifted orphan (its kernel_entry_time no longer matches), stamp
     # the kernel's current entry_time so it reconciles cleanly from now on.
     if (action.recorded or {}).get("_orphan") and action.entry_time:
         updates["kernel_entry_time"] = str(action.entry_time)
-    _update_trade_signal_data(str(row.get("id")), updates)
+    if updates:
+        _update_trade_signal_data(str(row.get("id")), updates)
     return None
 
 
@@ -6007,6 +6046,10 @@ def _kernel_close_live_trade(strat_id: str, strat: dict, action) -> str | None:
     row = (action.recorded or {}).get("_row")
     if row is None:
         return None  # backfill of a live trade we never recorded — cannot replay a real order
+    if parse_trade_signal_data(row.get("signal_data")).get("manual_pause"):
+        # MANUAL-1: a manually PAUSED live position is detached — never fire a real
+        # reduce-only close on it (the operator manages it by hand).
+        return None
     trade = action.trade or {}
     trade_id = str(row.get("id"))
     asset = str(row.get("asset") or strat.get("asset") or "")

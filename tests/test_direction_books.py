@@ -156,7 +156,9 @@ class TestReconcilerBookSafetyGuard:
         assert dict(row)["status"] == "OPEN"
 
     def test_short_pass_considers_short_book_trade(self, forven_db, monkeypatch):
-        _books_settings()
+        # confirm_count=1: this test exercises book SCOPING, not the empty-read streak
+        # guard (RECONCILE-6, tested separately) — sweep on the first empty read.
+        _books_settings(reconcile_empty_read_confirm_count=1)
         _seed_open_trade("T-SHORT-2", "BTC", "short", "scalp", "short")
         monkeypatch.setattr(
             "forven.exchange.risk._snapshot_exchange_state", self._empty_snapshot
@@ -173,7 +175,7 @@ class TestReconcilerBookSafetyGuard:
         # Books toggled OFF but the short address remains set and a short-book
         # position is still open: reconcile_all_books must still reconcile that
         # sub-account (no orphaned, never-reconciled OPEN row).
-        _books_settings(live_books_enabled=False)  # addresses NOT cleared
+        _books_settings(live_books_enabled=False, reconcile_empty_read_confirm_count=1)  # addresses NOT cleared
         _seed_open_trade("T-LEFT-1", "BTC", "short", "scalp", "short")
         monkeypatch.setattr(
             "forven.exchange.risk._snapshot_exchange_state", self._empty_snapshot

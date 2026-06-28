@@ -14,13 +14,26 @@ log = logging.getLogger("forven.market_data")
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 
+# DATA-1: cover the HyperLiquid-native candle intervals, not just a 6-entry subset.
+# Strategies on 30m / 2h / 3m / 8h / 12h are first-class everywhere else (data.TIMEFRAME_MS
+# + strategy creation), but were silently undtradeable in live/paper because the fetcher
+# raised "unsupported interval" on every call. (6h / 45m are NOT HL-native candle intervals
+# and are rejected at fetch — a promotion-time timeframe validation against this set is the
+# follow-up for those.)
 INTERVAL_TO_MS = {
     "1m": 60_000,
+    "3m": 3 * 60_000,
     "5m": 5 * 60_000,
     "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
     "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
     "4h": 4 * 60 * 60_000,
+    "8h": 8 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
     "1d": 24 * 60 * 60_000,
+    "3d": 3 * 24 * 60 * 60_000,
+    "1w": 7 * 24 * 60 * 60_000,
 }
 
 

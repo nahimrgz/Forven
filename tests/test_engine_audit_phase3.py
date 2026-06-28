@@ -5,6 +5,7 @@ FREEZE-1: a hung position-managing scanner is now visible to the health monitor
 FREEZE-3: an alive-but-FROZEN daemon (ticks hours old, process still alive) is now
   detected (RED) instead of reporting healthy.
 """
+import json
 from datetime import datetime, timedelta, timezone
 
 from forven.health_monitor import State, check_scanner_execution, check_daemon_liveness
@@ -188,3 +189,92 @@ def test_boot_recovery_stamp_preserves_operator_block(forven_db):
                             "recovery_summary": "operator block"})
     mark_boot_recovery_pending()
     assert kv_get("daemon_state", {}).get("recovery_status") == "blocked"
+
+
+# ─── DATA-1 / DATA-3: timeframe coverage (live fetch + bar-width tables) ─────────
+
+def test_live_fetch_and_barwidth_cover_common_timeframes():
+    from forven.market_data import INTERVAL_TO_MS
+    from forven.scanner import _TIMEFRAME_SECONDS
+    # 30m / 2h / 3m / 8h / 12h are first-class everywhere else; they must be live-fetchable.
+    for tf in ("30m", "2h", "3m", "8h", "12h"):
+        assert tf in INTERVAL_TO_MS, f"{tf} missing from INTERVAL_TO_MS"
+    # The bar-width table used by closed-bar trim + the stale-feed gate must not silently
+    # fall back to 1h for an accepted timeframe (DATA-3).
+    assert _TIMEFRAME_SECONDS.get("2h") == 7200
+    assert _TIMEFRAME_SECONDS.get("30m") == 1800
+    assert _TIMEFRAME_SECONDS.get("6h") == 21600
+
+
+# ─── LATE-1: go-live cutoff fails CLOSED on a reset-anchor read error ────────────
+
+def test_resolve_paper_go_live_fails_closed_on_kv_error(forven_db, monkeypatch):
+    import forven.scanner as sc
+    from forven.sim.clock import get_now
+
+    def _boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(sc, "kv_get", _boom)
+    # An OLD stage time: without the fix this would become the cutoff and replay pre-reset
+    # history into a freshly-emptied book. Fail-closed clamps to ~now instead.
+    result = sc._resolve_paper_go_live({"id": "s1", "stage_changed_at": "2020-01-01T00:00:00+00:00"})
+    assert result is not None
+    assert abs((get_now() - result).total_seconds()) < 10
+
+
+# ─── MANUAL-1 / MANUAL-2: kernel reconcile honors manual pause + operator SL/TP ──
+
+def test_kernel_close_skips_manually_paused_position():
+    import types
+    import forven.scanner as sc
+
+    row = {"id": "P1", "signal_data": json.dumps({"manual_pause": True, "kernel_managed": True})}
+    action = types.SimpleNamespace(
+        recorded={"_row": row}, trade={"exit_price": 100.0, "exit_reason": "signal"}, direction="long",
+    )
+    # Paused = detached: the reconciler must NOT auto-close it (would double-count a manual
+    # partial-close). Returns None without touching the DB.
+    assert sc._kernel_close_paper_trade("s", {"asset": "BTC"}, action) is None
+
+
+def test_kernel_refresh_preserves_operator_manual_stop(forven_db):
+    import types
+    import forven.scanner as sc
+    from forven.trade_state import parse_trade_signal_data
+    from forven.db import get_db
+
+    tid = sc._open_trade_db(
+        "s-m", "BTC", "long", 100.0, 1.0, 0.01, 1.0,
+        {"kernel_managed": True, "kernel_entry_time": "T1",
+         "stop_loss_price": 95.0, "stop_loss_source": "manual"},
+        execution_type="paper",
+    )
+    with get_db() as conn:
+        row = dict(conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone())
+    action = types.SimpleNamespace(
+        recorded={"_row": row}, position={"stop_price": 80.0, "target_price": 120.0}, entry_time="T1",
+    )
+    sc._kernel_refresh_paper_trade(action)
+    with get_db() as conn:
+        sd = parse_trade_signal_data(
+            dict(conn.execute("SELECT signal_data FROM trades WHERE id=?", (tid,)).fetchone())["signal_data"]
+        )
+    assert sd["stop_loss_price"] == 95.0   # MANUAL-2: operator stop NOT clobbered by kernel's 80
+    assert sd["take_profit_price"] == 120.0  # un-owned side still refreshed
+
+
+# ─── DIRECTION-BOOKS-3: reconcile routing is UNRESOLVABLE (not master) on a lock ─
+
+def test_trade_routed_address_unresolvable_on_locked_settings(monkeypatch):
+    import forven.exchange.risk as risk
+
+    def _boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(risk, "kv_get", _boom)
+    # A booked (short) trade must NOT default to None(master) on a settings-read failure.
+    assert risk._trade_routed_address({"book": "short"}) == risk._UNRESOLVABLE_ROUTE
+    # A genuinely-master trade still resolves to None.
+    assert risk._trade_routed_address({"book": None}) is None
+    assert risk._trade_routed_address({"book": "main"}) is None
