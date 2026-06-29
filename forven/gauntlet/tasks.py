@@ -577,6 +577,11 @@ def _best_sweep_result(strategy_id: str, fallback_tf: str) -> tuple[str, str | N
     best_result_id: str | None = None
     best_metrics: dict[str, Any] = {}
     best_score = float("-inf")
+    # Least-degenerate fallback, used ONLY if no context clears the validity floor —
+    # so a strategy that genuinely can't trade anywhere is judged (and failed) on its
+    # most-traded context, never crowned by a lucky 4-trade slice.
+    fb_tf, fb_result_id, fb_metrics, fb_trades = best_tf, None, {}, -1.0
+    from forven.policy import is_degenerate_backtest_metrics
     for row in rows:
         metrics = _loads(row["metrics_json"], {})
         if not isinstance(metrics, dict) or not metrics:
@@ -584,12 +589,22 @@ def _best_sweep_result(strategy_id: str, fallback_tf: str) -> tuple[str, str | N
         trades = _metric(metrics, "total_trades", default=0.0)
         sharpe = _metric(metrics, "sharpe_ratio", "sharpe", default=0.0)
         total_return = _metric(metrics, "total_return_pct", "total_return", default=0.0)
+        tf = str(row["timeframe"] or best_tf).strip() or best_tf
+        rid = str(row["result_id"]) if row["result_id"] else None
+        if float(trades) > fb_trades:
+            fb_tf, fb_result_id, fb_metrics, fb_trades = tf, rid, metrics, float(trades)
+        # Validity floor: a too-few-trade / zero-in-sample-trade slice yields a lucky
+        # high Sharpe that swamps this Sharpe-dominated score and contaminates the
+        # strategy's stored metrics (the gate then reads IS Sharpe 0.00 and rejects).
+        # Such a slice can never be the sweep winner.
+        if is_degenerate_backtest_metrics(metrics):
+            continue
         score = sharpe * 10.0 + min(trades, 100.0) * 0.01 + total_return * 0.01
         if score > best_score:
             best_score = score
-            best_tf = str(row["timeframe"] or best_tf).strip() or best_tf
-            best_result_id = str(row["result_id"]) if row["result_id"] else None
-            best_metrics = metrics
+            best_tf, best_result_id, best_metrics = tf, rid, metrics
+    if best_score == float("-inf"):
+        return fb_tf, fb_result_id, fb_metrics
     return best_tf, best_result_id, best_metrics
 
 

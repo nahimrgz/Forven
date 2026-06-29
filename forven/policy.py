@@ -642,6 +642,35 @@ def validate_backtest_metrics(metrics: dict) -> tuple[bool, float, str]:
     return True, penalty, rejection_reason
 
 
+def is_degenerate_backtest_metrics(
+    metrics: dict, *, min_total_trades: int = 10, min_is_trades: int = 1
+) -> bool:
+    """True for a statistically meaningless backtest slice: too few trades OR zero
+    in-sample trades.
+
+    Such a slice yields a lucky high Sharpe (few all-winning OOS trades, IS Sharpe
+    0.00). In the Sharpe-dominated timeframe-sweep selector that lucky slice OUTSCORES
+    an honest 100+-trade run, so its contaminated metrics get persisted to
+    strategies.metrics — which the gate then reads as IS Sharpe 0.00 / <5 trades and
+    rejects, re-archiving an otherwise-healthy strategy on every retry. Used both to
+    keep a degenerate slice from winning the sweep AND from locking out an honest
+    rerun via the best-of-Sharpe merge. Fail-safe (returns False on any error)."""
+    try:
+        if not isinstance(metrics, dict) or not metrics:
+            return False
+        total = float(metrics.get("total_trades") or metrics.get("num_trades") or 0)
+        is_block = metrics.get("in_sample") if isinstance(metrics.get("in_sample"), dict) else {}
+        is_trades = float(
+            is_block.get("total_trades")
+            or is_block.get("num_trades")
+            or is_block.get("trades")
+            or 0
+        )
+        return total < float(min_total_trades) or is_trades < float(min_is_trades)
+    except Exception:
+        return False
+
+
 def score_strategy(metrics: dict) -> float:
     """
     Compute fitness score (0-100) from backtest metrics.

@@ -1568,14 +1568,28 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 # Still allow promotion check with existing metrics
                 metrics = existing_metrics
             else:
-                # --- Best-of rule ---
-                # Only update if new backtest is better (higher Sharpe) or if no existing metrics.
+                # --- Best-of rule (degeneracy-aware) ---
+                # Only keep the existing metrics over the new run if existing is GENUINELY
+                # better (higher Sharpe) AND not a degenerate slice. The raw best-of-Sharpe
+                # rule let a contaminated low-trade / zero-in-sample-trade blob (lucky high
+                # Sharpe) permanently lock out every honest rerun (lower Sharpe), so a
+                # healthy strategy stayed archived on every revive/retry. Now: a degenerate
+                # new run never overwrites honest stored metrics, and an honest rerun always
+                # unsticks a degenerate stored blob regardless of Sharpe.
+                from forven.policy import is_degenerate_backtest_metrics
                 existing_sharpe = float(existing_metrics.get("sharpe") or existing_metrics.get("sharpe_ratio") or 0)
                 new_sharpe = float(metrics.get("sharpe") or metrics.get("sharpe_ratio") or 0)
-                if existing_sharpe > 0 and new_sharpe < existing_sharpe:
+                existing_degenerate = is_degenerate_backtest_metrics(existing_metrics)
+                new_degenerate = is_degenerate_backtest_metrics(metrics)
+                keep_existing = (
+                    (new_degenerate and not existing_degenerate)
+                    or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
+                )
+                if keep_existing:
                     log.info(
-                        "Keeping better existing metrics for %s: existing Sharpe %.2f > new %.2f",
-                        strategy_id, existing_sharpe, new_sharpe,
+                        "Keeping existing metrics for %s: existing Sharpe %.2f vs new %.2f "
+                        "(existing_degenerate=%s, new_degenerate=%s)",
+                        strategy_id, existing_sharpe, new_sharpe, existing_degenerate, new_degenerate,
                     )
                     # Keep existing but still store the result in backtest_results (already done upstream)
                     metrics = existing_metrics
