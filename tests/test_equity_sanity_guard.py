@@ -79,3 +79,18 @@ def test_real_drawdown_still_fires_kill_switch(forven_db):
     assert result.get("rejected") is not True
     assert result["action"] == "kill_switch"
     assert risk._get_risk_state()["kill_switch_active"] is True
+
+
+def test_notable_accepted_move_is_logged(forven_db, caplog):
+    """KS-CACHE-LOG: a ~28x inflation (under the 100x reject ceiling, so ACCEPTED)
+    must still leave a durable WARNING trail at the moment it latches the HWM — the
+    2026-06-29 false kill-switch slipped through precisely because nothing logged
+    the sub-100x inflated read as it entered."""
+    risk.update_equity(660.0, source="books_aggregate")    # baseline last_equity
+    with caplog.at_level("WARNING"):
+        result = risk.update_equity(18590.0, source="books_aggregate")  # ~28x, accepted
+
+    assert result.get("rejected") is not True               # under the 100x ceiling
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "last good in one tick" in msgs
+    assert "source=books_aggregate" in msgs

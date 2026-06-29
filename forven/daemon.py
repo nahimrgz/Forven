@@ -1182,38 +1182,69 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
 
         total_val = total_margin = total_ntl = 0.0
         unreliable = False
+        # KS-CACHE-LOG (2026-06-29 false kill-switch): a stale/inflated value in
+        # _BOOK_EQUITY_CACHE silently poisoned the aggregate for hours because the
+        # substitution path was debug-only. Track per-wallet provenance and emit a
+        # LOUD, DURABLE (api.log) evidence line whenever any wallet falls back to
+        # cache or a read fails — so a recurrence can be diagnosed live, BEFORE the
+        # operator restarts (which wipes this in-memory cache and the evidence).
+        substituted = False
+        read_failed = False
+        breakdown: list[str] = []
         for addr in addresses:
             key = (str(addr).strip().lower() if addr else "__master__")
             kwargs = {"account_address": addr} if addr else {}
             raised = False
+            err_reason = ""
             try:
                 acc = get_account_value(testnet=testnet, **kwargs)
                 val = float(acc.get("accountValue", 0) or 0) if isinstance(acc, dict) else 0.0
-            except Exception:
+            except Exception as exc:
                 acc, val, raised = None, 0.0, True
+                err_reason = f"{type(exc).__name__}: {exc}"
             if val > 0:
                 _BOOK_EQUITY_CACHE[key] = val  # last-known-good
                 total_val += val
+                breakdown.append(f"{key}=${val:,.2f}(live)")
                 if isinstance(acc, dict):
                     total_margin += float(acc.get("totalMarginUsed", 0) or 0)
                     total_ntl += float(acc.get("totalNtlPos", 0) or 0)
             else:
+                if raised:
+                    read_failed = True
                 cached = _BOOK_EQUITY_CACHE.get(key)
                 if cached is not None and cached > 0:
                     # Had funds before, now reads 0/failed => transient glitch.
                     # Substitute last-known-good so it can't fake a drawdown.
                     total_val += cached
-                    log.debug("book equity: substituted last-known $%.2f for %s (transient read)", cached, key)
+                    substituted = True
+                    breakdown.append(f"{key}=${cached:,.2f}(CACHED)")
+                    log.warning(
+                        "book equity: SUBSTITUTED cached $%.2f for %s (live read %s) — "
+                        "stale cache can poison the aggregate",
+                        cached, key, err_reason or "returned 0/non-positive",
+                    )
                 elif raised:
                     # Read ERRORED with no history => genuinely unknown; skip tick.
                     unreliable = True
-                # else: read returned 0 with no history => a legitimately EMPTY
-                # account (e.g. master drained, all capital in the sub-accounts).
-                # Count it as $0 — do NOT mark unreliable, or the daemon could
-                # never compute equity for a valid empty-master config.
+                    breakdown.append(f"{key}=ERR({err_reason})")
+                else:
+                    # else: read returned 0 with no history => a legitimately EMPTY
+                    # account (e.g. master drained, all capital in the sub-accounts).
+                    # Count it as $0 — do NOT mark unreliable, or the daemon could
+                    # never compute equity for a valid empty-master config.
+                    breakdown.append(f"{key}=$0(empty)")
         if unreliable or total_val <= 0:
-            log.warning("book-aware equity read incomplete/unreliable this tick; skipping risk update")
+            log.warning(
+                "book-aware equity read incomplete/unreliable this tick; skipping risk update [%s]",
+                ", ".join(breakdown) or "no accounts",
+            )
             return None
+        if substituted or read_failed:
+            log.warning(
+                "book-aware equity used DEGRADED reads: total=$%.2f source=books_aggregate [%s]",
+                total_val, ", ".join(breakdown),
+            )
         return {
             "accountValue": total_val,
             "totalMarginUsed": total_margin,

@@ -2821,6 +2821,11 @@ def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
 _MAX_PLAUSIBLE_EQUITY = 1e12  # $1T — no real or testnet account reaches this
 _EQUITY_JUMP_REJECT_MULT = 100.0  # a single-tick 100x jump from the last good equity is suspect
 _EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS = 5  # ...unless it persists this many ticks (a real deposit/regime change)
+# KS-CACHE-LOG: log (do NOT reject) any accepted single-tick move >= this mult or
+# <= its reciprocal. The 2026-06-29 false kill-switch was a ~28x inflated read that
+# latched a corrupt HWM while staying under the 100x hard-reject ceiling; this
+# leaves a durable trail at the moment such an inflation enters the risk state.
+_EQUITY_NOTABLE_MOVE_MULT = 2.0
 
 
 def _validate_equity_sample(account_equity: object, state: dict) -> tuple[bool, str]:
@@ -2882,6 +2887,7 @@ def _rejected_equity_result(state: dict, reason: str) -> dict:
 
 def _update_equity_locked(account_equity: float, source: str) -> dict:
     state = _get_risk_state()
+    prev_last_equity = float(state.get("last_equity") or 0.0)  # KS-CACHE-LOG: detect sharp accepted moves
 
     # Sanity guard: never let an implausible equity reading mutate the risk state
     # (high-water mark / kill-switch). A garbage sample is ignored and the next
@@ -2998,6 +3004,19 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
     state["last_equity"] = float(account_equity)
     state["updated_at"] = get_now().isoformat()
 
+    # KS-CACHE-LOG: durable trail when an accepted sample moves equity sharply in
+    # one tick. This only LOGS (does not reject), so an inflation that stays under
+    # the hard-reject ceiling (the 2026-06-29 ~28x books_aggregate read) is still
+    # visible in api.log at the moment it latches the HWM / arms a drawdown.
+    if prev_last_equity > 0 and account_equity > 0:
+        move = account_equity / prev_last_equity
+        if move >= _EQUITY_NOTABLE_MOVE_MULT or move <= 1.0 / _EQUITY_NOTABLE_MOVE_MULT:
+            log.warning(
+                "equity sample %.2fx last good in one tick (source=%s): $%.2f -> $%.2f; "
+                "HWM=$%.2f drawdown=%.1f%%",
+                move, source, prev_last_equity, account_equity, hwm, drawdown_pct * 100,
+            )
+
     daily_state = kv_get(sim_kv_key("daily_risk"))
     if (
         not isinstance(daily_state, dict)
@@ -3049,12 +3068,12 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         _save_risk_state(state)
 
         log.critical(
-            "KILL SWITCH TRIGGERED - drawdown %.1f%% (equity $%.2f, HWM $%.2f)",
-            drawdown_pct * 100, account_equity, hwm,
+            "KILL SWITCH TRIGGERED - drawdown %.1f%% (equity $%.2f, HWM $%.2f, source=%s)",
+            drawdown_pct * 100, account_equity, hwm, source,
         )
         log_activity("critical", "risk", (
             f"KILL SWITCH: drawdown {drawdown_pct:.1%} from HWM ${hwm:,.2f}. "
-            f"Equity: ${account_equity:,.2f}. All positions will be closed."
+            f"Equity: ${account_equity:,.2f} (source={source}). All positions will be closed."
         ))
         return result
 

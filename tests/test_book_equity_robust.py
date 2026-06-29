@@ -88,3 +88,19 @@ def test_raised_read_with_no_history_returns_none(monkeypatch):
     # so the aggregate is unreliable -> None -> risk cycle skips the tick.
     _stub_reads(monkeypatch, {"__master__": 316.0, "0xlong": RuntimeError("read error"), "0xshort": 30.0})
     assert dmn._book_aware_account_value(testnet=True) is None
+
+
+def test_substitution_is_logged_for_diagnosis(monkeypatch, caplog):
+    # KS-CACHE-LOG: the cache substitution is the exact mechanism that poisoned the
+    # aggregate in the 2026-06-29 false kill-switch. It must log LOUD (WARNING) so a
+    # recurrence is diagnosable in api.log BEFORE the operator restarts (which wipes
+    # this in-memory cache and the evidence with it).
+    _stub_reads(monkeypatch, {"__master__": 316.0, "0xlong": 329.0, "0xshort": 30.0})
+    dmn._book_aware_account_value(testnet=True)  # seed last-known-good cache
+    _stub_reads(monkeypatch, {"__master__": RuntimeError("read timeout"), "0xlong": 329.0, "0xshort": 30.0})
+    with caplog.at_level("WARNING"):
+        out = dmn._book_aware_account_value(testnet=True)
+    assert out is not None and out["accountValue"] == pytest.approx(675.0)
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "SUBSTITUTED" in msgs and "__master__" in msgs  # names the failing wallet + cached value
+    assert "DEGRADED" in msgs  # full per-wallet composition evidence line
