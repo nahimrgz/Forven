@@ -185,6 +185,9 @@
 	// Selected session
 	let selectedSession: PaperTradingSession | null = null;
 	let sessionTrades: PaperTrade[] = [];
+	// One-shot: a strategy id from a ?select= deep-link (e.g. the All Trades blotter)
+	// to select THAT strategy's existing session on the next session load.
+	let preselectStrategyId: string | null = null;
 
 	// Visual replay state
 	let showVisualReplay = false;
@@ -421,6 +424,8 @@
 		nextUrl.searchParams.delete('strategy');
 		nextUrl.searchParams.delete('symbol');
 		nextUrl.searchParams.delete('timeframe');
+		nextUrl.searchParams.delete('select');
+		nextUrl.searchParams.delete('view');
 		const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
 		const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 		if (nextPath !== currentPath) {
@@ -955,7 +960,11 @@
 		const timeframeParam = $page.url.searchParams.get('timeframe');
 		const hasExplicitCreateIntent = Boolean(strategyParam || symbolParam || timeframeParam);
 		let hasWorkspacePrefillIntent = false;
-		if (hasExplicitCreateIntent && allowsSessionEditing) {
+		// ?select=<strategyId> means "select that strategy's existing session" (a
+		// deep-link from the All Trades blotter) — distinct from ?strategy= which
+		// pre-fills the NEW-session form.
+		preselectStrategyId = $page.url.searchParams.get('select');
+		if (hasExplicitCreateIntent || preselectStrategyId) {
 			clearPrefillQueryParams();
 		}
 
@@ -1045,10 +1054,22 @@
 			});
 			sessions = loadedSessions;
 
-			const keepArchivedSelection = Boolean(selectedArchivedStrategy && !selectedSession);
-			const preferredId = selectedSession?.id ?? readStoredSelectedSessionId();
+			// Resolve a ?select= deep-link (strategy id -> its session) ONCE on the
+			// initial load; it overrides the stored/first-session default so the
+			// blotter lands the operator on that strategy's trade.
+			let preselectId: string | null = null;
+			if (preselectStrategyId) {
+				const match = loadedSessions.find(
+					(s) => s.strategy_id === preselectStrategyId || s.id === preselectStrategyId
+				);
+				if (match) preselectId = match.id;
+				preselectStrategyId = null;
+			}
+			const keepArchivedSelection = Boolean(selectedArchivedStrategy && !selectedSession) && !preselectId;
+			const preferredId = preselectId ?? selectedSession?.id ?? readStoredSelectedSessionId();
 			const preferredSession = getPreferredSession(loadedSessions, preferredId);
 			if (preferredSession && !keepArchivedSelection) {
+				if (preselectId) writeStoredSelectedSessionId(preferredSession.id);
 				if (selectedSession?.id !== preferredSession.id) {
 					selectSession(preferredSession);
 				} else {

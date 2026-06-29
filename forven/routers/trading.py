@@ -18,9 +18,62 @@ def read_recent_trades(limit: int = 20):
 
 
 @router.get("/api/trades")
-def read_all_trades(status: str | None = None, limit: int = 200, offset: int = 0):
-    """Full trade ledger across all statuses (OPEN/CLOSED/FAILED), filterable + paged."""
-    return trading_domain.read_all_trades(status=status, limit=limit, offset=offset)
+def read_all_trades(
+    status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+    sort: str | None = None,
+    sort_dir: str | None = None,
+):
+    """Full trade ledger across all statuses (OPEN/CLOSED/FAILED) with blotter
+    filtering (asset/strategy/direction/execution_type/date/search), whitelisted
+    server-side sort, and pagination."""
+    return trading_domain.read_all_trades(
+        status=status,
+        limit=limit,
+        offset=offset,
+        asset=asset,
+        strategy=strategy,
+        direction=direction,
+        execution_type=execution_type,
+        opened_from=opened_from,
+        opened_to=opened_to,
+        search=search,
+        sort=sort,
+        sort_dir=sort_dir,
+    )
+
+
+@router.get("/api/trades/stats")
+def read_trades_stats(
+    status: str | None = None,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+):
+    """Aggregate blotter stats (win rate, profit factor, net P&L, avg win/loss,
+    expectancy, best/worst, open count + exposure) over the FULL filtered ledger."""
+    return trading_domain.read_trades_stats(
+        status=status,
+        asset=asset,
+        strategy=strategy,
+        direction=direction,
+        execution_type=execution_type,
+        opened_from=opened_from,
+        opened_to=opened_to,
+        search=search,
+    )
 
 
 # NOTE: registered under the canonical /api/strategies namespace, NOT /api/forven.

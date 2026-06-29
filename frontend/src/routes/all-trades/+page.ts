@@ -1,12 +1,19 @@
 import type { PageLoad } from './$types';
-import { getForvenAllTrades } from '$lib/api';
-import type { ForvenTradesPage } from '$lib/api';
+import { getForvenAllTrades, getForvenTradesStats } from '$lib/api';
+import type { ForvenTradesPage, ForvenTradesStats } from '$lib/api';
 
 export const ssr = false;
 
 export const load: PageLoad = async () => {
-	const [result] = await Promise.allSettled([getForvenAllTrades({ limit: 200 })]);
+	const [pageResult, statsResult] = await Promise.allSettled([
+		getForvenAllTrades({ limit: 100, sort: 'opened_at', sort_dir: 'desc' }),
+		getForvenTradesStats()
+	]);
 	return {
-		initialPage: result.status === 'fulfilled' ? result.value : null,
-	} satisfies { initialPage: ForvenTradesPage | null };
+		initialPage: pageResult.status === 'fulfilled' ? pageResult.value : null,
+		initialStats: statsResult.status === 'fulfilled' ? statsResult.value : null
+	} satisfies {
+		initialPage: ForvenTradesPage | null;
+		initialStats: ForvenTradesStats | null;
+	};
 };

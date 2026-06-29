@@ -479,6 +479,7 @@ export {
 	getSystemHeartbeat,
 	getBackendSoakReport,
 	getForvenAllTrades,
+	getForvenTradesStats,
 	markForvenTradeFailed,
 } from './forven';
 export {
@@ -583,6 +584,8 @@ export type {
 	ResearchMemoryMode,
 	ResearchSettings,
 	ForvenTradesPage,
+	ForvenTradesStats,
+	ForvenTradesQuery,
 	LiveSignalsResponse,
 } from './forven';
 

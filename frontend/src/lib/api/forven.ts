@@ -146,20 +146,37 @@ export interface ForvenSentimentSnapshot {
 
 export interface ForvenTrade {
 	id?: string;
+	display_id?: string;
 	asset?: string;
+	symbol?: string;
 	direction?: string;
 	strategy?: string;
 	strategy_id?: string;
+	strategy_name?: string;
 	source?: string;
+	execution_type?: string;
 	entry_price?: number;
+	signal_entry_price?: number | null;
+	fill_entry_price?: number | null;
 	exit_price?: number | null;
+	signal_exit_price?: number | null;
+	fill_exit_price?: number | null;
+	entry_slippage_bps?: number | null;
+	exit_slippage_bps?: number | null;
 	size?: number;
+	risk_pct?: number | null;
 	leverage?: number;
+	pnl?: number | null;
 	pnl_pct?: number | null;
 	pnl_usd?: number | null;
+	net_pnl_pct?: number | null;
+	fees_pct?: number | null;
+	book?: string | null;
 	status?: string;
+	timeframe?: string | null;
 	opened_at?: string | null;
 	closed_at?: string | null;
+	created_at?: string | null;
 	signal_data?: unknown;
 }
 
@@ -169,6 +186,47 @@ export interface ForvenTradesPage {
 	limit: number;
 	offset: number;
 	status: string | null;
+	sort?: string;
+	sort_dir?: string;
+}
+
+/** Aggregate blotter stats over the full filtered ledger (see /api/trades/stats).
+ * Realized metrics are dollar-based (pnl_usd over CLOSED trades). win_rate /
+ * profit_factor / avg_win / avg_loss / expectancy are null when undefined. */
+export interface ForvenTradesStats {
+	total: number;
+	open_count: number;
+	closed_count: number;
+	failed_count: number;
+	open_exposure: number;
+	net_pnl: number;
+	gross_profit: number;
+	gross_loss: number;
+	wins: number;
+	losses: number;
+	decided: number;
+	win_rate: number | null;
+	profit_factor: number | null;
+	avg_win: number | null;
+	avg_loss: number | null;
+	expectancy: number | null;
+	best: number | null;
+	worst: number | null;
+}
+
+export interface ForvenTradesQuery {
+	status?: string;
+	limit?: number;
+	offset?: number;
+	asset?: string;
+	strategy?: string;
+	direction?: string;
+	execution_type?: string;
+	opened_from?: string;
+	opened_to?: string;
+	search?: string;
+	sort?: string;
+	sort_dir?: 'asc' | 'desc';
 }
 
 export interface ForvenStrategyPerformance {
@@ -743,14 +801,34 @@ export async function forceCloseForvenTrade(
 	});
 }
 
-export async function getForvenAllTrades(
-	opts: { status?: string; limit?: number; offset?: number } = {}
-): Promise<ForvenTradesPage> {
+function tradesQueryParams(opts: ForvenTradesQuery): URLSearchParams {
 	const params = new URLSearchParams();
 	if (opts.status) params.set('status', opts.status);
+	if (opts.asset) params.set('asset', opts.asset);
+	if (opts.strategy) params.set('strategy', opts.strategy);
+	if (opts.direction) params.set('direction', opts.direction);
+	if (opts.execution_type) params.set('execution_type', opts.execution_type);
+	if (opts.opened_from) params.set('opened_from', opts.opened_from);
+	if (opts.opened_to) params.set('opened_to', opts.opened_to);
+	if (opts.search) params.set('search', opts.search);
+	return params;
+}
+
+export async function getForvenAllTrades(opts: ForvenTradesQuery = {}): Promise<ForvenTradesPage> {
+	const params = tradesQueryParams(opts);
 	params.set('limit', String(opts.limit ?? 200));
 	params.set('offset', String(opts.offset ?? 0));
+	if (opts.sort) params.set('sort', opts.sort);
+	if (opts.sort_dir) params.set('sort_dir', opts.sort_dir);
 	return fetchApi(`/api/trades?${params.toString()}`);
+}
+
+export async function getForvenTradesStats(
+	opts: Omit<ForvenTradesQuery, 'limit' | 'offset' | 'sort' | 'sort_dir'> = {}
+): Promise<ForvenTradesStats> {
+	const params = tradesQueryParams(opts);
+	const qs = params.toString();
+	return fetchApi(`/api/trades/stats${qs ? `?${qs}` : ''}`);
 }
 
 export async function markForvenTradeFailed(

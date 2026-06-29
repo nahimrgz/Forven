@@ -3,7 +3,17 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from forven.config import get_execution_mode
-from forven.db import _now, count_trades, get_all_trades, get_db, get_open_trades, get_recent_trades, kv_get, log_activity
+from forven.db import (
+    _now,
+    count_trades,
+    get_all_trades,
+    get_db,
+    get_open_trades,
+    get_recent_trades,
+    get_trades_stats,
+    kv_get,
+    log_activity,
+)
 from forven.exchange import hyperliquid as hl
 from forven.exchange.risk import release, sync_from_trades
 from forven.trade_state import (
@@ -687,22 +697,90 @@ def read_recent_trades(limit: int = 20):
     return get_recent_trades(limit=limit)
 
 
-def read_all_trades(status: str | None = None, limit: int = 200, offset: int = 0) -> dict:
-    """Full trade ledger (all statuses) with a status filter + pagination.
+def _normalize_trade_filters(
+    status: str | None,
+    asset: str | None,
+    strategy: str | None,
+    direction: str | None,
+    execution_type: str | None,
+    opened_from: str | None,
+    opened_to: str | None,
+    search: str | None,
+) -> dict:
+    """Coerce raw ledger query params into the canonical filter kwargs shared by the
+    list / count / stats DB helpers (so the blotter table and its stat bar stay in
+    lockstep)."""
+    def _clean(v: str | None) -> str | None:
+        s = str(v).strip() if v is not None else ""
+        return s or None
 
-    Returns the page of trades plus the total count so the operator panel can show
+    return {
+        "status": (_clean(status) or "").upper() or None,
+        "asset": (_clean(asset) or "").upper() or None,
+        "strategy": _clean(strategy),
+        "direction": (_clean(direction) or "").lower() or None,
+        "execution_type": (_clean(execution_type) or "").lower() or None,
+        "opened_from": _clean(opened_from),
+        "opened_to": _clean(opened_to),
+        "search": _clean(search),
+    }
+
+
+def read_all_trades(
+    status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+    sort: str | None = None,
+    sort_dir: str | None = None,
+) -> dict:
+    """Full trade ledger (all statuses) with filtering, whitelisted sort + pagination.
+
+    Returns the page of trades plus the filtered total so the blotter can show
     "showing N of TOTAL" and page through the whole history — not just open/recent.
     """
     safe_limit = max(1, min(int(limit or 200), 1000))
     safe_offset = max(0, int(offset or 0))
-    norm_status = str(status or "").strip().upper() or None
+    filters = _normalize_trade_filters(
+        status, asset, strategy, direction, execution_type, opened_from, opened_to, search
+    )
+    sort_dir_norm = "asc" if str(sort_dir or "").strip().lower() == "asc" else "desc"
     return {
-        "trades": get_all_trades(status=norm_status, limit=safe_limit, offset=safe_offset),
-        "total": count_trades(status=norm_status),
+        "trades": get_all_trades(
+            limit=safe_limit, offset=safe_offset, sort=sort, sort_dir=sort_dir_norm, **filters
+        ),
+        "total": count_trades(**filters),
         "limit": safe_limit,
         "offset": safe_offset,
-        "status": norm_status,
+        "status": filters["status"],
+        "sort": str(sort or "opened_at").strip().lower() or "opened_at",
+        "sort_dir": sort_dir_norm,
     }
+
+
+def read_trades_stats(
+    status: str | None = None,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> dict:
+    """Aggregate stats for the blotter stat bar over the FULL filtered ledger (same
+    filters as read_all_trades, so the bar matches the table the operator is viewing).
+    """
+    filters = _normalize_trade_filters(
+        status, asset, strategy, direction, execution_type, opened_from, opened_to, search
+    )
+    return get_trades_stats(**filters)
 
 
 def _resolve_live_timeframe(strategy_id: str) -> str | None:

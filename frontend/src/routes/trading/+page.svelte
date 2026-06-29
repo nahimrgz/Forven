@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { page } from '$app/stores';
 	import PaperTrades from '$lib/components/trading/PaperTrades.svelte';
 	import PaperSessionSummary from '$lib/components/dashboard/PaperSessionSummary.svelte';
 	import type { ForvenDashboardResponse } from '$lib/api';
@@ -9,7 +10,13 @@
 	// Session scope. 'paper' is the default (fast); 'live' / 'all' pull in deployed
 	// strategies via include_deployed so the manual controls can drive REAL positions.
 	type SessionView = 'paper' | 'live' | 'all';
-	let view: SessionView = 'paper';
+	// Honor an inbound ?view= deep-link (e.g. from the All Trades blotter) so a live
+	// strategy's session is loaded on first mount and PaperTrades can select it.
+	function initialView(): SessionView {
+		const v = $page.url.searchParams.get('view');
+		return v === 'live' || v === 'all' ? v : 'paper';
+	}
+	let view: SessionView = initialView();
 
 	// The position alert (paper-only) can fire while we're on the 'live' view, where
 	// paper sessions aren't loaded. Drop back to 'paper' so the remounted PaperTrades
@@ -54,6 +61,12 @@
 			{#if view !== 'paper'}
 				<span class="text-[10px] text-gray-500 ml-2">Loading deployed sessions can take a few seconds.</span>
 			{/if}
+			<a
+				href="/all-trades"
+				data-sveltekit-preload-data="hover"
+				class="terminal-button text-[10px] py-0 px-2 ml-auto"
+				title="Full trade ledger — every paper & live trade, filterable & sortable"
+			>All Trades →</a>
 		</div>
 		<PaperSessionSummary />
 	</div>

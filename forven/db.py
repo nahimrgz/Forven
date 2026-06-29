@@ -3897,47 +3897,234 @@ def get_recent_trades(limit: int = 20) -> list[dict]:
 _ALL_TRADE_COLUMNS = (
     "id, display_id, strategy, strategy_id, strategy_name, asset, symbol, direction, "
     "size, risk_pct, leverage, entry_price, signal_entry_price, fill_entry_price, "
-    "exit_price, signal_exit_price, fill_exit_price, status, execution_type, pnl, "
-    "pnl_pct, pnl_usd, signal_data, opened_at, closed_at, timeframe, source, created_at"
+    "exit_price, signal_exit_price, fill_exit_price, entry_slippage_bps, exit_slippage_bps, "
+    "status, execution_type, pnl, pnl_pct, pnl_usd, net_pnl_pct, fees_pct, book, "
+    "signal_data, opened_at, closed_at, timeframe, source, created_at"
 )
 
+# Whitelisted ledger sort columns (request key -> SQL expression). A request sort
+# that is not on this list falls back to opened_at, so a crafted ``?sort=`` can
+# never inject SQL — only these expressions ever reach ORDER BY.
+_TRADE_SORT_COLUMNS = {
+    "opened_at": "COALESCE(opened_at, created_at)",
+    "closed_at": "closed_at",
+    "pnl_usd": "COALESCE(pnl_usd, pnl)",
+    "pnl_pct": "COALESCE(net_pnl_pct, pnl_pct)",
+    "asset": "UPPER(COALESCE(asset, symbol, ''))",
+    "strategy": "UPPER(COALESCE(strategy_id, strategy, ''))",
+    "status": "UPPER(COALESCE(status, ''))",
+    "size": "size",
+    "leverage": "leverage",
+    "duration": "(julianday(COALESCE(closed_at, created_at)) - julianday(COALESCE(opened_at, created_at)))",
+}
 
-def get_all_trades(status: str | None = None, limit: int = 200, offset: int = 0) -> list[dict]:
-    """List trades across ALL statuses (newest first), optionally filtered by status.
 
-    Powers the operator trade-ledger view. ``get_open_trades`` only returns OPEN and
-    ``get_recent_trades`` has no status filter or pagination — this is the full ledger.
-    """
+def _build_trade_filters(
+    *,
+    status: str | None = None,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> tuple[str, list]:
+    """Build a parameterized WHERE clause shared by the ledger list, count, and
+    stats so all three apply IDENTICAL filtering. Every value is bound, never
+    interpolated."""
+    clauses: list[str] = []
+    params: list = []
+
     norm_status = str(status or "").strip().upper()
+    if norm_status:
+        clauses.append("UPPER(COALESCE(status, '')) = ?")
+        params.append(norm_status)
+
+    norm_asset = str(asset or "").strip().upper()
+    if norm_asset:
+        clauses.append("UPPER(COALESCE(asset, symbol, '')) = ?")
+        params.append(norm_asset)
+
+    norm_dir = str(direction or "").strip().lower()
+    if norm_dir in ("long", "short"):
+        clauses.append("LOWER(COALESCE(direction, '')) = ?")
+        params.append(norm_dir)
+
+    norm_exec = str(execution_type or "").strip().lower()
+    if norm_exec:
+        clauses.append("LOWER(COALESCE(execution_type, '')) = ?")
+        params.append(norm_exec)
+
+    strat = str(strategy or "").strip()
+    if strat:
+        like = f"%{strat}%"
+        clauses.append(
+            "(strategy_id = ? OR strategy = ? OR display_id = ? "
+            "OR strategy_name LIKE ? OR strategy_id LIKE ? OR strategy LIKE ?)"
+        )
+        params.extend([strat, strat, strat, like, like, like])
+
+    dfrom = str(opened_from or "").strip()
+    if dfrom:
+        clauses.append("COALESCE(opened_at, created_at) >= ?")
+        params.append(dfrom)
+    dto = str(opened_to or "").strip()
+    if dto:
+        clauses.append("COALESCE(opened_at, created_at) <= ?")
+        params.append(dto)
+
+    q = str(search or "").strip()
+    if q:
+        like = f"%{q}%"
+        clauses.append(
+            "(id LIKE ? OR display_id LIKE ? OR asset LIKE ? OR symbol LIKE ? "
+            "OR strategy LIKE ? OR strategy_id LIKE ? OR strategy_name LIKE ?)"
+        )
+        params.extend([like] * 7)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def get_all_trades(
+    status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    *,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+    sort: str | None = None,
+    sort_dir: str | None = None,
+) -> list[dict]:
+    """List trades across ALL statuses with ledger filtering + whitelisted sort.
+
+    Powers the operator trade-ledger blotter. ``get_open_trades`` only returns OPEN
+    and ``get_recent_trades`` has no filter/sort/pagination — this is the full ledger.
+    """
     safe_limit = max(1, min(int(limit or 200), 1000))
     safe_offset = max(0, int(offset or 0))
-    where = ""
-    params: list = []
-    if norm_status:
-        where = "WHERE UPPER(COALESCE(status, '')) = ?"
-        params.append(norm_status)
-    params.extend([safe_limit, safe_offset])
+    where, params = _build_trade_filters(
+        status=status, asset=asset, strategy=strategy, direction=direction,
+        execution_type=execution_type, opened_from=opened_from, opened_to=opened_to,
+        search=search,
+    )
+    sort_expr = _TRADE_SORT_COLUMNS.get(
+        str(sort or "").strip().lower(), _TRADE_SORT_COLUMNS["opened_at"]
+    )
+    sort_sql = "ASC" if str(sort_dir or "").strip().lower() == "asc" else "DESC"
+    query_params = list(params) + [safe_limit, safe_offset]
     with get_db() as conn:
         rows = conn.execute(
             f"SELECT {_ALL_TRADE_COLUMNS} FROM trades {where} "
-            "ORDER BY COALESCE(opened_at, created_at) DESC, id DESC LIMIT ? OFFSET ?",
-            tuple(params),
+            f"ORDER BY {sort_expr} {sort_sql}, id DESC LIMIT ? OFFSET ?",
+            tuple(query_params),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def count_trades(status: str | None = None) -> int:
-    """Count trades, optionally filtered by status (for ledger pagination totals)."""
-    norm_status = str(status or "").strip().upper()
+def count_trades(
+    status: str | None = None,
+    *,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> int:
+    """Count trades matching the ledger filters (for pagination totals)."""
+    where, params = _build_trade_filters(
+        status=status, asset=asset, strategy=strategy, direction=direction,
+        execution_type=execution_type, opened_from=opened_from, opened_to=opened_to,
+        search=search,
+    )
     with get_db() as conn:
-        if norm_status:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM trades WHERE UPPER(COALESCE(status, '')) = ?",
-                (norm_status,),
-            ).fetchone()
-        else:
-            row = conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM trades {where}", tuple(params)).fetchone()
         return int(row["n"] if row else 0)
+
+
+def get_trades_stats(
+    status: str | None = None,
+    *,
+    asset: str | None = None,
+    strategy: str | None = None,
+    direction: str | None = None,
+    execution_type: str | None = None,
+    opened_from: str | None = None,
+    opened_to: str | None = None,
+    search: str | None = None,
+) -> dict:
+    """Aggregate blotter stats over the FULL filtered set (not just one page).
+
+    Realized metrics use the unambiguous DOLLAR P&L ``COALESCE(pnl_usd, pnl)`` over
+    CLOSED trades — deliberately sidestepping the pnl_pct unit-blend (kernel writes an
+    equity-fraction, legacy writes a margin-return). Open exposure is the sum of open
+    notional (size * entry price). Computed entirely in SQL so a large ledger never
+    streams every row into the API process.
+    """
+    where, params = _build_trade_filters(
+        status=status, asset=asset, strategy=strategy, direction=direction,
+        execution_type=execution_type, opened_from=opened_from, opened_to=opened_to,
+        search=search,
+    )
+    pnl = "COALESCE(pnl_usd, pnl)"
+    closed = "UPPER(COALESCE(status, '')) = 'CLOSED'"
+    notional = "ABS(COALESCE(size, 0) * COALESCE(fill_entry_price, entry_price, signal_entry_price, 0))"
+    sql = f"""
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN UPPER(COALESCE(status,'')) = 'OPEN' THEN 1 ELSE 0 END) AS open_count,
+          SUM(CASE WHEN {closed} THEN 1 ELSE 0 END) AS closed_count,
+          SUM(CASE WHEN UPPER(COALESCE(status,'')) = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
+          SUM(CASE WHEN UPPER(COALESCE(status,'')) = 'OPEN' THEN {notional} ELSE 0 END) AS open_exposure,
+          SUM(CASE WHEN {closed} AND {pnl} IS NOT NULL THEN {pnl} ELSE 0 END) AS net_pnl,
+          SUM(CASE WHEN {closed} AND {pnl} > 0 THEN {pnl} ELSE 0 END) AS gross_profit,
+          SUM(CASE WHEN {closed} AND {pnl} < 0 THEN {pnl} ELSE 0 END) AS gross_loss,
+          SUM(CASE WHEN {closed} AND {pnl} > 0 THEN 1 ELSE 0 END) AS wins,
+          SUM(CASE WHEN {closed} AND {pnl} < 0 THEN 1 ELSE 0 END) AS losses,
+          MAX(CASE WHEN {closed} THEN {pnl} END) AS best,
+          MIN(CASE WHEN {closed} THEN {pnl} END) AS worst
+        FROM trades {where}
+    """
+    with get_db() as conn:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    r = dict(row) if row else {}
+
+    wins = int(r.get("wins") or 0)
+    losses = int(r.get("losses") or 0)
+    decided = wins + losses
+    gross_profit = float(r.get("gross_profit") or 0.0)
+    gross_loss = float(r.get("gross_loss") or 0.0)  # <= 0
+    net_pnl = float(r.get("net_pnl") or 0.0)
+    return {
+        "total": int(r.get("total") or 0),
+        "open_count": int(r.get("open_count") or 0),
+        "closed_count": int(r.get("closed_count") or 0),
+        "failed_count": int(r.get("failed_count") or 0),
+        "open_exposure": float(r.get("open_exposure") or 0.0),
+        "net_pnl": net_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "wins": wins,
+        "losses": losses,
+        "decided": decided,
+        # win_rate / profit_factor / expectancy are None when undefined (no decided
+        # trades / no losses) so the UI renders "—"/"∞" instead of a misleading 0.
+        "win_rate": (wins / decided) if decided else None,
+        "profit_factor": (gross_profit / abs(gross_loss)) if gross_loss < 0 else None,
+        "avg_win": (gross_profit / wins) if wins else None,
+        "avg_loss": (gross_loss / losses) if losses else None,  # <= 0
+        "expectancy": (net_pnl / decided) if decided else None,
+        "best": (float(r["best"]) if r.get("best") is not None else None),
+        "worst": (float(r["worst"]) if r.get("worst") is not None else None),
+    }
 
 
 def get_open_trades(exclude_bots: bool = False) -> list[dict]:
