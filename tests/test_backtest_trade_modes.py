@@ -238,3 +238,47 @@ def test_resolve_backtest_trade_mode_falls_back_to_short_only_for_mirror_safe_st
 
     assert error is None
     assert resolved_mode == "short_only"
+
+
+def test_resolve_backtest_trade_mode_honors_imported_strategy_declared_mode():
+    """An imported (sandbox-only) strategy's real class — and its declared
+    ``supported_trade_modes`` — is never imported into the trusted parent, so the
+    parent must derive support from the validated stored params. A dual-side imported
+    strategy declaring ``trade_mode='both'`` must not be rejected as unsupported,
+    whether or not a proxy ``strategy_obj`` is passed (regression: imported strategy
+    backtest failed with "does not support trade_mode='both'")."""
+    from forven.strategies.sandbox_proxy import SandboxOnlyStrategy
+
+    runtime_type = "imported__btc_persistbrkregime_s195444"
+    params = {"_asset": "BTC", "trade_mode": "both"}
+    proxy = SandboxOnlyStrategy("S05074", params, runtime_type=runtime_type)
+
+    assert proxy.supported_trade_modes == {"long_only", "both"}
+
+    # Proxy-passed path (backtest / scanner build the proxy as the probe).
+    resolved_mode, error = backtest_mod.resolve_backtest_trade_mode(
+        "both", strategy_type=runtime_type, params=params, strategy_obj=proxy,
+    )
+    assert error is None
+    assert resolved_mode == "both"
+
+    # Type+params-only path (no proxy) must resolve identically.
+    resolved_mode, error = backtest_mod.resolve_backtest_trade_mode(
+        "both", strategy_type=runtime_type, params=params, strategy_obj=None,
+    )
+    assert error is None
+    assert resolved_mode == "both"
+
+
+def test_resolve_backtest_trade_mode_keeps_strict_guard_for_first_party_strategy():
+    """The sandbox-only relaxation must NOT leak to first-party strategies the parent
+    CAN introspect: forcing trade_mode='both' on a long-only type still errors."""
+    resolved_mode, error = backtest_mod.resolve_backtest_trade_mode(
+        "both",
+        strategy_type="macd",
+        params={"trade_mode": "both"},
+        strategy_obj=None,
+    )
+    assert resolved_mode == "both"
+    assert error is not None
+    assert "does not support trade_mode='both'" in error

@@ -875,6 +875,24 @@ def get_strategy_supported_trade_modes(
     if side_hint == "short":
         supported.add("short_only")
 
+    # Untrusted-origin (sandbox-only / imported) strategies are never imported into the
+    # trusted parent, so this process can't read the real class's declared
+    # ``supported_trade_modes``. When called with only a type+params (no proxy
+    # ``strategy_obj``), honor the strategy's own validated ``trade_mode`` so an imported
+    # dual-side strategy isn't rejected as "does not support trade_mode='both'". Scoped to
+    # sandbox-only types so the strict guard is unchanged for first-party strategies we
+    # CAN introspect.
+    is_sandbox_only = bool(getattr(strategy_obj, "sandbox_only", False))
+    if not is_sandbox_only and strategy_type:
+        try:
+            from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+            is_sandbox_only = is_sandbox_only_type(strategy_type)
+        except Exception:
+            is_sandbox_only = False
+    if is_sandbox_only:
+        supported.add(_default_trade_mode_from_params(params))
+
     return supported
 
 

@@ -55,6 +55,30 @@ class SandboxOnlyStrategy(BaseStrategy):
         # The proxy carries the stored params; the real defaults live in the worker.
         return dict(getattr(self, "_stored_params", {}) or {})
 
+    @property
+    def supported_trade_modes(self):
+        """Trade modes the imported strategy supports.
+
+        The real class — and its declared ``supported_trade_modes`` — is never
+        imported into the trusted parent, so derive it from the strategy's
+        validated, stored params: an explicit ``_supported_trade_modes`` list if the
+        importer recorded one, otherwise the strategy's own declared ``trade_mode``
+        (which the worker baked into its canonical params at import). ``long_only`` is
+        always available. Without this the proxy would inherit BaseStrategy's
+        ``{"long_only"}`` and a dual-side imported strategy would be wrongly rejected
+        with "does not support trade_mode='both'"."""
+        modes = {"long_only"}
+        declared = self.params.get("_supported_trade_modes")
+        if isinstance(declared, (list, tuple, set)):
+            for candidate in declared:
+                normalized = str(candidate or "").strip().lower()
+                if normalized in {"long_only", "short_only", "both"}:
+                    modes.add(normalized)
+        trade_mode = str(self.params.get("trade_mode") or "").strip().lower()
+        if trade_mode in {"long_only", "short_only", "both"}:
+            modes.add(trade_mode)
+        return modes
+
     def _refuse(self):
         raise SandboxOnlyExecutionError(
             f"sandbox-only strategy {self._runtime_type!r} must execute in the worker, "
