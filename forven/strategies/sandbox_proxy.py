@@ -79,6 +79,21 @@ class SandboxOnlyStrategy(BaseStrategy):
             modes.add(trade_mode)
         return modes
 
+    def data_requirements(self) -> list[dict]:
+        """The imported strategy's declared data requirements, captured by the worker
+        at import (the real class never reaches the parent) and carried in stored
+        params under ``_data_requirements``. Falls back to BaseStrategy's single-source
+        default. Multi-asset imports are rejected at import time
+        (intake.register_imported_strategy_file), so this is single-source in practice —
+        but exposing the real declaration keeps the parent's data preflight honest
+        rather than silently assuming the BaseStrategy default."""
+        stored = self.params.get("_data_requirements")
+        if isinstance(stored, list) and stored:
+            cleaned = [dict(r) for r in stored if isinstance(r, dict)]
+            if cleaned:
+                return cleaned
+        return super().data_requirements()
+
     def _refuse(self):
         raise SandboxOnlyExecutionError(
             f"sandbox-only strategy {self._runtime_type!r} must execute in the worker, "

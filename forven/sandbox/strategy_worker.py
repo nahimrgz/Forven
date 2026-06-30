@@ -249,6 +249,29 @@ def _validate_custom_module(workdir: Path) -> dict:
     default_params = probe.default_params
     asset = probe.asset if hasattr(probe, "asset") else "BTC"
 
+    # Capture the declared data requirements so the trusted parent can SEE a
+    # cross-asset / multi-source need (the real class never reaches the parent). The
+    # parent rejects multi-asset imports — the sandbox can't supply a second asset's
+    # series, so they would silently run on incomplete data. A data_requirements() that
+    # raises (or isn't a list) is reported as None → the parent treats it as unknown.
+    try:
+        data_reqs = probe.data_requirements()
+        if not isinstance(data_reqs, list):
+            data_reqs = None
+    except Exception:
+        data_reqs = None
+
+    # Capture the optimizable parameter space so the parent CAN tune an imported
+    # strategy (it can't introspect the absent class). (min, max, step) tuples become
+    # lists through JSON — the optimizer's grid builder treats a 3-element list
+    # identically to the tuple.
+    try:
+        param_space = probe.parameter_space()
+        if not isinstance(param_space, dict):
+            param_space = None
+    except Exception:
+        param_space = None
+
     cert = certify_execution_strategy(str(type_name), default_params)
     lookahead_reason = detect_lookahead(probe)
 
@@ -258,6 +281,8 @@ def _validate_custom_module(workdir: Path) -> dict:
         "default_params": _json_safe(default_params),
         "canonical_params": _json_safe(getattr(cert, "canonical_params", None)),
         "asset": str(asset).strip() or "BTC",
+        "data_requirements": _json_safe(data_reqs) if data_reqs is not None else None,
+        "parameter_space": _json_safe(param_space) if param_space is not None else None,
         "certified": bool(cert.certified),
         "cert_error": cert.primary_blocking_reason(),
         "lookahead_blocked": bool(lookahead_reason),

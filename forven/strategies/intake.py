@@ -703,6 +703,28 @@ def register_imported_strategy_file(
             f"imported strategy validation failed: {meta.get('error') or 'unknown error'}"
         )
 
+    # Fail-closed on cross-asset / multi-source imports. There is NO parent-side
+    # cross-asset enrichment, and the sandbox worker is network/DB-jailed (R3), so a
+    # strategy that needs a SECOND asset's series cannot be fed it — it would run on a
+    # single-asset frame and silently emit empty/garbage signals. Reject at import
+    # rather than register a strategy that can never produce correct signals. (The real
+    # class never reaches the parent; the worker captured data_requirements() for us.)
+    data_reqs = meta.get("data_requirements")
+    if isinstance(data_reqs, list):
+        distinct_assets = {
+            str(r.get("asset") or "").strip().upper()
+            for r in data_reqs
+            if isinstance(r, dict) and r.get("asset")
+        }
+        if len(distinct_assets) > 1:
+            raise ValueError(
+                f"{modname}.py declares a cross-asset data requirement "
+                f"({', '.join(sorted(distinct_assets))}). Cross-asset / multi-source "
+                "imported strategies are not supported: the sandbox cannot supply a "
+                "second asset's data, so the strategy would run on incomplete data. "
+                "Import a single-asset strategy instead."
+            )
+
     runtime_type = imported_runtime_type(modname)
     asset = str(meta.get("asset") or "BTC").strip() or "BTC"
     certified = bool(meta.get("certified"))
@@ -718,6 +740,17 @@ def register_imported_strategy_file(
     ) or {}
     if not isinstance(stored_params, dict):
         stored_params = {}
+    # Carry the validated data requirements so the parent-side proxy reports the real
+    # (single-source) declaration instead of BaseStrategy's default — otherwise the
+    # proxy is silently wrong about what data the strategy needs.
+    if isinstance(data_reqs, list) and data_reqs:
+        stored_params.setdefault("_data_requirements", data_reqs)
+    # Carry the optimizable parameter space so the optimizer can tune the imported
+    # strategy (its real parameter_space() is in the absent class). Without this the
+    # optimizer returns {} for sandbox-only types and silently never tunes them.
+    param_space = meta.get("parameter_space")
+    if isinstance(param_space, dict) and param_space:
+        stored_params.setdefault("_parameter_space", param_space)
 
     with get_db() as conn:
         strategy_id, _display, _base = create_strategy_container(
