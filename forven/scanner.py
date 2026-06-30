@@ -2611,6 +2611,62 @@ def _latest_directional_signals(strategy_instance, df: pd.DataFrame) -> dict | N
     }
 
 
+def _sandbox_latest_signal(
+    strategy_instance, df: pd.DataFrame, *, resolved_runtime_type, family_type, canonical_meta
+) -> dict:
+    """Latest scalar signal for a SANDBOX-ONLY (imported) strategy, computed in the
+    locked-down worker — its code never runs in the parent. Mirrors the get_signal
+    dict shape so the signal matrix / paper trigger sees the real entry/exit."""
+    from forven.sandbox.strategy_worker import (
+        compute_directional_signals_isolated,
+        StrategyWorkerError,
+    )
+
+    rt = str(getattr(strategy_instance, "strategy_type", None) or resolved_runtime_type or "")
+    params = dict(getattr(strategy_instance, "params", {}) or {})
+    trade_mode = str(params.get("trade_mode") or "long_only").strip().lower()
+    if trade_mode not in {"long_only", "short_only", "both"}:
+        trade_mode = "long_only"
+    price = 0.0
+    try:
+        if not df.empty:
+            price = float(df["close"].iloc[-1])
+    except Exception:
+        price = 0.0
+
+    sigs = None
+    try:
+        sigs = compute_directional_signals_isolated(df, rt, params, trade_mode=trade_mode)
+    except StrategyWorkerError as exc:
+        log.error("sandbox signal generation failed for %s: %s", rt, exc)
+
+    def _last(series) -> bool:
+        try:
+            return bool(series.iloc[-1])
+        except Exception:
+            return False
+
+    if sigs is None:
+        le = se = lx = sx = False
+    else:
+        le, se = _last(sigs.long_entries), _last(sigs.short_entries)
+        lx, sx = _last(sigs.long_exits), _last(sigs.short_exits)
+    direction = "short" if (se or sx) and not (le or lx) else "long"
+    return {
+        "price": price,
+        "entry_signal": bool(le or se),
+        "exit_signal": bool(lx or sx),
+        "direction": direction,
+        "directional_signals": {"long_entry": le, "short_entry": se, "long_exit": lx, "short_exit": sx},
+        "runtime_source": "sandbox_worker",
+        "runtime_type": rt,
+        "family_type": family_type,
+        "param_alias_resolutions": canonical_meta.alias_resolutions,
+        "param_unknown_params": canonical_meta.unknown_params,
+        "param_unsupported_rule_blobs": canonical_meta.unsupported_rule_blobs,
+    }
+
+
 def get_signal(
     strat_id: str,
     strat: dict,
@@ -2631,6 +2687,7 @@ def get_signal(
     if strategy_instance is None:
         try:
             from forven.strategies.registry import _TYPE_MAP, get_active, resolve_runtime_type
+            from forven.strategies.sandbox_proxy import is_sandbox_only_type as _is_sandbox_only_type
 
             strategy_instance = get_active().get(strat_id)
             if strategy_instance is None:
@@ -2640,15 +2697,33 @@ def get_signal(
                     strat.get("runtime_type"),
                 )
                 resolved_runtime_type = runtime_type or resolved_runtime_type
+                asset = str(strat.get("asset") or "").strip()
+                if asset:
+                    canonical_params.setdefault("_asset", asset)
                 strategy_cls = _TYPE_MAP.get(runtime_type or "")
                 if strategy_cls is not None:
-                    asset = str(strat.get("asset") or "").strip()
-                    if asset:
-                        canonical_params.setdefault("_asset", asset)
                     strategy_instance = strategy_cls(strat_id, canonical_params)
                     runtime_source = str(runtime_meta.get("source") or "registry_ad_hoc")
+                elif runtime_meta.get("sandbox_only") or _is_sandbox_only_type(runtime_type):
+                    # Untrusted-origin: never instantiate its real class here; the proxy
+                    # carries type+params and routes signal-gen to the worker below.
+                    from forven.strategies.sandbox_proxy import SandboxOnlyStrategy
+
+                    strategy_instance = SandboxOnlyStrategy(
+                        strat_id, canonical_params, runtime_type=runtime_type
+                    )
+                    runtime_source = "sandbox_only"
         except Exception:
             strategy_instance = None
+
+    # Sandbox-only (imported) strategies compute their latest signal in the worker —
+    # their code is never run in the parent (the proxy's generate_signal raises).
+    if strategy_instance is not None and getattr(strategy_instance, "sandbox_only", False):
+        return _sandbox_latest_signal(
+            strategy_instance, df,
+            resolved_runtime_type=resolved_runtime_type, family_type=family_type,
+            canonical_meta=canonical_meta,
+        )
 
     if strategy_instance is not None:
         try:
@@ -6022,14 +6097,21 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     strategy_instance = None
     try:
         from forven.strategies.registry import _TYPE_MAP, get_active, resolve_runtime_type
+        from forven.strategies.sandbox_proxy import is_sandbox_only_type as _is_sandbox_only_type
         strategy_instance = get_active().get(strat_id)
         if strategy_instance is None:
             runtime_type, _meta = resolve_runtime_type(str(strat.get("type") or ""), strat.get("runtime_type"))
             cls = _TYPE_MAP.get(runtime_type or "")
+            cp = dict(p)
+            cp.setdefault("_asset", asset)
             if cls is not None:
-                cp = dict(p)
-                cp.setdefault("_asset", asset)
                 strategy_instance = cls(strat_id, cp)
+            elif _meta.get("sandbox_only") or _is_sandbox_only_type(runtime_type):
+                # Untrusted-origin: the proxy carries type+params; run_strategy_execution
+                # force-routes its kernel signal generation to the sandbox worker.
+                from forven.strategies.sandbox_proxy import SandboxOnlyStrategy
+
+                strategy_instance = SandboxOnlyStrategy(strat_id, cp, runtime_type=runtime_type)
     except Exception:
         strategy_instance = None
     if strategy_instance is None:

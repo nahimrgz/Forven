@@ -986,6 +986,16 @@ def _get_param_space(strategy_id: str, strategy_type: str, base_params: dict) ->
     base_params = base_params if isinstance(base_params, dict) else {}
     resolved_strategy_obj = None
 
+    # Untrusted-origin (sandbox-only) strategies are NOT re-optimized in the parent:
+    # their real parameter_space() lives only in the worker, and they ship with the
+    # author's tuned params. Return an empty space so the optimizer evaluates the
+    # stored params instead of trying to introspect the absent class (which would
+    # also kick off the in-parent custom-module scan below).
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+    if is_sandbox_only_type(strategy_type):
+        return {}
+
     # Try registry class first
     try:
         from forven.strategies.registry import (

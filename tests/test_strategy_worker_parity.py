@@ -353,6 +353,71 @@ def test_sandbox_only_proxy_force_routes_to_worker(monkeypatch):
         sw._reset_worker()
 
 
+def test_full_gauntlet_sites_handle_sandbox_only(monkeypatch):
+    """The remaining gauntlet/scanner construction sites are sandbox-aware: the
+    optimizer skips re-optimizing an imported strategy (no in-parent class), and the
+    scanner's get_signal computes its latest signal IN THE WORKER (runtime_source
+    'sandbox_worker') without ever running the strategy's code in the parent (R2)."""
+    import sys as _sys
+    from pathlib import Path
+
+    monkeypatch.delenv("FORVEN_IN_STRATEGY_WORKER", raising=False)
+    monkeypatch.delenv("FORVEN_ISOLATED_STRATEGY_EXEC", raising=False)
+
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies.registry import imported_runtime_type
+    from forven.strategies.optimizer import _get_param_space
+    from forven import scanner
+    import forven.sandbox.strategy_worker as sw
+
+    module_name = "wp_fullgaunt_probe"
+    src = "\n".join(
+        [
+            "import pandas as pd",
+            "from forven.strategies.base import BaseStrategy, Signal, DirectionalSignals",
+            "TYPE_NAME = 'wp_fullgaunt_type'",
+            "class WpFullGaunt(BaseStrategy):",
+            "    @property",
+            "    def name(self): return 'wp'",
+            "    @property",
+            "    def asset(self): return 'BTC'",
+            "    @property",
+            "    def strategy_type(self): return TYPE_NAME",
+            "    @property",
+            "    def default_params(self): return {}",
+            "    def generate_signal(self, df):",
+            "        return Signal(price=float(df['close'].iloc[-1]) if len(df.index) else 0.0)",
+            "    def generate_signals(self, df):",
+            "        f = df['close'].ewm(span=5).mean(); s = df['close'].ewm(span=20).mean()",
+            "        le = ((f > s) & (f.shift(1) <= s.shift(1))).fillna(False)",
+            "        lx = ((f < s) & (f.shift(1) >= s.shift(1))).fillna(False)",
+            "        z = pd.Series(False, index=df.index)",
+            "        return DirectionalSignals(long_entries=le, long_exits=lx, short_entries=z, short_exits=z)",
+            "STRATEGY_CLASS = WpFullGaunt",
+        ]
+    )
+    target = Path(imported_pkg.__file__).resolve().parent / f"{module_name}.py"
+    target.write_text(src, encoding="utf-8")
+    sw._reset_worker()
+    try:
+        rt = imported_runtime_type(module_name)
+
+        # Optimizer: no in-parent class -> empty param space (no crash, no re-tune).
+        assert _get_param_space("S-wp", rt, {}) == {}
+
+        # Scanner get_signal: routed to the worker, parent never runs the code.
+        df = _frame()
+        strat = {"type": rt, "runtime_type": rt, "asset": "BTC", "params": {}}
+        sig = scanner.get_signal("S-wp", strat, df, None)
+        assert sig.get("runtime_source") == "sandbox_worker"
+        assert "directional_signals" in sig
+        assert f"forven.strategies.imported.{module_name}" not in _sys.modules
+    finally:
+        if target.exists():
+            target.unlink()
+        sw._reset_worker()
+
+
 def test_isolated_validation_rejects_unknown_module():
     """An unknown custom module yields a structured failure, not a crash/None."""
     from forven.sandbox.strategy_worker import validate_custom_module_isolated

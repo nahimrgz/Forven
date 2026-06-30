@@ -11315,12 +11315,19 @@ def preview_strategy_signals(
 
     family_type = str(strategy_type or "").strip()
     strategy_obj = None
-    try:
-        cls = _resolve_strategy_class(family_type)
-        if cls:
-            strategy_obj = cls("preview", params)
-    except Exception:
-        strategy_obj = None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
+
+    if is_sandbox_only_type(family_type):
+        # Untrusted-origin: the proxy stands in; _run_signal_walk → run_strategy_execution
+        # force-routes signal generation to the sandbox worker (never in-process here).
+        strategy_obj = SandboxOnlyStrategy("preview", params, runtime_type=family_type)
+    else:
+        try:
+            cls = _resolve_strategy_class(family_type)
+            if cls:
+                strategy_obj = cls("preview", params)
+        except Exception:
+            strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_type)
     if strategy_obj is None and not checker and family_type not in _VECTORIZABLE_TYPES:
         warnings.append(f"Unknown strategy type '{family_type}' — cannot preview signals.")
