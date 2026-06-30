@@ -17,7 +17,10 @@ Engine conventions exercised (from execution_kernel.simulate):
   * exit precedence per bar: time-stop → signal exit → stop/trailing → take-profit;
   * a long stop fills at min(open, stop), a short stop at max(open, stop) (gap-through);
   * a take-profit fills AT the target; a time-stop / signal exit fills at the bar OPEN;
-  * a trailing stop ratchets on the PRIOR bar's extreme and fills at the level.
+  * a trailing stop ratchets on the PRIOR bar's extreme and fills at the level;
+  * risk-based 'fraction' sizing deploys size_fraction = risk/(stop·lev), so a stop-out loses
+    exactly risk_per_trade of equity — leverage-invariant (the last oracle; the others use
+    'full' sizing = size_fraction 1.0 to keep the price-fill math isolated).
 """
 
 from __future__ import annotations
@@ -67,13 +70,17 @@ def _ec(**profile) -> dict:
     return _sizing.normalize_execution_controls({"sizing_mode": "full", **profile})
 
 
-def _run_kernel(df: pd.DataFrame, signals: DirectionalSignals, ec: dict):
+def _run_kernel_lev(df: pd.DataFrame, signals: DirectionalSignals, ec: dict, leverage: float):
     res = ek.simulate(
-        df, signals, WARMUP, LEVERAGE, regimes=None, round_trip_drag=0.0, trade_mode="both",
+        df, signals, WARMUP, leverage, regimes=None, round_trip_drag=0.0, trade_mode="both",
         allowed_modes=("long", "short"), ec=ec, initial_capital=10000.0,
     )
-    trades = ek.force_close(res, df, leverage=LEVERAGE, round_trip_drag=0.0, trade_mode="both")
+    trades = ek.force_close(res, df, leverage=leverage, round_trip_drag=0.0, trade_mode="both")
     return trades, res
+
+
+def _run_kernel(df: pd.DataFrame, signals: DirectionalSignals, ec: dict):
+    return _run_kernel_lev(df, signals, ec, LEVERAGE)
 
 
 def _as_tuples(trades: list[dict]) -> list[tuple]:
@@ -268,3 +275,68 @@ def test_kernel_trailing_stop_oracle():
     trades, res = _run_kernel(df, sig, _ec(trailing_stop_pct=5.0))
     assert not res.open_positions
     assert _as_tuples(trades) == _TRAIL_EXPECTED
+
+
+# ── Oracle 5: risk-based (fraction) sizing — size_fraction = risk/(stop·lev), and a stop-out
+#    loses EXACTLY risk_per_trade of equity, leverage-invariant ───────────────────────────────
+#   risk 2%, stop 4% (=> size_fraction 0.02/(0.04·lev)), target 8% (a 2:1 winner => +2·risk).
+_SIZING_RISK = 0.02
+_SIZING_STOP_PCT = 4.0
+_SIZING_BARS = [
+    (100, 101, 99, 100),    # 0
+    (100, 101, 99, 100),    # 1  long entry signal
+    (100, 101, 99, 100),    # 2  LONG fills @100 -> stop 96, target 108
+    (99, 100, 95, 96),      # 3  low 95<=96 -> STOP @min(99,96)=96
+    (100, 101, 99, 100),    # 4  filler
+    (100, 101, 99, 100),    # 5  long entry signal
+    (100, 101, 99, 100),    # 6  LONG fills @100
+    (101, 109, 100, 108),   # 7  high 109>=108 -> TP @108
+    (100, 101, 99, 100),    # 8  filler
+]
+_SIZING_LONG_E = (1, 5)
+
+
+def _sizing_ec() -> dict:
+    return _ec(sizing_mode="fraction", risk_per_trade=_SIZING_RISK,
+               stop_loss_pct=_SIZING_STOP_PCT, take_profit_pct=8.0)
+
+
+def _expected_size_fraction(leverage: float) -> float:
+    return _SIZING_RISK / (_SIZING_STOP_PCT / 100.0 * leverage)
+
+
+def test_kernel_fraction_sizing_oracle():
+    """Risk-based sizing deploys EXACTLY risk/(stop·lev) of equity, and the stop-out loses
+    exactly risk_per_trade while a 2:1 winner makes 2·risk — pins the formula and the PnL
+    scaling (gross · size_fraction), not just price fills."""
+    df = _frame(_SIZING_BARS)
+    sig = _signals(df.index, long_e=_SIZING_LONG_E)
+    trades, res = _run_kernel(df, sig, _sizing_ec())  # leverage 2.0 -> size_fraction 0.25
+    assert not res.open_positions
+    assert _as_tuples(trades) == [
+        ("long", 2, 100.0, 96.0, "stop_loss", round(-_SIZING_RISK, 5)),       # stop loses exactly -risk
+        ("long", 6, 100.0, 108.0, "take_profit", round(2 * _SIZING_RISK, 5)),  # 2:1 winner -> +2·risk
+    ]
+    sf = round(_expected_size_fraction(LEVERAGE), 4)
+    assert sf == 0.25
+    for t in res.closed_trades:
+        assert t["size_fraction"] == sf
+    assert res.closed_trades[0]["pnl_pct"] == pytest.approx(-_SIZING_RISK, abs=1e-9)
+
+
+def test_fraction_sizing_is_leverage_invariant():
+    """Doubling leverage HALVES size_fraction, so the equity PnL is IDENTICAL — the stop still
+    loses exactly risk_per_trade. The leverage-invariance the risk-based sizing guarantees (a
+    backtest's % returns are achievable regardless of the leverage knob)."""
+    df = _frame(_SIZING_BARS)
+    sig = _signals(df.index, long_e=_SIZING_LONG_E)
+    t2, r2 = _run_kernel_lev(df, sig, _sizing_ec(), 2.0)
+    t4, r4 = _run_kernel_lev(df, sig, _sizing_ec(), 4.0)
+    # identical equity PnL despite different leverage...
+    assert _as_tuples(t2) == _as_tuples(t4)
+    # ...because size_fraction scales by 1/leverage (0.25 at 2x, 0.125 at 4x)
+    assert r2.closed_trades[0]["size_fraction"] == round(_expected_size_fraction(2.0), 4) == 0.25
+    assert r4.closed_trades[0]["size_fraction"] == round(_expected_size_fraction(4.0), 4) == 0.125
+    # a stop-out loses exactly risk_per_trade at BOTH leverages
+    assert r2.closed_trades[0]["pnl_pct"] == pytest.approx(-_SIZING_RISK, abs=1e-9)
+    assert r4.closed_trades[0]["pnl_pct"] == pytest.approx(-_SIZING_RISK, abs=1e-9)
