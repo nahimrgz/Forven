@@ -8,7 +8,7 @@ Example usage:
         strategy_type = "macd_volume"
 
         def _primary_signal(self, df):
-            from forven.scanner import macd
+            from forven.strategies.indicators import macd
             m = macd(df)
             return (m["macd"] > m["signal"]) & (m["macd"] > 0)
 
@@ -68,7 +68,7 @@ class MomentumConfirmationStrategy(BaseStrategy):
         if len(df) < 10:
             return Signal()
         try:
-            from forven.scanner import rsi as calc_rsi, atr as calc_atr
+            from forven.strategies.indicators import rsi as calc_rsi, atr as calc_atr
 
             rsi_period = int(self.p("rsi_period", 14))
             rsi_min = float(self.p("rsi_min", 45))
@@ -120,7 +120,7 @@ class MomentumConfirmationStrategy(BaseStrategy):
         if len(df) < 10:
             return pd.DataFrame({"entry_signal": False, "exit_signal": False}, index=df.index)
         try:
-            from forven.scanner import rsi as calc_rsi
+            from forven.strategies.indicators import rsi as calc_rsi
 
             rsi_period = int(self.p("rsi_period", 14))
             rsi_min = float(self.p("rsi_min", 45))

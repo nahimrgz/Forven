@@ -48,7 +48,7 @@ class EMACrossStrategy(BaseStrategy):
                 f"Uses {p['ema_regime']}-bar trend filter.")
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr
+        from forven.strategies.indicators import adx, atr
         p = self.params
         close = df["close"]
         
@@ -82,7 +82,7 @@ class EMACrossStrategy(BaseStrategy):
                                  "regime_ok": bool(regime_ok), "atr_14": round(curr_atr, 6)})
 
     def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-        from forven.scanner import adx
+        from forven.strategies.indicators import adx
 
         p = self.params
         close = df["close"]

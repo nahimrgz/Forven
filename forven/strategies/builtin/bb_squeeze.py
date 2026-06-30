@@ -20,7 +20,7 @@ class BBSqueezeStrategy(BaseStrategy):
     def describe(self) -> str:
         return "Detects a volatility squeeze (BB inside KC) and trades the breakout."
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import atr
+        from forven.strategies.indicators import atr
         p = self.params
         close = df["close"]
         

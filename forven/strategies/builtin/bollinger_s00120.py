@@ -60,7 +60,7 @@ class BollingerS00120Strategy(BaseStrategy):
         long-entry floor, or RSI just crossed down through it). Exit: close below the
         mid band OR RSI above the short threshold.
         """
-        from forven.scanner import rsi as compute_rsi
+        from forven.strategies.indicators import rsi as compute_rsi
 
         p = self.params
         bp = p.get("bb_period", 20)
@@ -88,7 +88,7 @@ class BollingerS00120Strategy(BaseStrategy):
         return entry.fillna(False), exit_.fillna(False)
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import rsi as compute_rsi, atr
+        from forven.strategies.indicators import rsi as compute_rsi, atr
 
         p = self.params
         bp = p.get("bb_period", 20)

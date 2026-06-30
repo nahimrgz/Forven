@@ -91,23 +91,31 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
 )
 
 # The ONLY forven module prefixes an untrusted strategy may import: the strategy
-# base/indicators, the composite/builtin strategies it may compose, the read-only
-# market-data view, the scanner indicator helpers, and the data layer. This
-# EXCLUDES forven.exchange / forven.db / forven.secret_storage / forven.config /
-# forven.auth / forven.brain — which expose orders, the database, and credentials.
-# That is a TIGHTENING: the previous denylist allowed ALL of forven.*. (forven.scanner
-# is still broad; the real containment is Phase 2's out-of-process execution — see
-# docs/security-hardening-plan.md.)
+# base, the pure-indicator facade, the composite/builtin strategies it may compose,
+# the read-only market-data view, and the pure TA helpers. This EXCLUDES
+# forven.exchange / forven.db / forven.secret_storage / forven.config / forven.auth /
+# forven.brain — which expose orders, the database, and credentials.
+#
+# REMOVED for R3 (docs/strategy-share-security-audit-2026-06-29.md):
+#  • forven.scanner — re-exports get_db / kv_get / _execute_direct (DB + secret-decrypt
+#    + live-order sink). Strategies only ever needed its PURE indicator helpers
+#    (rsi/atr/adx/...), which are now re-exported by forven.strategies.indicators (a
+#    lazy facade). The builtin/composite corpus was migrated to import from there; the
+#    only files still importing forven.scanner are archived/dead customs (correctly
+#    scan-rejected on revival). The worker DB+network jail already made scanner inert
+#    inside the sandbox; de-allowlisting also removes it from the *intended* surface.
+#  • forven.strategies.sentiment — re-exports a live funding fetch (network/exchange).
+#    The one shipped user (builtin funding.py) was migrated to read the parent-enriched
+#    funding_rate column; remaining importers are archived/dead.
+#  • forven.data / forven.data_manager — ccxt client (SSRF), raw requests.Session
+#    (exfil egress), and pathlib.Path/shutil (arbitrary FS read/write — NOT covered by
+#    the DB+network jail). Only archived/dead customs imported them.
 ALLOWED_FORVEN_PREFIXES: tuple[str, ...] = (
     "forven.strategies.base",
     "forven.strategies.indicators",
-    "forven.strategies.sentiment",
     "forven.strategies.composite",
     "forven.strategies.builtin",
     "forven.market_data_view",
-    "forven.scanner",
-    "forven.data",
-    "forven.data_manager",
     "forven.ta",
 )
 

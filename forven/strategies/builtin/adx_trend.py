@@ -47,7 +47,7 @@ class ADXTrendStrategy(BaseStrategy):
         )
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr
+        from forven.strategies.indicators import adx, atr
 
         p = self.params
         high = df["high"]

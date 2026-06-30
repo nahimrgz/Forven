@@ -8,7 +8,12 @@ key, the Fernet key) and unrestricted FS/network. This module moves that step in
 subprocess that:
 
   * inherits a **secret-free** environment (``build_subprocess_env``),
-  * has **network egress denied** (the strategy can compute, not exfiltrate),
+  * has **all network egress denied** (loopback included — compute, not exfiltrate),
+  * is **database-jailed** — ``forven.db`` refuses every connection while
+    ``FORVEN_IN_STRATEGY_WORKER`` is set, so the still-importable confused-deputy
+    modules (``forven.scanner`` re-exports ``get_db``/``kv_get``/``kv_set``;
+    ``forven.data``/``data_manager``) cannot read or tamper the DB, decrypt secrets,
+    or reach a live-order sink,
   * is confined to a throwaway working directory,
   * is memory/CPU/process-capped (Win32 Job Object / POSIX rlimit, from :mod:`forven.sandbox`).
 
@@ -101,11 +106,14 @@ class StrategyWorkerError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def _install_network_deny() -> None:
-    """Best-effort: make outbound (routable) sockets raise inside the worker.
+    """Best-effort: make ALL outbound socket connects raise inside the worker.
 
     Defense-in-depth — the env is already secret-free and the AST guard blocks
     ``import socket`` in strategy code; this closes the residual where a guard
-    bypass reaches a socket via a transitive import. Loopback is left alone."""
+    bypass reaches a socket via a transitive import. Loopback is denied too: the
+    worker needs no network of any kind, and a bypass must not reach the local
+    control plane (``127.0.0.1:8003``) for SSRF against the trusted host
+    (docs/strategy-share-security-audit-2026-06-29.md, R3)."""
     try:
         import socket
     except Exception:
@@ -118,19 +126,10 @@ def _install_network_deny() -> None:
 
     class _GuardedSocket(_real_socket):  # type: ignore[misc, valid-type]
         def connect(self, address):  # noqa: ANN001
-            self._refuse_if_routable(address)
-            return super().connect(address)
+            _deny()
 
         def connect_ex(self, address):  # noqa: ANN001
-            self._refuse_if_routable(address)
-            return super().connect_ex(address)
-
-        @staticmethod
-        def _refuse_if_routable(address) -> None:  # noqa: ANN001
-            host = address[0] if isinstance(address, tuple) and address else ""
-            if str(host).strip().lower() in ("127.0.0.1", "::1", "localhost", ""):
-                return
-            raise OSError("network access is disabled in the strategy sandbox")
+            _deny()
 
     socket.socket = _GuardedSocket  # type: ignore[misc, assignment]
     socket.create_connection = _deny  # type: ignore[assignment]

@@ -3,7 +3,7 @@
 import pandas as pd
 
 from forven.strategies.base import BaseStrategy, DirectionalSignals, Signal
-from forven.scanner import atr, stochastic
+from forven.strategies.indicators import atr, stochastic
 
 TYPE_NAME = "stochastic"
 

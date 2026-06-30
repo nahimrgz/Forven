@@ -46,7 +46,7 @@ class ADXTrendPulseStrategy(BaseStrategy):
         )
 
     def _indicator_frame(self, df: pd.DataFrame) -> pd.DataFrame:
-        from forven.scanner import adx
+        from forven.strategies.indicators import adx
 
         p = self.params
         close = df["close"]

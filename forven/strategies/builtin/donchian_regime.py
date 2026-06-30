@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from forven.scanner import adx as compute_adx
+from forven.strategies.indicators import adx as compute_adx
 from forven.strategies.base import BaseStrategy, Signal
 from forven.strategies.builtin.donchian import donchian_bands, resolve_donchian_period
 

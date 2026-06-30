@@ -46,7 +46,7 @@ class ATRVolumeBreakoutStrategy(BaseStrategy):
         )
 
     def _indicator_frame(self, df: pd.DataFrame) -> pd.DataFrame:
-        from forven.scanner import atr
+        from forven.strategies.indicators import atr
 
         p = self.params
         close = df["close"]

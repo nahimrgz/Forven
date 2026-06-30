@@ -9,7 +9,7 @@ Example usage:
         strategy_type = "funding_fade_rsi"
 
         def _technical_filter(self, df):
-            from forven.scanner import rsi
+            from forven.strategies.indicators import rsi
             rsi_vals = rsi(df, period=14)
             # Fade: enter long when funding is extremely negative (longs squeezed)
             # and RSI confirms oversold
@@ -61,7 +61,7 @@ class FundingRegimeStrategy(BaseStrategy):
         """Returns (is_extreme, z_score). Graceful if no funding_rate column."""
         if "funding_rate" not in df.columns:
             return False, 0.0
-        from forven.scanner import funding_rate_zscore
+        from forven.strategies.indicators import funding_rate_zscore
         period = int(self.p("funding_period", 48))
         threshold = float(self.p("funding_threshold", 1.5))
         direction = str(self.p("funding_direction", "negative")).lower()
@@ -79,7 +79,7 @@ class FundingRegimeStrategy(BaseStrategy):
         """Vectorized funding extreme check."""
         if "funding_rate" not in df.columns:
             return pd.Series(False, index=df.index)
-        from forven.scanner import funding_rate_zscore
+        from forven.strategies.indicators import funding_rate_zscore
         period = int(self.p("funding_period", 48))
         threshold = float(self.p("funding_threshold", 1.5))
         direction = str(self.p("funding_direction", "negative")).lower()
@@ -95,7 +95,7 @@ class FundingRegimeStrategy(BaseStrategy):
         if len(df) < 10:
             return Signal()
         try:
-            from forven.scanner import atr as calc_atr, oi_price_divergence
+            from forven.strategies.indicators import atr as calc_atr, oi_price_divergence
 
             atr_vals = calc_atr(df, period=int(self.p("atr_period", 14)))
             funding_extreme, z_now = self._funding_extreme(df)
@@ -132,7 +132,7 @@ class FundingRegimeStrategy(BaseStrategy):
         if len(df) < 10:
             return pd.DataFrame({"entry_signal": False, "exit_signal": False}, index=df.index)
         try:
-            from forven.scanner import oi_price_divergence
+            from forven.strategies.indicators import oi_price_divergence
 
             funding_series = self._funding_extreme_series(df)
             oi_div = oi_price_divergence(df, period=int(self.p("oi_period", 14)))

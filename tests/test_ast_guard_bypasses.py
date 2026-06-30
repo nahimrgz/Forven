@@ -12,6 +12,17 @@ from forven.sandbox.ast_guard import scan_source
 
 
 BYPASS_PAYLOADS = {
+    # R3 (2026-06-30): the confused-deputy forven modules are no longer on the
+    # untrusted allowlist — forven.scanner (re-exports get_db/kv_get/_execute_direct),
+    # forven.strategies.sentiment (live funding fetch), forven.data / forven.data_manager
+    # (ccxt/requests/Path-shutil). Strategies use the forven.strategies.indicators facade
+    # instead. See docs/strategy-share-security-audit-2026-06-29.md.
+    "r3_scanner_db_handle": "from forven.scanner import get_db\n",
+    "r3_scanner_indicator": "from forven.scanner import atr\n",
+    "r3_scanner_module": "import forven.scanner as sc\nsc.kv_get('forven:settings')\n",
+    "r3_sentiment_fetch": "from forven.strategies.sentiment import fetch_funding_rates\n",
+    "r3_data_path": "from forven.data import Path\n",
+    "r3_data_manager_session": "from forven.data_manager import data_manager\n",
     "builtins_eval_attr": "import builtins\nbuiltins.eval('1+1')\n",
     "builtins_exec_attr": "import builtins\nbuiltins.exec('x=1')\n",
     "builtins_open_attr": "import builtins\nbuiltins.open('/etc/passwd')\n",
@@ -148,7 +159,9 @@ LEGIT_PAYLOADS = {
     "warnings_ok": "import warnings\nwarnings.warn('x')\n",
     "forven_base_ok": "from forven.strategies.base import BaseStrategy, Signal\n",
     "forven_marketdata_ok": "from forven.market_data_view import get_ohlcv\n",
-    "forven_scanner_helper_ok": "from forven.scanner import compute_atr\n",
+    # R3: pure indicator helpers now come from the allowlisted facade, NOT forven.scanner
+    # (which re-exports get_db/kv_get/_execute_direct and is de-allowlisted).
+    "forven_indicator_facade_ok": "from forven.strategies.indicators import atr, rsi, adx\n",
     # 2026-06-29 hardening must NOT regress these real corpus idioms.
     "ohlcv_subscript_open": "def g(df):\n    return df['open'] + df['close'] - df['low']\n",
     "dataclass_params_dict": (

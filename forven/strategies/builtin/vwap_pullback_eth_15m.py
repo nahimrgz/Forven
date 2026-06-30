@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from forven.scanner import rsi as compute_rsi
+from forven.strategies.indicators import rsi as compute_rsi
 from forven.strategies.base import BaseStrategy, Signal
 
 TYPE_NAME = "vwap_pullback_eth_15m"

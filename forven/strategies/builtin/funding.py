@@ -70,8 +70,9 @@ class FundingStrategy(BaseStrategy):
         return entry.fillna(False), exit_.fillna(False)
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        """Funding rate mean reversion - uses df['funding_rate'] if available (backtest) or fetches live."""
-        from forven.scanner import atr
+        """Funding rate mean reversion — reads df['funding_rate'] (enriched by the
+        parent: scanner/backtest add it by asset). Neutral when the column is absent."""
+        from forven.strategies.indicators import atr
 
         p = self.params
         close = df["close"]
@@ -82,23 +83,15 @@ class FundingStrategy(BaseStrategy):
         curr_ema200 = float(ema200.iloc[-1])
         curr_atr = float(atr_14.iloc[-1])
 
-        # Use pre-computed funding_rate from dataframe if available (backtest mode)
-        # Otherwise fall back to live funding rate (live trading mode)
+        # Funding comes from the parent-enriched ``funding_rate`` column — the scanner
+        # and backtest both enrich it by asset before delegating. A strategy must not
+        # fetch its own market data: that breaks backtest/live parity and is denied in
+        # the isolated worker anyway (R3 — forven.strategies.sentiment is no longer on
+        # the untrusted import allowlist). When the column is absent there is simply no
+        # funding signal, so fall through to the neutral return below.
         funding = None
         if "funding_rate" in df.columns:
-            # Backtest mode - use pre-computed funding rates
             funding = float(df["funding_rate"].iloc[-1])
-        else:
-            # Live mode - try to fetch live funding rate
-            try:
-                from forven.strategies.sentiment import fetch_funding_rates
-                funding_map = fetch_funding_rates()
-                if isinstance(funding_map, dict):
-                    funding_payload = funding_map.get(self.asset)
-                    if isinstance(funding_payload, dict) and "funding" in funding_payload:
-                        funding = float(funding_payload.get("funding", 0.0))
-            except Exception:
-                pass
 
         # If no funding data available, return neutral signal
         if funding is None:

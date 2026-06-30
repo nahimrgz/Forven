@@ -42,7 +42,7 @@ class MACDStrategy(BaseStrategy):
 
     def generate_signals(self, df: pd.DataFrame):
         """Vectorized twin of generate_signal — the SINGLE source of entry/exit logic."""
-        from forven.scanner import adx
+        from forven.strategies.indicators import adx
         p = self.params
         close = df["close"]
 
@@ -64,7 +64,7 @@ class MACDStrategy(BaseStrategy):
         return entry.fillna(False), exit_.fillna(False)
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr
+        from forven.strategies.indicators import adx, atr
         p = self.params
         close = df["close"]
 

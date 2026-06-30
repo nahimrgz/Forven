@@ -70,7 +70,7 @@ class RSIMomentumStrategy(BaseStrategy):
         both EMAs and ADX clears its floor. Exit: RSI crosses down through the
         overbought threshold.
         """
-        from forven.scanner import adx, rsi
+        from forven.strategies.indicators import adx, rsi
 
         p = self.params
         close = df["close"]
@@ -91,7 +91,7 @@ class RSIMomentumStrategy(BaseStrategy):
         return entry.fillna(False), exit_.fillna(False)
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx, atr, rsi
+        from forven.strategies.indicators import adx, atr, rsi
         p = self.params
         close = df["close"]
 

@@ -15,7 +15,7 @@ Based on backtest results:
 import pandas as pd
 
 from forven.strategies.base import BaseStrategy, Signal
-from forven.scanner import rsi as compute_rsi, atr
+from forven.strategies.indicators import rsi as compute_rsi, atr
 
 
 TYPE_NAME = "rsi_momentum"

@@ -9,7 +9,7 @@ Example usage:
         strategy_type = "bb_rsi_reversion"
 
         def _volatility_ok(self, df):
-            from forven.scanner import adx
+            from forven.strategies.indicators import adx
             adx_vals = adx(df, period=14)
             return adx_vals < 25  # only trade when market is ranging, not trending
 """
@@ -69,7 +69,7 @@ class MeanReversionGateStrategy(BaseStrategy):
         if len(df) < 10:
             return Signal()
         try:
-            from forven.scanner import rsi as calc_rsi, atr as calc_atr
+            from forven.strategies.indicators import rsi as calc_rsi, atr as calc_atr
 
             rsi_period = int(self.p("rsi_period", 14))
             rsi_oversold = float(self.p("rsi_oversold", 35))
@@ -116,7 +116,7 @@ class MeanReversionGateStrategy(BaseStrategy):
         if len(df) < 10:
             return pd.DataFrame({"entry_signal": False, "exit_signal": False}, index=df.index)
         try:
-            from forven.scanner import rsi as calc_rsi
+            from forven.strategies.indicators import rsi as calc_rsi
 
             rsi_period = int(self.p("rsi_period", 14))
             rsi_oversold = float(self.p("rsi_oversold", 35))

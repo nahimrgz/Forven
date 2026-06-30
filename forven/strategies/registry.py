@@ -388,6 +388,13 @@ def _ensure_active_db_strategy_modules() -> None:
     registered" after a restart (the lazy archived loader only resolves when the
     runtime name equals the module name). Bounded to active strategies; best-effort
     and never raises."""
+    # The isolated strategy worker is DB-jailed (forven.db refuses connections when
+    # FORVEN_IN_STRATEGY_WORKER is set) and resolves the one type it needs per-request
+    # from the filesystem/imported scan — it never needs this parent-side convenience
+    # sweep. Skip it explicitly so worker startup stays clean (rather than relying on
+    # the broad except below to swallow the jail's RuntimeError every spawn).
+    if _in_strategy_worker():
+        return
     try:
         from forven.db import get_db
         with get_db() as conn:

@@ -48,7 +48,7 @@ class TrixStrategy(BaseStrategy):
         )
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import atr
+        from forven.strategies.indicators import atr
 
         p = self.params
         close = df["close"]

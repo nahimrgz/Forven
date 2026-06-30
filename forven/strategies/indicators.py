@@ -831,3 +831,42 @@ __all__ = [
     "compute_indicator",
     "metadata",
 ]
+# NOTE: the pure-indicator facade names (rsi/adx/atr/... — see __getattr__ below) are
+# intentionally NOT in __all__. They are provided lazily via the module __getattr__
+# hook and resolved by explicit ``from forven.strategies.indicators import rsi``;
+# listing them in __all__ would (a) trip F822 (no real module-level binding) and
+# (b) wrongly pull them into ``import *``.
+
+
+# ── Public indicator facade for untrusted strategies (R3) ──────────────────────
+# Untrusted (custom/imported) strategies may import ``forven.strategies.indicators``
+# (allowlisted) but NOT ``forven.scanner`` — which also re-exports get_db / kv_get /
+# _execute_direct, the confused-deputy surface (see
+# docs/strategy-share-security-audit-2026-06-29.md, R3). These names are the PURE,
+# stateless indicator helpers strategies legitimately need (df -> Series, no DB /
+# network / global state), re-exported from their canonical home in ``forven.scanner``
+# so there is a single implementation. The re-export is LAZY (PEP 562 module hook):
+# ``scanner`` is a heavy module and importing it eagerly at indicators-load time would
+# risk an import cycle, so it is pulled only when a facade name is first accessed.
+# ``from forven.strategies.indicators import rsi`` resolves through this hook.
+_FACADE_NAMES = frozenset(
+    {
+        "rsi",
+        "adx",
+        "atr",
+        "stochastic",
+        "williams_r",
+        "vwap",
+        "oi_price_divergence",
+        "funding_rate_zscore",
+        "ema_cross_thresholds",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name in _FACADE_NAMES:
+        from forven import scanner
+
+        return getattr(scanner, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

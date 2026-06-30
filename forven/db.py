@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -26,6 +27,25 @@ ID_WIDTH_BY_PREFIX = {
 }
 log = logging.getLogger("forven.db")
 _WAL_CONFIGURED_PATHS: set[str] = set()
+
+# Untrusted strategy code runs ONLY inside the out-of-process strategy worker
+# (forven.sandbox.strategy_worker sets FORVEN_IN_STRATEGY_WORKER). That worker must
+# never reach the production database: the confused-deputy modules it can still
+# import (forven.scanner re-exports get_db/kv_get/kv_set; forven.data/data_manager)
+# funnel DB reads, secret decryption (kv_get), trade tampering and settings /
+# kill-switch writes through the connection factories below. Refusing a connection
+# here is the boundary that makes a guard bypass inert (see
+# docs/strategy-share-security-audit-2026-06-29.md, R3). The parent process never
+# sets this flag, so the guard is a no-op outside the sandbox.
+_STRATEGY_WORKER_FLAG = "FORVEN_IN_STRATEGY_WORKER"
+
+
+def _assert_db_access_allowed() -> None:
+    if os.environ.get(_STRATEGY_WORKER_FLAG):
+        raise RuntimeError(
+            "database access is disabled inside the strategy sandbox "
+            "(forven.db connection requested from the isolated strategy worker)"
+        )
 
 
 FACTORY_RESET_CATEGORIES = {
@@ -429,6 +449,7 @@ def _repair_strategy_generic_placeholders(conn: sqlite3.Connection, now_iso: str
 @contextmanager
 def get_db():
     """Get a database connection with WAL mode and foreign keys."""
+    _assert_db_access_allowed()
     ensure_dirs()
     db_key = str(FORVEN_DB)
     conn = sqlite3.connect(db_key, timeout=60)
@@ -461,6 +482,7 @@ def get_db_best_effort(timeout_seconds: float = 0.25):
     Use this only for telemetry/state writes where dropping an update is better
     than blocking an async loop behind SQLite contention.
     """
+    _assert_db_access_allowed()
     ensure_dirs()
     timeout = max(float(timeout_seconds), 0.0)
     busy_timeout_ms = max(1, int(timeout * 1000))
@@ -501,6 +523,7 @@ def get_db_immediate():
     Use sparingly — an IMMEDIATE txn serializes writers, so it should wrap
     only the critical section that must be atomic.
     """
+    _assert_db_access_allowed()
     ensure_dirs()
     db_key = str(FORVEN_DB)
     conn = sqlite3.connect(db_key, timeout=60, isolation_level=None)

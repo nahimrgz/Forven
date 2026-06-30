@@ -51,7 +51,7 @@ class SuperTrendStrategy(BaseStrategy):
         return entry.fillna(False), exit_.fillna(False)
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import atr
+        from forven.strategies.indicators import atr
         p = self.params
         close = df["close"]
 

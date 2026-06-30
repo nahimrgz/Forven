@@ -8,7 +8,7 @@ Example usage:
         strategy_type = "trend_keltner"
 
         def _entry_signal(self, df):
-            from forven.scanner import keltner_channel
+            from forven.strategies.indicators import keltner_channel
             kc = keltner_channel(df, period=self.p("kc_period", 20), mult=self.p("kc_mult", 2.0))
             return df["close"] > kc["upper"]  # breakout above upper band
 """
@@ -58,7 +58,7 @@ class TrendFilterStrategy(BaseStrategy):
         if len(df) < 10:
             return Signal()
         try:
-            from forven.scanner import adx as calc_adx, atr as calc_atr
+            from forven.strategies.indicators import adx as calc_adx, atr as calc_atr
 
             ma_period = max(2, int(self.p("ma_period", 100)))
             ma_type = str(self.p("ma_type", "ema")).lower()
@@ -102,7 +102,7 @@ class TrendFilterStrategy(BaseStrategy):
         if len(df) < 10:
             return pd.DataFrame({"entry_signal": False, "exit_signal": False}, index=df.index)
         try:
-            from forven.scanner import adx as calc_adx
+            from forven.strategies.indicators import adx as calc_adx
 
             ma_period = max(2, int(self.p("ma_period", 100)))
             ma_type = str(self.p("ma_type", "ema")).lower()

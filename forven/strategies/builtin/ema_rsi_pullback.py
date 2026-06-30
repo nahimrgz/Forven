@@ -45,7 +45,7 @@ class EMARSIPullbackStrategy(BaseStrategy):
         )
 
     def _indicator_frame(self, df: pd.DataFrame) -> pd.DataFrame:
-        from forven.scanner import rsi
+        from forven.strategies.indicators import rsi
 
         p = self.params
         close = df["close"]

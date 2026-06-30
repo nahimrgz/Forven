@@ -96,7 +96,7 @@ class KeltnerStrategy(BaseStrategy):
         mirrors it: enter on a cross down through the lower band, cover when close
         rises back above the mid.
         """
-        from forven.scanner import adx
+        from forven.strategies.indicators import adx
 
         p = self.params
         adx_period = p.get("adx_period", 14)
@@ -145,7 +145,7 @@ class KeltnerStrategy(BaseStrategy):
         )
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
-        from forven.scanner import adx
+        from forven.strategies.indicators import adx
         p = self.params
 
         adx_period = p.get("adx_period", 14)
