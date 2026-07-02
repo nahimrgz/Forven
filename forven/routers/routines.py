@@ -62,10 +62,24 @@ def list_routines(enabled_only: bool = False) -> dict[str, Any]:
 # captured as a routine id.
 @router.get("/api/routines/channels")
 def list_routine_channels() -> dict[str, Any]:
-    """Discord channel aliases the bot can deliver routine results to."""
-    from forven.discord_channels import channel_aliases
+    """Discord channels the bot can deliver routine results to.
 
-    return {"channels": channel_aliases()}
+    Prefers the live guild channel list the bot publishes on connect (works
+    on any user's server); falls back to the static alias map when the bot
+    has never connected.
+    """
+    from forven.discord_channels import available_channels, channel_aliases
+
+    live = available_channels()
+    if live:
+        return {
+            "channels": [{"id": c["id"], "label": f"#{c['name']}"} for c in live],
+            "source": "discord",
+        }
+    return {
+        "channels": [{"id": alias, "label": f"#{alias}"} for alias in channel_aliases()],
+        "source": "aliases",
+    }
 
 
 @router.post("/api/routines")

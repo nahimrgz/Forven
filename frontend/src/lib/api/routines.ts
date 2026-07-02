@@ -98,9 +98,18 @@ export async function previewRoutineSchedule(id: number, count = 5): Promise<str
 	return res.upcoming || [];
 }
 
-/** Discord channel aliases the bot can deliver routine results to. */
-export async function listRoutineChannels(): Promise<string[]> {
-	const res = await fetchApi<{ channels: string[] }>('/routines/channels');
+/** A Discord channel the bot can post to. `id` is what gets stored on the
+ * routine (raw channel id from the live guild list, or an alias name when
+ * the backend falls back to the static alias map). */
+export interface RoutineChannel {
+	id: string;
+	label: string;
+}
+
+/** Discord channels the bot can deliver routine results to — live guild list
+ * when the bot has connected, alias-map fallback otherwise. */
+export async function listRoutineChannels(): Promise<RoutineChannel[]> {
+	const res = await fetchApi<{ channels: RoutineChannel[] }>('/routines/channels');
 	return res.channels || [];
 }
 

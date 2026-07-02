@@ -12,6 +12,7 @@
 		runRoutine,
 		updateRoutine,
 		type Routine,
+		type RoutineChannel,
 		type RoutineCreatePayload,
 	} from '$lib/api/routines';
 	import {
@@ -25,7 +26,7 @@
 	} from '$lib/utils/schedule';
 
 	let routines: Routine[] = [];
-	let channels: string[] = [];
+	let channels: RoutineChannel[] = [];
 	let loading = true;
 	let error: string | null = null;
 	let actionMessage: string | null = null;
@@ -85,6 +86,14 @@
 
 	function scheduleLabel(routine: Routine): string {
 		return describeCronLocal(routine.cron_expr) || routine.cron_expr;
+	}
+
+	// Stored channel values are raw ids (live guild list) or alias names
+	// (fallback map / Brain proposals) — show the friendly label when known.
+	function channelLabel(value: string | null | undefined): string {
+		if (!value) return '';
+		const match = channels.find((c) => c.id === value);
+		return match ? match.label : `#${value}`;
 	}
 
 	async function load() {
@@ -310,7 +319,7 @@
 				{#if channels.length > 0}
 					<select bind:value={createForm.channel} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200">
 						<option value="">— don't post —</option>
-						{#each channels as ch}<option value={ch}>#{ch}</option>{/each}
+						{#each channels as ch}<option value={ch.id}>{ch.label}</option>{/each}
 					</select>
 				{:else}
 					<input type="text" bind:value={createForm.channel} placeholder="channel alias or id (optional)" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />
@@ -361,7 +370,7 @@
 										<span class="border border-[#333] bg-[#111] text-gray-400 rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider">{routine.created_by ? `operator · ${routine.created_by}` : 'operator'}</span>
 									{/if}
 									{#if routine.channel}
-										<span class="border border-sky-900 bg-sky-900/20 text-sky-300 rounded px-1.5 py-0.5 text-[10px]" title="Result is posted to this Discord channel">→ #{routine.channel}</span>
+										<span class="border border-sky-900 bg-sky-900/20 text-sky-300 rounded px-1.5 py-0.5 text-[10px]" title="Result is posted to this Discord channel">→ {channelLabel(routine.channel)}</span>
 									{/if}
 								</div>
 								<div class="text-[11px] text-gray-500 mt-0.5" title={routine.cron_expr}>{scheduleLabel(routine)} · {routine.tools_context}</div>
@@ -436,7 +445,10 @@
 										{#if channels.length > 0}
 											<select bind:value={editDraft.channel} class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200">
 												<option value="">— don't post —</option>
-												{#each channels as ch}<option value={ch}>#{ch}</option>{/each}
+												{#if editDraft.channel && !channels.some((c) => c.id === editDraft.channel)}
+													<option value={editDraft.channel}>{channelLabel(editDraft.channel)}</option>
+												{/if}
+												{#each channels as ch}<option value={ch.id}>{ch.label}</option>{/each}
 											</select>
 										{:else}
 											<input type="text" bind:value={editDraft.channel} placeholder="channel alias or id (optional)" class="mt-1 w-full bg-black border border-[#222] px-2 py-1.5 text-gray-200" />

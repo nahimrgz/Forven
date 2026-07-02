@@ -1091,6 +1091,51 @@ async def _run_brain_task(task: dict) -> None:
             ),
         )
 
+    # Deliver the response to Discord when the payload names a channel
+    # (routines and generic scheduled brain jobs). The bot task-worker path
+    # posts payload.channel itself, but THIS is the API fallback worker —
+    # without this, routine responses silently stop at tasks.result whenever
+    # the gateway isn't consuming the queue. send_sync is Discord REST, so it
+    # works from this process; run it in a thread to keep the loop unblocked.
+    delivery_channel = str(payload.get("channel") or "").strip()
+    if delivery_channel:
+        routine_id = payload.get("routine_id")
+
+        def _record_run(status: str, error: str | None = None) -> None:
+            if routine_id is None:
+                return
+            try:
+                from forven.control_plane.routines import record_routine_run
+
+                record_routine_run(int(routine_id), status=status, error=error)
+            except Exception:
+                log.debug("record_routine_run failed for routine %s", routine_id, exc_info=True)
+
+        def _post_to_discord() -> bool:
+            from forven.bot import (
+                _render_operational_discord_reply,
+                _sanitize_response,
+                send_sync,
+            )
+
+            outbound = _render_operational_discord_reply(
+                _sanitize_response(_brain_response_text(response)),
+                source=source,
+                task_message=message,
+            )
+            return bool(send_sync(delivery_channel, outbound))
+
+        try:
+            if not await asyncio.to_thread(_post_to_discord):
+                raise RuntimeError("send returned false (channel circuit open or missing access)")
+            _record_run("ok")
+        except Exception as exc:
+            log.warning(
+                "Brain task %s: Discord delivery to %r failed: %s",
+                task.get("id"), delivery_channel, exc,
+            )
+            _record_run("error", f"Discord delivery failed: {exc}")
+
 
 def acquire_runtime_worker_lock(lock_name: str = "api_runtime_worker.lock") -> bool:
     """Acquire a singleton lock so only one API process runs background loops.

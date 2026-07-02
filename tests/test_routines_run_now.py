@@ -132,3 +132,37 @@ def test_run_route_paused_routine_returns_409(client: TestClient) -> None:
     routine_id = _make(enabled=False)
     resp = client.post(f"/api/routines/{routine_id}/run")
     assert resp.status_code == 409
+
+
+# --- channel picker --------------------------------------------------------
+
+def test_channels_endpoint_prefers_live_bot_list(client: TestClient) -> None:
+    """When the bot has published its guild channels, the picker serves them
+    (raw ids + names) so the page works on any user's Discord server."""
+    init_db()
+    from forven.db import kv_set
+    from forven.discord_channels import AVAILABLE_CHANNELS_KV_KEY
+
+    kv_set(
+        AVAILABLE_CHANNELS_KV_KEY,
+        {
+            "updated_at": "2026-07-02T00:00:00+00:00",
+            "channels": [{"id": "123456", "name": "updates"}],
+        },
+    )
+    resp = client.get("/api/routines/channels")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "discord"
+    assert {"id": "123456", "label": "#updates"} in body["channels"]
+
+
+def test_channels_endpoint_falls_back_to_alias_map(client: TestClient) -> None:
+    """Without a bot-published list, the static alias map still populates the
+    picker (and 'channels' is not captured by the /{routine_id} route)."""
+    init_db()
+    resp = client.get("/api/routines/channels")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "aliases"
+    assert any(c["id"] == "ops" for c in body["channels"])

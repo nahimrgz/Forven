@@ -48,3 +48,34 @@ def load_channel_map() -> dict[str, str]:
 def channel_aliases() -> list[str]:
     """Sorted alias names for UI dropdowns (aliases may share a channel id)."""
     return sorted(load_channel_map().keys())
+
+
+# The bot gateway publishes the text channels it can actually post to (per
+# guild it is connected to) under this kv key on connect and on channel
+# create/delete/rename. This is what makes the routines channel picker work
+# on ANY user's Discord server — the alias map above is only a fallback for
+# setups where the bot has never connected.
+AVAILABLE_CHANNELS_KV_KEY = "discord:available_channels"
+
+
+def available_channels() -> list[dict[str, str]] | None:
+    """Live guild text-channel list published by the bot, or None if the bot
+    has never published (callers fall back to the static alias map)."""
+    try:
+        from forven.db import kv_get
+
+        data = kv_get(AVAILABLE_CHANNELS_KV_KEY)
+        raw = data.get("channels") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return None
+        out: list[dict[str, str]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            channel_id = str(entry.get("id") or "").strip()
+            name = str(entry.get("name") or "").strip()
+            if channel_id and name:
+                out.append({"id": channel_id, "name": name})
+        return out or None
+    except Exception:
+        return None

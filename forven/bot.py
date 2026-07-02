@@ -73,7 +73,7 @@ def _bot_owns_runtime_loops() -> bool:
 
 # Channel alias map lives in forven.discord_channels (shared with the API);
 # config.json "discord_channels" / "discord_owner_id" override the defaults.
-from forven.discord_channels import load_channel_map
+from forven.discord_channels import AVAILABLE_CHANNELS_KV_KEY, load_channel_map
 
 
 def _load_discord_config() -> tuple[dict, dict, int]:
@@ -755,6 +755,7 @@ class ForvenBot(commands.Bot):
         from forven.db import init_db
 
         init_db()
+        self._publish_available_channels()
         if not _bot_owns_runtime_loops():
             try:
                 seed_default_agents()
@@ -790,6 +791,39 @@ class ForvenBot(commands.Bot):
 
         # Bootstrap: seed agents, jobs, workspace, kick brain
         await self._bootstrap()
+
+    def _publish_available_channels(self) -> None:
+        """Publish the text channels this bot can post to (id + name) so the
+        API can offer a live channel picker (routines page) without importing
+        discord. Works on any user's server — no hardcoded channel ids.
+        """
+        if self.agent_id:
+            return
+        try:
+            channels = [
+                {"id": str(ch.id), "name": ch.name}
+                for guild in self.guilds
+                for ch in guild.text_channels
+                if ch.permissions_for(guild.me).send_messages
+            ]
+            kv_set_best_effort(
+                AVAILABLE_CHANNELS_KV_KEY,
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "channels": channels,
+                },
+            )
+        except Exception:
+            log.debug("Failed to publish available Discord channels", exc_info=True)
+
+    async def on_guild_channel_create(self, channel) -> None:
+        self._publish_available_channels()
+
+    async def on_guild_channel_delete(self, channel) -> None:
+        self._publish_available_channels()
+
+    async def on_guild_channel_update(self, before, after) -> None:
+        self._publish_available_channels()
 
     def _has_inflight_task_work(self) -> bool:
         return bool(self._active_agent_task_ids or self._active_brain_task_ids)
