@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from forven.data import _now_iso, symbol_to_fs
+from forven.data import _now_iso, _replace_with_retry, symbol_to_fs
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ def _write_parquet_frame(path: Path, frame: pd.DataFrame) -> None:
             os.close(fd)
     except OSError:
         pass
-    os.replace(str(tmp), str(path))
+    _replace_with_retry(tmp, path)
 
 
 def read_revisions(symbol: str, timeframe: str) -> pd.DataFrame | None:

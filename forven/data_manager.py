@@ -373,7 +373,9 @@ def _save_stream_parquet(df: pd.DataFrame, path: Path, stream: str, symbol: str)
                 os.close(fd)
         except OSError:
             pass
-        os.replace(str(tmp), str(path))
+        from forven.data import _replace_with_retry
+
+        _replace_with_retry(tmp, path)
     except Exception:
         # Ensure the .tmp doesn't leak on any error in the write path.
         try:

@@ -463,6 +463,24 @@ def tail_path(symbol: str, timeframe: str) -> Path:
     return Path(str(parquet_path(symbol, timeframe)) + ".tail")
 
 
+def _replace_with_retry(tmp: "Path | str", path: "Path | str", *, attempts: int = 5) -> None:
+    """os.replace with backoff for Windows share-violation races.
+
+    A concurrent READER holding the target without FILE_SHARE_DELETE (pyarrow/
+    DuckDB scans from the backend, or a UI download) makes os.replace fail
+    with WinError 5 — transiently. Retry briefly; re-raise when it persists.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            _replace_with_retry(tmp, path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.2 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
 def _footer_bounds(path: Path) -> tuple[int, int | None, int | None]:
     """(row_count, min_ts_ms, max_ts_ms) for one parquet, from footer statistics
     only; falls back to a single-column load when statistics are absent.
@@ -550,7 +568,7 @@ def _write_lake_parquet(frame: pd.DataFrame, path: Path, *, symbol: str, timefra
             os.close(fd)
     except OSError:
         pass
-    os.replace(str(tmp), str(path))
+    _replace_with_retry(tmp, path)
 
 
 def _append_bars_locked(
@@ -765,7 +783,7 @@ def save_parquet(df: pd.DataFrame, symbol: str, timeframe: str, source: str = "c
             os.close(fd)
     except OSError:
         pass
-    os.replace(str(tmp_path), str(path))
+    _replace_with_retry(tmp_path, path)
     # A full save is REPLACEMENT semantics: the dataset is now exactly `out`.
     # Clear the tail sidecar — every merge-path caller loads via load_parquet
     # (cold+tail) first, so its rows are folded into the frame just written.
