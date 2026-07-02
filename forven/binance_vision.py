@@ -234,7 +234,7 @@ class BinanceVisionClient:
             # Resample 5-min data to target timeframe, taking the last snapshot of each period
             df = (
                 df.set_index("timestamp")
-                .resample(timeframe)
+                .resample(BinanceVisionClient._pandas_freq(timeframe))
                 .last()
                 .dropna()
                 .reset_index()
@@ -243,6 +243,16 @@ class BinanceVisionClient:
         except Exception as exc:
             log.warning("BV metrics parse error: %s", exc)
             return None
+
+    @staticmethod
+    def _pandas_freq(timeframe: str) -> str:
+        """Map a forven timeframe to a pandas-4-safe resample frequency:
+        lowercase 'm' minutes must be spelled 'min' ('15m' -> '15min';
+        pandas 4 rejects bare 'm' as ambiguous with month-end)."""
+        tf = str(timeframe or "").strip()
+        if tf.endswith("m") and not tf.endswith("min"):
+            return f"{tf[:-1]}min"
+        return tf
 
     @staticmethod
     def _parse_metrics_multi(zip_bytes: bytes, oi_timeframes: list[str]) -> dict | None:
@@ -270,7 +280,7 @@ class BinanceVisionClient:
             if "sum_open_interest" in df.columns:
                 oi = pd.to_numeric(df["sum_open_interest"], errors="coerce").dropna()
                 for tf in oi_timeframes:
-                    resampled = oi.resample(tf).last().dropna()
+                    resampled = oi.resample(BinanceVisionClient._pandas_freq(tf)).last().dropna()
                     out["oi"][tf] = resampled.rename("open_interest").reset_index()
             if "count_long_short_ratio" in df.columns:
                 ratio = pd.to_numeric(df["count_long_short_ratio"], errors="coerce").dropna()

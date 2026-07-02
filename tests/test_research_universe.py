@@ -181,6 +181,19 @@ def _metrics_zip(day: datetime, periods: int = 48) -> bytes:
 
 
 class TestMetricsMulti:
+    def test_sub_hour_timeframe_resample(self):
+        # pandas 4 rejects bare "15m" as a resample frequency ('m' == month-end
+        # ambiguity); the parser must map it to "15min" — this silently zeroed
+        # metrics deep-history for every symbol with sub-hour active timeframes.
+        from forven.binance_vision import BinanceVisionClient
+
+        frames = BinanceVisionClient._parse_metrics_multi(
+            _metrics_zip(datetime(2025, 5, 1, tzinfo=timezone.utc)), ["15m", "5m"]
+        )
+        assert frames is not None
+        assert len(frames["oi"]["15m"]) == 16  # 4 hours of 5-min rows -> 16 buckets
+        assert len(frames["oi"]["5m"]) == 48
+
     def test_parse_all_streams_single_pass(self):
         from forven.binance_vision import BinanceVisionClient
 
