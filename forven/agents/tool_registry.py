@@ -538,15 +538,9 @@ _DEFAULT_CATEGORY_PATTERNS: list[tuple[str, str]] = [
     ("inspect_", "research"),
     ("ingest_url", "research"),
     ("research_", "research"),
-    # Exchange / market data — match the ACTUAL registered tool names so the
-    # 'exchange' bucket is non-empty (the generic prefixes below match nothing
-    # today but are kept for forward-compat).
-    ("place_order", "exchange"),
-    ("close_position", "exchange"),
-    ("cancel_orders", "exchange"),
-    ("get_account_info", "exchange"),
-    ("get_exchange_positions", "exchange"),
-    ("update_trade", "exchange"),
+    # Exchange / market data. The agent order/position tools were deleted
+    # outright (agents have NO order path); only market-data tools remain.
+    # The generic prefixes match nothing today but fail-safe future tools.
     ("fetch_exchange_data", "exchange"),
     ("get_local_ohlcv", "exchange"),
     ("exchange_", "exchange"),

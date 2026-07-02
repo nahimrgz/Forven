@@ -20,10 +20,9 @@ from forven.ai import (
     is_transient_provider_exception,
     normalize_provider_and_model,
 )
-from forven.async_utils import spawn
 from forven.context import build_agent_context
 from forven.cost_pricing import estimate_cost_usd
-from forven.db import claim_pending_agent_tasks, create_pending_task, format_prefixed_id, get_db, get_task_tool_calls, init_db, is_user_active, kv_get, kv_set, log_activity
+from forven.db import create_pending_task, format_prefixed_id, get_db, get_task_tool_calls, kv_get, kv_set, log_activity
 from forven.provider_runtime_health import (
     record_call_failure,
     record_provider_event,
@@ -35,7 +34,6 @@ from forven.workspace import append_workspace, read_workspace
 
 from .context import (
     _current_agent_id as _legacy_current_agent_id,
-    _recover_dangling_tasks as _legacy_recover_dangling_tasks,
     reset_tool_context,
     set_tool_context,
 )
@@ -43,7 +41,6 @@ from .tool_definitions import (
     AGENT_TOOLS,
     BACKTESTING_TOOLS,  # noqa: F401 - legacy re-exported via forven.agents
     BRAIN_TOOLS,  # noqa: F401 - legacy re-exported via forven.agents
-    EXCHANGE_TOOLS,  # noqa: F401 - legacy re-exported via forven.agents
     MAX_TOOL_ROUNDS,
     PIPELINE_AUTO_HANDOFF_TASK_TYPES,
 )
@@ -54,10 +51,9 @@ from .tool_registry import (
 # Import tool modules to trigger @register_tool decorators.
 import forven.agents.tools_core         # noqa: F401
 import forven.agents.tools_brain        # noqa: F401
-import forven.agents.tools_exchange     # noqa: F401
 import forven.agents.tools_backtesting  # noqa: F401
 
-from .tools_exchange import (
+from .ownership import (
     _check_task_owner,
     _extract_task_strategy_id,
 )
@@ -90,9 +86,8 @@ def _is_missing_credentials_error(error: Exception) -> bool:
         or "has no api credentials" in text
     )
 
-# Backward-compatible re-exports used by forven.agents.__init__ and older tests.
+# Backward-compatible re-export used by forven.agents.__init__ and older tests.
 _current_agent_id = _legacy_current_agent_id
-_recover_dangling_tasks = _legacy_recover_dangling_tasks
 
 
 def _coerce_task_input_data(task: dict) -> dict:
@@ -513,9 +508,6 @@ async def _call_with_tools_single(
 
 
 _AGENT_TASK_TIMEOUT_SECONDS = DEFAULT_AGENT_TASK_TIMEOUT_SECONDS  # 15-minute hard wall-clock limit per task
-_AGENT_IDLE_POLL_SECONDS = 5
-_AGENT_DISABLED_POLL_SECONDS = 30
-_AGENT_USER_ACTIVE_YIELD_SECONDS = 2
 _BRAIN_CALLBACK_MAX_PENDING = 10  # Don't queue brain callbacks if queue is already this deep
 
 
@@ -754,10 +746,6 @@ _ARTIFACT_TOOLS: frozenset[str] = frozenset({
     "write_file",
     "store_memory",
     "store_chroma",
-    "place_order",
-    "close_position",
-    "cancel_orders",
-    "update_trade",
 })
 
 
@@ -1644,67 +1632,3 @@ async def _run_agent_task_inner(
     finally:
         if tool_context_tokens is not None:
             reset_tool_context(tool_context_tokens)
-
-
-async def run_agent_loop(agent_id: str):
-    """Run an agent's continuous loop — pick up tasks, execute, wait."""
-    init_db()
-
-    log.info("Agent %s loop started", agent_id)
-
-    while True:
-        # Refresh agent config each iteration so model/schedule/enabled
-        # changes take effect without a daemon restart.
-        with get_db() as conn:
-            row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        if not row:
-            log.error("Agent %s not found (deleted?), stopping loop", agent_id)
-            return
-        agent = dict(row)
-
-        # Determine loop interval (refresh each iteration). Agent schedules are
-        # heartbeat metadata; task pickup must stay fast for autonomous flow.
-        interval = _AGENT_IDLE_POLL_SECONDS
-        if agent.get("schedule_type") == "interval" and agent.get("schedule_expr"):
-            try:
-                configured_interval = int(agent["schedule_expr"]) / 1000  # ms to seconds
-                interval = min(max(configured_interval, 1), _AGENT_IDLE_POLL_SECONDS)
-            except (ValueError, TypeError):
-                pass
-
-        if not agent.get("enabled"):
-            log.debug("Agent %s is disabled, sleeping", agent_id)
-            await asyncio.sleep(_AGENT_DISABLED_POLL_SECONDS)
-            continue
-
-        try:
-            tasks = claim_pending_agent_tasks(agent_id)
-            for task in tasks:
-                # Yield to user: if user is active and this is a system task,
-                # insert a short delay between tasks to free up resources.
-                task_source = (task.get("source") or "system") if isinstance(task, dict) else "system"
-                if task_source != "user" and is_user_active():
-                    log.info("Agent %s briefly yielding to user-active signal before system task", agent_id)
-                    await asyncio.sleep(_AGENT_USER_ACTIVE_YIELD_SECONDS)
-                await run_agent_task(agent, task)
-        except Exception as e:
-            log.error("Agent %s loop error: %s", agent_id, e)
-
-        await asyncio.sleep(interval)
-
-
-async def run_all_agents():
-    """Run all enabled agents concurrently."""
-    init_db()
-
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM agents WHERE enabled = 1").fetchall()
-        agents = [dict(r) for r in rows]
-
-    if not agents:
-        log.info("No enabled agents to run")
-        return
-
-    log.info("Starting %d agent loops", len(agents))
-    tasks = [spawn(run_agent_loop(a["id"]), name=f"agent-loop-{a['id']}") for a in agents]
-    await asyncio.gather(*tasks)

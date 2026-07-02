@@ -8,7 +8,7 @@ from forven.db import get_db
 from .context import _current_agent_id_var, _current_task_display_id_var
 from .tool_definitions import BRAIN_AGENT_IDS
 from .tool_registry import register_tool
-from .tools_exchange import _normalize_agent_id
+from .roster import normalize_agent_id as _normalize_agent_id
 
 
 def _suggest_known_families(stype: str, *, n: int = 3) -> list[str]:

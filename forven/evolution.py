@@ -1229,16 +1229,6 @@ def _load_recent_execution_metrics(
     return compute_live_metrics(pnls)
 
 
-def run_ideation_step():
-    """Compatibility wrapper for the retired broad ideation cycle."""
-    from forven.crucible_planner import run_crucible_planner_cycle
-
-    log.info("Evolution: routing ideation step through crucible planner")
-    result = run_crucible_planner_cycle(limit=3)
-    log_activity("info", "evolution", f"Ideation step: delegated to crucible planner: {result}")
-    return result
-
-
 def _run_backtest_validation_sync(
     strategy_id: str,
     strategy_type: str,
@@ -2361,16 +2351,6 @@ def _check_gauntlet_overflow_alert():
         # Clear alert when under threshold
         if kv_get(alert_key):
             kv_set(alert_key, None)
-
-
-def run_coding_step():
-    """Compatibility wrapper for the retired broad coding cycle."""
-    from forven.crucible_planner import run_crucible_planner_cycle
-
-    log.info("Evolution: routing coding step through crucible planner")
-    result = run_crucible_planner_cycle(limit=3)
-    log_activity("info", "evolution", f"Coding step: delegated to crucible planner: {result}")
-    return result
 
 
 def check_paper_graduation():

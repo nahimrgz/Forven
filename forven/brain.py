@@ -2566,8 +2566,8 @@ async def invoke(
     record_cache_observation(prompt_hash)
 
     # P1-T06: stash per-cycle context so a downstream execute_brain_actions
-    # call (sometimes outside this function — see process_task_queue) can
-    # write a fully-populated brain_decisions row.
+    # call (which may run outside this function, e.g. in the runtime worker's
+    # brain task) can write a fully-populated brain_decisions row.
     cycle_id = uuid.uuid4().hex
     situation_summary = (context or "")[:500]
     _set_brain_cycle_context(
@@ -3464,30 +3464,6 @@ def run_strategy_review():
     return {"actions": actions, "candidates": candidates}
 
 
-def run_evolution_cycle():
-    """Run all 4 evolution pipeline steps in sequence.
-
-    Called manually or by a comprehensive scheduler job.
-    Steps: ideation ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ testing ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ paper graduation ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ weekly review
-    """
-    from forven.evolution import (
-        run_ideation_step, run_testing_step,
-        check_paper_graduation, run_weekly_review,
-    )
-
-    log.info("Running full evolution cycle")
-    log_activity("info", "brain", "Starting full evolution cycle")
-
-    run_ideation_step()
-    run_testing_step()
-    check_paper_graduation()
-    result = run_weekly_review()
-
-    log.info("Evolution cycle complete: %s", result)
-    log_activity("info", "brain", f"Evolution cycle complete: {result}")
-    return result
-
-
 def assign_research_cycle():
     """Compatibility wrapper for the retired broad research cycle."""
     from forven.crucible_planner import run_crucible_planner_cycle
@@ -3550,62 +3526,6 @@ def assign_risk_audit():
     )
 
     log_activity("info", "brain", "Assigned risk audit to risk-manager")
-
-
-def process_task_queue():
-    """Process pending brain tasks from the queue (from Discord/scheduler)."""
-    from forven.db import claim_pending_tasks
-
-    rows = claim_pending_tasks("brain_invoke", limit=5, priority=True)
-
-    for task in rows:
-        task = dict(task)
-        payload = json.loads(task.get("payload", "{}"))
-
-        try:
-            response = invoke_sync(message=payload.get("message"))
-            decision = normalize_brain_decision(response)
-            executed = execute_brain_actions(decision, actor="brain")
-
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
-                    (
-                        datetime.now(timezone.utc).isoformat(),
-                        json.dumps({
-                            "response": response[:2000],
-                            "actions_executed": executed,
-                        }),
-                        task["id"],
-                    ),
-                )
-
-            # Post response to Discord if requested
-            channel = payload.get("channel")
-            if channel:
-                try:
-                    from forven.notifications import emit_notification
-                    from forven.notification_renderers import summarize_discord_text
-
-                    emit_notification(
-                        "brain_response",
-                        source="brain",
-                        title="Brain response ready",
-                        summary=summarize_discord_text(response, limit=320, max_lines=3) or response[:240],
-                        body=response,
-                        channel_id=str(channel),
-                        metadata={"channel_id": str(channel), "task_id": task["id"]},
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            log.error("Brain task %d failed: %s", task["id"], e)
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE tasks SET status='failed', error=? WHERE id=?",
-                    (str(e)[:500], task["id"]),
-                )
 
 
 def run_gauntlet_backtest_migration():

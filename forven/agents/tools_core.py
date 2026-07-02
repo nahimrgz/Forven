@@ -9,7 +9,11 @@ import subprocess
 
 from forven.security.env_allowlist import build_subprocess_env
 from forven.workspace import append_workspace, read_workspace
-from .context import _normalize_legacy_paths
+from .context import (
+    _current_agent_id_var,
+    _current_task_display_id_var,
+    _normalize_legacy_paths,
+)
 from .tool_registry import register_tool
 
 
@@ -620,3 +624,68 @@ def _tool_get_local_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> str:
         return f"Dataset not found: {symbol} {timeframe}. Use list_local_datasets to see what is available."
     except Exception as e:
         return f"Error loading OHLCV: {e}"
+
+
+@register_tool(
+    name="request_fix",
+    description=(
+        "Report a code-level bug you cannot resolve to the operator's triage queue. "
+        "Use this when you encounter a bug, broken import, API error, or infrastructure issue "
+        "that you cannot resolve with your own tools. It records the bug for human / Claude-Code "
+        "review (a notification + the review log) — NO autonomous code change is made; the system "
+        "is fixed through the normal dev workflow. Provide a clear description of the problem, what "
+        "you tried, and what files/systems are affected."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short summary of the problem (shown in the operator triage queue)"},
+            "description": {
+                "type": "string",
+                "description": "Detailed problem description: what failed, error messages, what you already tried, affected files/systems",
+            },
+            "severity": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "critical"],
+                "description": "Impact severity. Default: medium",
+            },
+            "context": {"type": "object", "description": "Optional context: error traces, file paths, strategy_id, etc."},
+        },
+        "required": ["title", "description"],
+    },
+)
+def _tool_request_fix(params: dict) -> str:
+    """Report a code-level problem to the operator bug-triage queue (report-only)."""
+    title = str(params.get("title", "")).strip()
+    description = str(params.get("description", "")).strip()
+    if not title or not description:
+        return "Error: both 'title' and 'description' are required."
+
+    severity = str(params.get("severity", "medium")).strip().lower()
+    if severity not in ("low", "medium", "high", "critical"):
+        severity = "medium"
+
+    context = params.get("context") or {}
+    requesting_agent = _current_agent_id_var.get()
+    requesting_task = _current_task_display_id_var.get()
+
+    try:
+        from forven.brain import escalate_to_engineer
+        result = escalate_to_engineer(
+            title=title,
+            description=description,
+            requesting_agent=requesting_agent,
+            requesting_task_id=requesting_task,
+            severity=severity,
+            context=context if isinstance(context, dict) else {},
+        )
+        return json.dumps({
+            "status": result.get("status", "reported"),
+            "queue": result.get("queue", "operator_triage"),
+            "message": (
+                f"Bug reported to the operator triage queue (severity={severity}). "
+                f"No autonomous code change is made; it will be fixed via the normal dev workflow."
+            ),
+        })
+    except Exception as e:
+        return f"Bug report failed: {e}"

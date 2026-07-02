@@ -1388,15 +1388,12 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             await _run_sync_job(run_crucible_discovery, timeout_seconds=60)
             return "ok", None
 
-        # Evolution pipeline steps
-        if kind == "evolution_ideation":
-            from forven.evolution import run_ideation_step
-            await _run_sync_job(run_ideation_step)
-            return "ok", None
-
-        if kind == "evolution_coding":
-            from forven.evolution import run_coding_step
-            await _run_sync_job(run_coding_step)
+        # Evolution pipeline steps. The broad ideation/coding cycles are retired;
+        # an (always force-disabled, but manually runnable) ideation job routes
+        # straight to the crucible planner.
+        if kind in {"evolution_ideation", "evolution_coding"}:
+            from forven.crucible_planner import run_crucible_planner_cycle
+            await _run_sync_job(run_crucible_planner_cycle, limit=3)
             return "ok", None
 
         if kind == "evolution_testing":
