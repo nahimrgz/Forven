@@ -44,8 +44,37 @@
 		return 'home';
 	}
 
+	function parseHashField(hash: string): string | null {
+		if (!hash || hash.length < 2) return null;
+		const raw = hash.startsWith('#') ? hash.slice(1) : hash;
+		const slash = raw.indexOf('/');
+		return slash > 0 ? raw.slice(slash + 1) : null;
+	}
+
+	// "#area/fieldId" deep links (search picks, risk-page "Edit caps/limits") must
+	// LAND on the field, not just switch the area. The area section renders after
+	// the settings blob loads, so retry briefly until the element exists, then
+	// scroll it into view and focus it (the focus ring marks the field).
+	function scrollToHashField(): void {
+		if (typeof window === 'undefined') return;
+		const fieldId = parseHashField(window.location.hash);
+		if (!fieldId) return;
+		let attempts = 0;
+		const tryScroll = () => {
+			const el = document.getElementById(fieldId);
+			if (el) {
+				el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+				(el as HTMLElement).focus?.({ preventScroll: true });
+			} else if (attempts++ < 30) {
+				setTimeout(tryScroll, 100);
+			}
+		};
+		tryScroll();
+	}
+
 	function handleHashChange(): void {
 		activeArea = parseHash(window.location.hash);
+		scrollToHashField();
 	}
 
 	function setArea(id: string): void {
@@ -58,6 +87,7 @@
 
 	onMount(() => {
 		activeArea = parseHash(window.location.hash);
+		scrollToHashField();
 		window.addEventListener('hashchange', handleHashChange);
 
 		(async () => {

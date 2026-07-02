@@ -289,7 +289,7 @@
 	function balanceState(session: PaperTradingSession | null | undefined): 'real' | 'unavailable' | null {
 		if (!isDeployedCompatSession(session)) return null;
 		const src = String(session?.balance_source ?? '').toLowerCase();
-		return src === 'exchange' || src === 'books_aggregate' ? 'real' : 'unavailable';
+		return src === 'exchange' || src === 'books_only' || src === 'books_aggregate' ? 'real' : 'unavailable';
 	}
 
 	// Manual controls are enabled for every compat session — paper AND deployed/live.

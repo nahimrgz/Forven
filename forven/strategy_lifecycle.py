@@ -51,6 +51,11 @@ class StrategyPromoteBody(BaseModel):
     # surfaces the gate's reject reason. The mainnet hard-gate
     # (FORVEN_ALLOW_MAINNET) is separate and unaffected.
     override: bool | None = Field(default=False)
+    # GO-LIVE-1: a transition into live_graduated additionally requires the
+    # typed confirmation phrase ("GO LIVE") and an initial per-asset notional
+    # ceiling in USD, enforced per order by forven.exchange.risk.
+    confirm: str | None = Field(default=None, max_length=32)
+    live_notional_ceiling_usd: float | None = Field(default=None, gt=0)
 
 
 class LifecycleTransitionBody(BaseModel):
@@ -61,6 +66,9 @@ class LifecycleTransitionBody(BaseModel):
     force: bool | None = Field(default=False)
     # See StrategyPromoteBody.override.
     override: bool | None = Field(default=False)
+    # See StrategyPromoteBody: GO-LIVE-1 confirmation fields.
+    confirm: str | None = Field(default=None, max_length=32)
+    live_notional_ceiling_usd: float | None = Field(default=None, gt=0)
 
 
 class LifecycleCreateBody(BaseModel):
@@ -1121,6 +1129,23 @@ def promote_strategy(strategy_id: str, body: StrategyPromoteBody):
         # and actor="api" is a recognised user actor, so this can only originate
         # from a human at the UI after an informed confirmation).
         force = (bool(body.force) and resolved_target not in {"paper", "live_graduated"}) or override
+        # GO-LIVE-1: a request that can actually LAND in live_graduated (an
+        # operator override past the approval gate, or auto-live explicitly
+        # enabled) must carry the typed confirmation + initial per-asset
+        # notional ceiling. The non-override path only queues an approval; the
+        # approval endpoint collects the confirmation there instead. A valid
+        # ceiling is persisted whenever provided, before the transition.
+        if resolved_target == "live_graduated":
+            from forven.brain import _allow_auto_live_promotion
+            from forven.exchange.risk import set_live_notional_ceiling, validate_go_live_confirmation
+
+            _go_live_error = validate_go_live_confirmation(body.confirm, body.live_notional_ceiling_usd)
+            if (override or _allow_auto_live_promotion()) and _go_live_error:
+                return {"ok": False, "error": _go_live_error}
+            if not _go_live_error:
+                set_live_notional_ceiling(
+                    strategy_id, float(body.live_notional_ceiling_usd), actor="api"
+                )
         if override and resolved_target in {"paper", "live_graduated"}:
             log_activity(
                 "warning",
@@ -1897,6 +1922,20 @@ def transition_lifecycle_strategy(body: LifecycleTransitionBody):
     strategy_id = body.strategy_id.strip()
     if not strategy_id:
         raise HTTPException(status_code=400, detail="strategy_id is required")
+
+    # GO-LIVE-1: same contract as promote_strategy — see the comment there.
+    # (Validated outside the try below so the 400 reaches the client verbatim.)
+    if target_status == "live_graduated":
+        from forven.brain import _allow_auto_live_promotion
+        from forven.exchange.risk import set_live_notional_ceiling, validate_go_live_confirmation
+
+        _go_live_error = validate_go_live_confirmation(body.confirm, body.live_notional_ceiling_usd)
+        if (bool(body.override) or _allow_auto_live_promotion()) and _go_live_error:
+            raise HTTPException(status_code=400, detail=_go_live_error)
+        if not _go_live_error:
+            set_live_notional_ceiling(
+                strategy_id, float(body.live_notional_ceiling_usd), actor=body.actor or "api"
+            )
 
     try:
         from forven.brain import _USER_ACTORS

@@ -509,12 +509,33 @@ def get_portfolio_summary() -> dict:
 #   live_max_asset_exposure_pct     (default 150.0 — |net notional| per asset)
 #   live_max_group_exposure_pct     (default 200.0 — |net notional| per
 #                                    CORRELATION_GROUPS group, e.g. crypto_major)
+#
+# SIZE-CAP-1: two PER-ORDER hard ceilings that the kernel path cannot disable.
+# The mirror-sized kernel opens with can_open(enforce_risk_caps=False), which
+# skips Rule 0b (per-trade risk cap) and the Rule-3 clamp — by design, for
+# backtest parity. These two caps restore an absolute per-order bound at the
+# only admission point every kernel live open passes through. They BLOCK (never
+# resize) so parity sizing is preserved: an order either fits or is refused.
+#   live_hard_max_per_trade_risk_pct  (default 2.0  — one order's risk-to-stop)
+#   live_hard_max_order_notional_pct  (default 100.0 — one order's notional)
+#
+# BOOK-BUDGET-1: with direction books, each order draws on ONE wallet (the
+# long or short sub-account), so admission must also be checked against THAT
+# wallet's capacity — the aggregate caps alone let two strategies with $200
+# ceilings both open into a $300 wallet. Gross notional per book is capped at
+# a percent of the book's own equity; capital is first-come-first-served and
+# the refused open alerts the operator (trade_blocked).
+#   live_max_book_notional_pct       (default 100.0 — Σ gross notional in a
+#                                     book vs that book's equity)
 # --------------------------------------------------------------------------- #
 
 _PORTFOLIO_BUDGET_DEFAULTS = {
     "live_max_total_open_risk_pct": 5.0,
     "live_max_asset_exposure_pct": 150.0,
     "live_max_group_exposure_pct": 200.0,
+    "live_hard_max_per_trade_risk_pct": 2.0,
+    "live_hard_max_order_notional_pct": 100.0,
+    "live_max_book_notional_pct": 100.0,
 }
 # Risk fallback for a live row with no recorded stop (should not exist — live
 # opens are refused without one; adopted/recovered rows are the edge case).
@@ -579,13 +600,14 @@ def live_portfolio_exposure() -> dict:
 
     per_asset: dict[str, dict] = {}
     per_group: dict[str, dict] = {}
+    per_book: dict[str, dict] = {}
     total_risk_usd = 0.0
     stops_missing = 0
     rows: list[dict] = []
     try:
         with get_db() as conn:
             db_rows = conn.execute(
-                "SELECT id, asset, direction, entry_price, fill_entry_price, size, "
+                "SELECT id, asset, direction, entry_price, fill_entry_price, size, book, "
                 "COALESCE(strategy_id, strategy) AS strategy_id, signal_data "
                 "FROM trades WHERE status = 'OPEN' "
                 "AND LOWER(COALESCE(execution_type, 'live')) = 'live'"
@@ -621,30 +643,56 @@ def live_portfolio_exposure() -> dict:
         g["net_notional_usd"] += sign * notional
         g["risk_usd"] += risk_usd
         g["positions"] += 1
+        # BOOK-BUDGET-1: GROSS notional per routed wallet — within a book every
+        # position consumes that wallet's margin regardless of direction.
+        book_label = str(row.get("book") or "main").strip().lower() or "main"
+        b = per_book.setdefault(book_label, {"gross_notional_usd": 0.0, "risk_usd": 0.0, "positions": 0})
+        b["gross_notional_usd"] += notional
+        b["risk_usd"] += risk_usd
+        b["positions"] += 1
         total_risk_usd += risk_usd
         rows.append({
             "trade_id": str(row.get("id")), "asset": asset_u, "direction": direction,
             "strategy_id": row.get("strategy_id"), "notional_usd": round(notional, 2),
             "risk_usd": round(risk_usd, 2), "stop_price": stop, "group": group,
+            "book": book_label,
         })
     return {
         "total_risk_usd": round(total_risk_usd, 2),
         "per_asset": per_asset,
         "per_group": per_group,
+        "per_book": per_book,
         "stops_missing": stops_missing,
         "positions": rows,
     }
 
 
+def _book_equity_from_snapshot(book_label: str) -> float | None:
+    """A book wallet's equity from the daemon's per-wallet snapshot (BOOK-BUDGET-1)."""
+    try:
+        daemon_state = kv_get("daemon_state", {}) or {}
+        exch = daemon_state.get("exchange_account") if isinstance(daemon_state, dict) else None
+        books_map = exch.get("books") if isinstance(exch, dict) else None
+        if isinstance(books_map, dict):
+            return _coerce_non_negative_float(books_map.get(book_label))
+    except Exception:
+        pass
+    return None
+
+
 def check_live_portfolio_budget(
     asset: str, direction: str, *,
     add_risk_usd: float, add_notional_usd: float, equity: float | None = None,
+    book: str | None = None, book_equity_usd: float | None = None,
 ) -> tuple[bool, str]:
     """The account-level admission check for a NEW live position.
 
     Returns (allowed, reason). Fails CLOSED when equity is unavailable. Pass
     add_risk_usd = |entry - stop| x units and add_notional_usd = entry x units
-    for the order about to be placed."""
+    for the order about to be placed. With direction books, pass ``book`` (the
+    routed wallet's label) and ``book_equity_usd`` (its balance) so admission is
+    also checked against THAT wallet's capacity — the aggregate caps alone
+    would let several strategies stack orders into one small wallet."""
     settings = _load_risk_settings()
     if not bool(settings.get("live_portfolio_budget_enabled", True)):
         return True, "portfolio budget disabled"
@@ -660,6 +708,45 @@ def check_live_portfolio_budget(
     sign = -1.0 if direction == "short" else 1.0
     add_risk = max(float(add_risk_usd or 0.0), 0.0)
     add_notional = max(float(add_notional_usd or 0.0), 0.0)
+
+    # SIZE-CAP-1: per-order hard ceilings, checked FIRST — these bound a single
+    # order regardless of what is already open (the aggregate checks below can
+    # pass on an empty book while one outsized order slips through).
+    hard_risk_usd = _budget_pct_setting(settings, "live_hard_max_per_trade_risk_pct") / 100.0 * eq
+    if add_risk > hard_risk_usd:
+        return False, (
+            f"hard per-trade cap: this order risks ${add_risk:,.0f}, above "
+            f"{_budget_pct_setting(settings, 'live_hard_max_per_trade_risk_pct'):g}% of equity "
+            f"(${hard_risk_usd:,.0f}) — refusing the live open"
+        )
+    hard_notional_usd = _budget_pct_setting(settings, "live_hard_max_order_notional_pct") / 100.0 * eq
+    if add_notional > hard_notional_usd:
+        return False, (
+            f"hard per-order notional cap: ${add_notional:,.0f} is above "
+            f"{_budget_pct_setting(settings, 'live_hard_max_order_notional_pct'):g}% of equity "
+            f"(${hard_notional_usd:,.0f}) — refusing the live open"
+        )
+
+    # BOOK-BUDGET-1: the order draws on ONE wallet. Cap the routed book's GROSS
+    # open notional against that book's own equity — first come, first served.
+    book_label = str(book or "").strip().lower()
+    if book_label and book_label != "main":
+        book_eq = _coerce_non_negative_float(book_equity_usd) or _book_equity_from_snapshot(book_label)
+        if not book_eq:
+            return False, (
+                f"book budget: the {book_label} wallet's balance is unavailable — refusing "
+                "the live open (fail closed) until the wallet read recovers"
+            )
+        max_book_usd = _budget_pct_setting(settings, "live_max_book_notional_pct") / 100.0 * book_eq
+        book_used = float((exposure["per_book"].get(book_label) or {}).get("gross_notional_usd", 0.0))
+        if book_used + add_notional > max_book_usd:
+            return False, (
+                f"book budget: the {book_label} wallet already holds ${book_used:,.0f} of open "
+                f"notional; adding ${add_notional:,.0f} would exceed "
+                f"{_budget_pct_setting(settings, 'live_max_book_notional_pct'):g}% of its "
+                f"${book_eq:,.0f} equity (${max_book_usd:,.0f}). Capital is first-come-first-served — "
+                "this open waits until the wallet frees up"
+            )
 
     max_risk_usd = _budget_pct_setting(settings, "live_max_total_open_risk_pct") / 100.0 * eq
     new_total_risk = exposure["total_risk_usd"] + add_risk
@@ -697,6 +784,118 @@ def check_live_portfolio_budget(
     )
 
 
+# --------------------------------------------------------------------------- #
+# GO-LIVE-1: per-strategy live notional ceiling, set by the operator at the
+# go-live confirmation (paper→live_graduated). The strategy's asset is pinned
+# to its container and live opens are one-position-per-asset, so a per-order
+# ceiling IS the per-asset ceiling for that strategy. Stored in KV (not in the
+# strategy's params — it's an operator risk knob, not strategy definition).
+# Absent ceiling = no per-strategy cap (pre-existing live strategies are not
+# stranded); the account-wide budget above still applies, and the snapshot
+# surfaces which live strategies lack one.
+# --------------------------------------------------------------------------- #
+
+_LIVE_CEILINGS_KV_KEY = "forven:live:asset_ceilings"
+
+# The exact phrase the operator must type to promote a strategy into live.
+GO_LIVE_CONFIRM_PHRASE = "GO LIVE"
+
+
+def validate_go_live_confirmation(confirm: str | None, ceiling_usd) -> str | None:
+    """Validate the operator's explicit go-live acknowledgement.
+
+    Returns an error message when invalid, None when the confirmation stands.
+    Every human-facing endpoint that can move a strategy into live_graduated
+    calls this — going live is never a single click/toggle."""
+    if str(confirm or "").strip().upper() != GO_LIVE_CONFIRM_PHRASE:
+        return (
+            f'going live requires the typed confirmation "{GO_LIVE_CONFIRM_PHRASE}" '
+            "(confirm field)"
+        )
+    try:
+        value = float(ceiling_usd)
+    except (TypeError, ValueError):
+        value = 0.0
+    if not (value > 0):
+        return (
+            "going live requires live_notional_ceiling_usd — the initial per-asset "
+            "notional ceiling (USD) this strategy may hold live"
+        )
+    return None
+
+
+def get_live_notional_ceilings() -> dict:
+    """Map of strategy_id -> {ceiling_usd, asset, set_by, set_at}."""
+    try:
+        raw = kv_get(_LIVE_CEILINGS_KV_KEY, {})
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def set_live_notional_ceiling(
+    strategy_id: str, ceiling_usd: float | None, *, asset: str | None = None, actor: str | None = None,
+) -> dict:
+    """Set (or clear, with None) a strategy's live per-asset notional ceiling."""
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        raise ValueError("strategy_id is required")
+    ceilings = get_live_notional_ceilings()
+    if ceiling_usd is None:
+        ceilings.pop(sid, None)
+    else:
+        value = float(ceiling_usd)
+        if not (value > 0):
+            raise ValueError("ceiling_usd must be a positive dollar amount")
+        ceilings[sid] = {
+            "ceiling_usd": round(value, 2),
+            "asset": str(asset or "").strip().upper() or None,
+            "set_by": str(actor or "operator"),
+            "set_at": get_now().isoformat(),
+        }
+    kv_set(_LIVE_CEILINGS_KV_KEY, ceilings)
+    log_activity(
+        "info", "risk",
+        f"Live notional ceiling for {sid} " + ("cleared" if ceiling_usd is None else f"set to ${float(ceiling_usd):,.0f}"),
+        {"strategy_id": sid, "ceiling_usd": ceiling_usd, "actor": actor},
+    )
+    return ceilings.get(sid) or {}
+
+
+def check_live_strategy_ceiling(strategy_id: str, add_notional_usd: float) -> tuple[bool, str]:
+    """Per-order admission against the strategy's go-live notional ceiling.
+
+    Returns (allowed, reason). No ceiling recorded → allowed (account-wide
+    budget still bounds it); the risk snapshot flags the missing ceiling."""
+    sid = str(strategy_id or "").strip()
+    entry = get_live_notional_ceilings().get(sid)
+    if not isinstance(entry, dict):
+        return True, "no per-strategy notional ceiling set"
+    try:
+        ceiling = float(entry.get("ceiling_usd") or 0.0)
+    except (TypeError, ValueError):
+        ceiling = 0.0
+    if ceiling <= 0:
+        return True, "no per-strategy notional ceiling set"
+    add_notional = max(float(add_notional_usd or 0.0), 0.0)
+    if add_notional > ceiling:
+        return False, (
+            f"go-live notional ceiling: order notional ${add_notional:,.0f} exceeds the "
+            f"${ceiling:,.0f} per-asset ceiling set for {sid} at go-live — refusing the live open"
+        )
+    return True, f"within go-live ceiling (${add_notional:,.0f}/${ceiling:,.0f})"
+
+
+def _liquidity_guard_snapshot_safe() -> dict:
+    """The liquidity guard's /api/risk block; never lets a snapshot error break risk status."""
+    try:
+        from forven.exchange.liquidity import liquidity_guard_snapshot
+        return liquidity_guard_snapshot()
+    except Exception as exc:
+        log.debug("Liquidity guard snapshot unavailable: %s", exc)
+        return {"enabled": None, "error": str(exc)}
+
+
 def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
     """Operator-facing view of the live portfolio budget (used by /api/risk)."""
     settings = _load_risk_settings()
@@ -723,11 +922,53 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         }
         for g, v in exposure["per_group"].items()
     }
+    # BOOK-BUDGET-1: per-wallet capacity view — every wallet the daemon knows
+    # about is listed (even with nothing open) so the operator sees free capacity.
+    books_equity: dict[str, float] = {}
+    try:
+        exch = (kv_get("daemon_state", {}) or {}).get("exchange_account") or {}
+        raw_books = exch.get("books") if isinstance(exch, dict) else None
+        if isinstance(raw_books, dict):
+            books_equity = {
+                str(k).strip().lower(): float(v)
+                for k, v in raw_books.items()
+                if _coerce_non_negative_float(v)
+            }
+    except Exception:
+        books_equity = {}
+    per_book = {}
+    for label in sorted(set(books_equity) | set(exposure["per_book"])):
+        used = exposure["per_book"].get(label) or {}
+        book_eq = books_equity.get(label)
+        per_book[label] = {
+            "gross_notional_usd": round(float(used.get("gross_notional_usd", 0.0)), 2),
+            "risk_usd": round(float(used.get("risk_usd", 0.0)), 2),
+            "positions": int(used.get("positions", 0) or 0),
+            "equity_usd": round(book_eq, 2) if book_eq else None,
+            "limit_usd": (
+                round(limits_pct["live_max_book_notional_pct"] / 100.0 * book_eq, 2)
+                if book_eq else None
+            ),
+        }
+    ceilings = get_live_notional_ceilings()
+    ceilings_missing: list[str] = []
+    try:
+        with get_db() as conn:
+            live_ids = [
+                str(r["id"]) for r in conn.execute(
+                    "SELECT id FROM strategies WHERE LOWER(COALESCE(stage, status, '')) = 'live_graduated'"
+                ).fetchall()
+            ]
+        ceilings_missing = [sid for sid in live_ids if sid not in ceilings]
+    except Exception as exc:
+        log.debug("Could not enumerate live strategies for ceiling audit: %s", exc)
     return {
         "enabled": bool(settings.get("live_portfolio_budget_enabled", True)),
         "equity_usd": round(eq, 2) if eq else None,
         "equity_available": bool(eq),
         "limits_pct": limits_pct,
+        "strategy_ceilings": ceilings,
+        "ceilings_missing": ceilings_missing,
         "total_open_risk_usd": exposure["total_risk_usd"],
         "total_open_risk_limit_usd": round(max_risk_usd, 2) if max_risk_usd else None,
         "total_open_risk_used_frac": (
@@ -736,6 +977,7 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         "stops_missing": exposure["stops_missing"],
         "per_asset": per_asset,
         "per_group": per_group,
+        "per_book": per_book,
         "positions": exposure["positions"],
         "groups": {g: list(assets) for g, assets in CORRELATION_GROUPS.items()},
     }
@@ -3109,7 +3351,12 @@ def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
 # HWM on the next good tick.
 _MAX_PLAUSIBLE_EQUITY = 1e12  # $1T — no real or testnet account reaches this
 _EQUITY_JUMP_REJECT_MULT = 100.0  # a single-tick 100x jump from the last good equity is suspect
-_EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS = 5  # ...unless it persists this many ticks (a real deposit/regime change)
+# EQ-BASIS-3: after this many consecutive rejects, ALERT the operator instead of
+# accepting. The old behavior self-healed — it accepted the suspect value as "a
+# real deposit" on the next tick, which is exactly how a persistent garbage read
+# latched a $516B high-water mark (the poison outlasted the guard). A genuine
+# >100x deposit is now confirmed explicitly via the equity re-baseline action.
+_EQUITY_JUMP_ALERT_AFTER_REJECTS = 5
 # KS-CACHE-LOG: log (do NOT reject) any accepted single-tick move >= this mult or
 # <= its reciprocal. The 2026-06-29 false kill-switch was a ~28x inflated read that
 # latched a corrupt HWM while staying under the 100x hard-reject ceiling; this
@@ -3122,11 +3369,11 @@ def _validate_equity_sample(account_equity: object, state: dict) -> tuple[bool, 
 
     Rejects non-numeric / NaN / non-positive / above the absolute plausibility
     ceiling, and a single-tick jump > ``_EQUITY_JUMP_REJECT_MULT`` x the last good
-    equity. The relative-jump check self-heals: it tracks
-    ``state['equity_reject_streak']`` and, once a suspect value persists for
-    ``_EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS`` ticks, accepts it as a genuine change
-    (e.g. a large deposit) rather than rejecting forever. Hard rejects
-    (NaN/non-positive/ceiling) never heal.
+    equity. The relative-jump check FAILS CLOSED (EQ-BASIS-3): it keeps rejecting
+    for as long as the suspect value persists, and once the streak passes
+    ``_EQUITY_JUMP_ALERT_AFTER_REJECTS`` it alerts the operator to confirm a
+    genuine large deposit via the equity re-baseline action — it never silently
+    accepts a 100x change on its own.
     """
     try:
         eq = float(account_equity)
@@ -3145,17 +3392,45 @@ def _validate_equity_sample(account_equity: object, state: dict) -> tuple[bool, 
     if last > 0 and eq > last * _EQUITY_JUMP_REJECT_MULT:
         streak = int(state.get("equity_reject_streak", 0) or 0) + 1
         state["equity_reject_streak"] = streak
-        if streak <= _EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS:
-            return False, (
-                f"equity ${eq:,.2f} is {eq / last:.0f}x the last good ${last:,.2f} "
-                f"(suspect; tick {streak}/{_EQUITY_JUMP_MAX_CONSECUTIVE_REJECTS})"
-            )
-        log.warning(
-            "Equity $%.2f sustained >%.0fx above last good $%.2f for %d ticks — accepting as a real change.",
-            eq, _EQUITY_JUMP_REJECT_MULT, last, streak,
+        if streak >= _EQUITY_JUMP_ALERT_AFTER_REJECTS:
+            # Re-alerts at most hourly while the anomaly persists (policy cooldown).
+            _notify_equity_anomaly(eq, last, streak)
+        return False, (
+            f"equity ${eq:,.2f} is {eq / last:.0f}x the last good ${last:,.2f} "
+            f"(suspect; rejected {streak} tick(s) — confirm a genuine deposit via "
+            "the equity re-baseline action)"
         )
     state["equity_reject_streak"] = 0
     return True, "ok"
+
+
+def _notify_equity_anomaly(eq: float, last: float, streak: int) -> None:
+    """A persistently-implausible equity source is either poisoned data or a real
+    large deposit — either way the operator must decide, loudly."""
+    summary = (
+        f"Live equity source keeps reporting ${eq:,.2f} — {eq / last:.0f}x the last good "
+        f"${last:,.2f} ({streak} consecutive ticks). Samples are being REJECTED (fail closed); "
+        "risk anchors are frozen at the last good reading. If this is a genuine "
+        "deposit/transfer, confirm it with Re-baseline on the Risk page."
+    )
+    log.error("EQUITY ANOMALY: %s", summary)
+    try:
+        log_activity("error", "risk", f"Equity anomaly: {summary}")
+    except Exception:
+        pass
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "equity_anomaly",
+            severity="warn",
+            source="risk",
+            title="Live equity source anomaly",
+            summary=summary,
+            body=summary,
+            dedupe_key="equity_anomaly:jump",
+        )
+    except Exception as exc:
+        log.debug("Could not emit equity_anomaly notification: %s", exc)
 
 
 def _rejected_equity_result(state: dict, reason: str) -> dict:
@@ -3731,6 +4006,77 @@ def _reset_kill_switch_locked() -> None:
     ))
 
 
+def rebaseline_equity_anchors(equity: float, *, source: str = "operator", actor: str = "ui") -> dict:
+    """Operator-confirmed re-anchoring of the equity anchors (EQ-BASIS-3).
+
+    Sets high_water_mark / last_equity / daily start to ``equity`` (a FRESH,
+    caller-verified live reading) and clears the jump-reject streak. This is the
+    explicit confirmation path for a poisoned anchor or a genuine large
+    deposit the fail-closed jump guard refuses to accept on its own. It does
+    NOT touch the kill-switch / daily-halt flags — those have their own reset.
+    """
+    eq = float(equity)
+    if not (eq > 0) or eq != eq or eq > _MAX_PLAUSIBLE_EQUITY:
+        raise ValueError(f"re-baseline requires a positive, plausible equity (got {equity!r})")
+
+    with _RISK_STATE_LOCK:
+        state = _get_risk_state()
+        old_hwm = float(state.get("high_water_mark") or 0.0)
+        old_last = float(state.get("last_equity") or 0.0)
+        state["high_water_mark"] = eq
+        state["last_equity"] = eq
+        state["drawdown_pct"] = 0.0
+        state["equity_reject_streak"] = 0
+        state["equity_source"] = str(source or "operator")
+        state["updated_at"] = get_now().isoformat()
+        _save_risk_state(state)
+
+        today = get_today().isoformat()
+        kv_set(sim_kv_key("daily_risk"), {
+            "date": today,
+            "start_equity": eq,
+            "current_equity": eq,
+            "pnl_pct": 0.0,
+            "loss_pct": 0.0,
+            "updated_at": get_now().isoformat(),
+        })
+
+    # Refresh the daemon_state mirrors immediately so the dashboard and the
+    # budget denominator don't show the stale numbers until the next tick.
+    try:
+        daemon_state = kv_get("daemon_state", {}) or {}
+        if isinstance(daemon_state, dict):
+            daemon_state["account_equity"] = eq
+            exchange_account = daemon_state.get("exchange_account")
+            if isinstance(exchange_account, dict):
+                exchange_account["accountValue"] = eq
+                exchange_account["source"] = str(source or "operator")
+            risk_block = daemon_state.get("risk")
+            if isinstance(risk_block, dict):
+                risk_block["high_water_mark"] = eq
+                risk_block["drawdown_pct"] = 0.0
+                risk_block["daily_pnl_pct"] = 0.0
+            kv_set("daemon_state", daemon_state)
+    except Exception as exc:
+        log.warning("Equity re-baseline: could not refresh daemon_state mirrors: %s", exc)
+
+    log.info(
+        "Equity anchors re-baselined by %s: HWM $%.2f -> $%.2f (last good was $%.2f, source=%s)",
+        actor, old_hwm, eq, old_last, source,
+    )
+    log_activity("warning", "risk", (
+        f"Equity anchors re-baselined by {actor}: HWM ${old_hwm:,.2f} -> ${eq:,.2f}, "
+        f"daily start reset to ${eq:,.2f} (source={source})."
+    ))
+    return {
+        "high_water_mark": eq,
+        "previous_high_water_mark": old_hwm,
+        "last_equity": eq,
+        "daily_start_equity": eq,
+        "source": str(source or "operator"),
+    }
+
+
 def is_trading_allowed() -> tuple[bool, str]:
     """Check if new trades are allowed right now.
 
@@ -3818,6 +4164,9 @@ def get_risk_status() -> dict:
         # vs equity) — distinct from limits.portfolio_budget, the legacy risk-pct
         # slot ledger. The frontend risk page renders this block.
         "portfolio_budget_live": live_portfolio_budget_snapshot(),
+        # LIQ-1: order-time liquidity guard state (limits + recent admit/block
+        # decisions). Enforcement lives in exchange.liquidity via market_order.
+        "liquidity_guard_live": _liquidity_guard_snapshot_safe(),
         "limits": {
             "max_drawdown": float(limits["max_drawdown"]),
             "daily_loss_limit": float(limits["daily_loss_limit"]),

@@ -770,14 +770,30 @@ def get_dashboard(require_account_connection: bool = False) -> dict[str, object]
     )
     if should_fetch_live_account:
         try:
-            from forven.exchange.hyperliquid import get_account_value
             from forven.api_domains.trading import _resolve_exchange_testnet
+            # EQ-BASIS-1: use the SAME books-aware aggregate the risk cycle uses.
+            # A master-only get_account_value here wrote the wrong basis back into
+            # daemon_state (master reserve funds are not at-risk capital when
+            # direction books are enabled), silently clobbering the daemon's
+            # books-only snapshot for every downstream reader.
+            from forven.daemon import _book_aware_account_value
 
             resolved_testnet = _resolve_exchange_testnet()
-            live_account = get_account_value(
-                testnet=resolved_testnet,
-                require_connection=strict_hyperliquid_account,
-            )
+            live_account = _book_aware_account_value(testnet=resolved_testnet)
+            if live_account is None and strict_hyperliquid_account:
+                raise HTTPException(
+                    status_code=503,
+                    detail="HyperLiquid wallet balance unavailable (degraded reads)",
+                )
+            if (
+                strict_hyperliquid_account
+                and isinstance(live_account, dict)
+                and str(live_account.get("source") or "") == "paper"
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="HyperLiquid credentials unavailable — no live wallet balance",
+                )
             if isinstance(live_account, dict):
                 live_equity_raw = live_account.get("accountValue")
                 try:

@@ -136,6 +136,14 @@ export interface ForvenRiskStatus {
 			positions?: number;
 			limit_usd?: number | null;
 		}>;
+		/** BOOK-BUDGET-1: per-wallet (direction book) capacity and usage. */
+		per_book?: Record<string, {
+			gross_notional_usd?: number;
+			risk_usd?: number;
+			positions?: number;
+			equity_usd?: number | null;
+			limit_usd?: number | null;
+		}>;
 		positions?: Array<{
 			trade_id?: string;
 			asset?: string;
@@ -147,6 +155,33 @@ export interface ForvenRiskStatus {
 			group?: string;
 		}>;
 		groups?: Record<string, string[]>;
+		/** GO-LIVE-1: per-strategy notional ceilings accepted at go-live. */
+		strategy_ceilings?: Record<string, {
+			ceiling_usd?: number;
+			asset?: string | null;
+			set_by?: string;
+			set_at?: string;
+		}>;
+		/** Live-stage strategies with no go-live ceiling recorded (pre-existing lives). */
+		ceilings_missing?: string[];
+	};
+	/** LIQ-1: order-time liquidity guard (limits + recent admit/block decisions). */
+	liquidity_guard_live?: {
+		enabled?: boolean | null;
+		error?: string;
+		limits?: Record<string, number>;
+		recent_decisions?: Array<{
+			asset?: string;
+			side?: string;
+			allowed?: boolean;
+			reason?: string;
+			checked_at?: number;
+			order_notional_usd?: number;
+			day_volume_usd?: number;
+			spread_bps?: number;
+			near_depth_usd?: number;
+			est_impact_bps?: number;
+		}>;
 	};
 }
 
@@ -1260,6 +1295,21 @@ export async function resetTradingHalt(): Promise<TradingResetResponse> {
 	});
 }
 
+/** EQ-BASIS-3: re-anchor HWM / daily start / last equity to a fresh books-aware live read. */
+export async function rebaselineEquityAnchors(): Promise<{
+	ok: boolean;
+	equity: number;
+	high_water_mark: number;
+	previous_high_water_mark: number;
+	daily_start_equity: number;
+	source: string;
+}> {
+	return fetchApi('/risk/equity/rebaseline', {
+		method: 'POST',
+		body: JSON.stringify({ confirm: true }),
+	});
+}
+
 export async function reconcileSchedulerJobs(): Promise<SchedulerReconcileResponse> {
 	return fetchApi('/scheduler/reconcile', { method: 'POST' });
 }
@@ -1549,7 +1599,17 @@ export async function getNowWorking(): Promise<NowWorkingRow[]> {
 export async function promoteForvenStrategy(
 	strategyId: string,
 	toStatus: string,
-	options?: { fromStatus?: string; fromOwner?: string; reason?: string; force?: boolean; override?: boolean }
+	options?: {
+		fromStatus?: string;
+		fromOwner?: string;
+		reason?: string;
+		force?: boolean;
+		override?: boolean;
+		/** GO-LIVE-1: typed confirmation phrase ("GO LIVE") required to land in live_graduated. */
+		confirm?: string;
+		/** GO-LIVE-1: initial per-asset notional ceiling (USD), enforced per live order. */
+		liveNotionalCeilingUsd?: number;
+	}
 ): Promise<{
 	ok: boolean;
 	strategy_id: string;
@@ -1573,6 +1633,8 @@ export async function promoteForvenStrategy(
 			reason: options?.reason,
 			force: options?.force ?? false,
 			override: options?.override ?? false,
+			confirm: options?.confirm,
+			live_notional_ceiling_usd: options?.liveNotionalCeilingUsd,
 		}),
 	});
 	if (result?.ok === false) {
@@ -1588,6 +1650,17 @@ export async function promoteForvenStrategy(
 		to_status: String(result?.to_status ?? toStatus),
 		updated_at: String(result?.updated_at ?? new Date().toISOString()),
 	};
+}
+
+/** GO-LIVE-1: set (or clear, with null) a strategy's per-asset live notional ceiling. */
+export async function setLiveNotionalCeiling(
+	strategyId: string,
+	ceilingUsd: number | null
+): Promise<{ ok: boolean; strategy_id: string; ceiling: Record<string, unknown> | null }> {
+	return fetchApi(`/strategies/${encodeURIComponent(strategyId)}/live-ceiling`, {
+		method: 'PUT',
+		body: JSON.stringify({ ceiling_usd: ceilingUsd }),
+	});
 }
 
 export interface StrategyHandoffPayload {
@@ -1692,6 +1765,10 @@ export interface ApprovalDecisionPayload {
 	actor?: string;
 	feedback?: string;
 	reason?: string;
+	/** GO-LIVE-1: typed confirmation phrase ("GO LIVE"), required when approving a live promotion. */
+	confirm?: string;
+	/** GO-LIVE-1: initial per-asset notional ceiling (USD), required when approving a live promotion. */
+	live_notional_ceiling_usd?: number;
 }
 
 export interface ApprovalHandoffPayload {

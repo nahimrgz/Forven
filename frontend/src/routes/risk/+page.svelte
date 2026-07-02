@@ -7,7 +7,7 @@
 		type ForvenDashboardResponse,
 		type ForvenRiskStatus,
 	} from '$lib/api';
-	import { triggerEmergencyHalt } from '$lib/api/forven';
+	import { rebaselineEquityAnchors, setLiveNotionalCeiling, triggerEmergencyHalt } from '$lib/api/forven';
 	import ErrorBanner from '$lib/components/ErrorBanner.svelte';
 	import LoadingState from '$lib/components/LoadingState.svelte';
 	import { createRealtimeRefresh, type RealtimeRefreshController } from '$lib/utils/realtime';
@@ -59,6 +59,14 @@
 	$: liveBudgetRiskLimit = Number(liveBudget?.total_open_risk_limit_usd ?? 0);
 	$: liveBudgetAssets = Object.entries(liveBudget?.per_asset ?? {});
 	$: liveBudgetGroups = Object.entries(liveBudget?.per_group ?? {});
+	// BOOK-BUDGET-1: per-wallet (direction book) capacity vs usage.
+	$: liveBudgetBooks = Object.entries(liveBudget?.per_book ?? {});
+	// GO-LIVE-1: per-strategy notional ceilings accepted at go-live.
+	$: liveCeilings = Object.entries(liveBudget?.strategy_ceilings ?? {});
+	$: ceilingsMissing = liveBudget?.ceilings_missing ?? [];
+	// LIQ-1: order-time liquidity guard state + recent admit/block decisions.
+	$: liquidityGuard = risk?.liquidity_guard_live ?? null;
+	$: liquidityDecisions = liquidityGuard?.recent_decisions ?? [];
 
 	function formatBudgetUsd(value: number): string {
 		return `$${Math.abs(value).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
@@ -148,6 +156,55 @@
 		}
 
 		loading = false;
+	}
+
+	// EQ-BASIS-3: re-anchor HWM / daily start to a fresh books-aware live read —
+	// the explicit confirmation for a poisoned anchor or a genuine large deposit
+	// that the fail-closed equity jump guard refuses to accept on its own.
+	let rebaselineBusy = false;
+	async function handleRebaseline() {
+		if (rebaselineBusy) return;
+		const confirmed = window.confirm(
+			'Re-baseline the equity anchors?\n\nHigh-water mark, daily start, and last equity will be re-anchored to a fresh live wallet reading (sum of the trading wallets). Drawdown and daily PnL restart from there. Use this after a bad reading poisoned the anchors, or to confirm a large deposit.'
+		);
+		if (!confirmed) return;
+		rebaselineBusy = true;
+		error = '';
+		try {
+			const result = await rebaselineEquityAnchors();
+			actionMessage = `Equity anchors re-baselined to $${Number(result.equity).toLocaleString(undefined, { maximumFractionDigits: 2 })} (was HWM $${Number(result.previous_high_water_mark).toLocaleString(undefined, { maximumFractionDigits: 2 })}).`;
+			await loadRiskData();
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Equity re-baseline failed';
+		} finally {
+			rebaselineBusy = false;
+		}
+	}
+
+	// GO-LIVE-1: adjust (or add) a live strategy's per-asset notional ceiling
+	// after go-live. 0 clears it — only the account-wide budget caps remain.
+	async function editCeiling(strategyId: string, current?: number) {
+		const raw = window.prompt(
+			`Per-asset live notional ceiling (USD) for ${strategyId} — the largest live position it may hold, enforced on every order.\n\nEnter 0 to clear the ceiling.`,
+			String(current && current > 0 ? current : 1000)
+		);
+		if (raw === null) return;
+		const value = Number(raw);
+		if (!Number.isFinite(value) || value < 0) {
+			error = 'Ceiling must be a number ≥ 0 (0 clears it).';
+			return;
+		}
+		error = '';
+		try {
+			await setLiveNotionalCeiling(strategyId, value === 0 ? null : value);
+			actionMessage =
+				value === 0
+					? `Ceiling cleared for ${strategyId}.`
+					: `Ceiling for ${strategyId} set to $${value.toLocaleString()}.`;
+			await loadRiskData();
+		} catch (e) {
+			error = e instanceof Error ? e.message : `Failed to update ceiling for ${strategyId}`;
+		}
 	}
 
 	async function handleTradingReset() {
@@ -349,7 +406,16 @@
 					<div class={`text-base font-bold ${dailyPnlUsd >= 0 ? 'text-green-400' : 'text-red-400'}`}>{formatUsd(dailyPnlUsd)}</div>
 				</div>
 				<div class="border border-[#222] bg-[#080808] rounded p-3">
-					<div class="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Equity Anchors</div>
+					<div class="flex items-center justify-between mb-1">
+						<div class="text-[10px] uppercase tracking-wider text-gray-500">Equity Anchors</div>
+						<button
+							type="button"
+							disabled={rebaselineBusy}
+							class="rounded border border-[#2b2b2b] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-gray-500 transition hover:text-gray-200 disabled:opacity-50"
+							title="Re-anchor HWM / daily start to a fresh live wallet reading"
+							on:click={() => void handleRebaseline()}
+						>{rebaselineBusy ? 'Re-baselining…' : 'Re-baseline'}</button>
+					</div>
 					<div class="text-xs text-gray-300">HWM: ${highWaterMark.toFixed(2)}</div>
 					<div class="text-xs text-gray-300">Daily Start: ${dailyStartEquity.toFixed(2)}</div>
 				</div>
@@ -390,7 +456,7 @@
 				<span class={`text-xs px-2 py-1 border rounded ${liveBudget.enabled ? 'text-green-400 border-green-800' : 'text-amber-400 border-amber-800'}`}>
 					{liveBudget.enabled ? 'Enforcing' : 'Disabled'}
 				</span>
-				<a href="/settings" class="text-[10px] uppercase tracking-wider text-gray-500 hover:text-gray-300 transition-colors">Edit caps</a>
+				<a href="/settings#trading/risk.live_max_total_open_risk_pct" class="text-[10px] uppercase tracking-wider text-gray-500 hover:text-gray-300 transition-colors">Edit caps</a>
 			</div>
 		</div>
 		<p class="text-[11px] text-gray-500">
@@ -411,6 +477,43 @@
 				conservative 3% of notional.
 			</div>
 		{/if}
+		{#if ceilingsMissing.length > 0}
+			<div class="rounded border border-amber-800 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">
+				<div>
+					{ceilingsMissing.length} live strategy(ies) have no go-live notional ceiling recorded — only the
+					account-wide caps bound them.
+				</div>
+				<div class="mt-1.5 flex flex-wrap gap-1.5">
+					{#each ceilingsMissing as sid}
+						<button
+							type="button"
+							class="rounded border border-amber-700 bg-amber-950/40 px-2 py-0.5 text-[11px] text-amber-100 transition hover:bg-amber-900/40"
+							on:click={() => void editCeiling(sid)}
+						>Set ceiling for {sid}</button>
+					{/each}
+				</div>
+			</div>
+		{/if}
+		{#if liveCeilings.length > 0}
+			<div class="pt-1">
+				<div class="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Go-live notional ceilings</div>
+				<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+					{#each liveCeilings as [sid, ceiling]}
+						<div class="border border-[#222] bg-[#090909] rounded px-3 py-2 flex items-center justify-between text-[11px]">
+							<a href={`/lab/strategy/${sid}`} class="font-mono text-cyan-300 hover:text-cyan-200">{sid}</a>
+							<span class="flex items-center gap-2 text-gray-300">
+								{formatBudgetUsd(Number(ceiling.ceiling_usd ?? 0))} max/asset
+								<button
+									type="button"
+									class="rounded border border-[#2b2b2b] px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-gray-500 transition hover:text-gray-200"
+									on:click={() => void editCeiling(sid, Number(ceiling.ceiling_usd ?? 0))}
+								>Edit</button>
+							</span>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/if}
 
 		<div class="space-y-1">
 			<div class="flex items-center justify-between text-[11px]">
@@ -429,6 +532,33 @@
 				></div>
 			</div>
 		</div>
+
+		{#if liveBudgetBooks.length > 0}
+			<div class="space-y-2 pt-1">
+				<div class="text-[10px] uppercase tracking-wider text-gray-500">Per-wallet capacity (direction books)</div>
+				{#each liveBudgetBooks as [bookName, b]}
+					{@const used = Number(b.gross_notional_usd ?? 0)}
+					{@const bookCap = Number(b.limit_usd ?? 0)}
+					{@const bookEq = Number(b.equity_usd ?? 0)}
+					<div class="space-y-1">
+						<div class="flex items-center justify-between text-[11px]">
+							<span class="text-gray-400 capitalize">{bookName} wallet
+								{#if bookEq > 0}<span class="text-gray-600">(${bookEq.toLocaleString(undefined, { maximumFractionDigits: 0 })} equity, {b.positions ?? 0} pos)</span>{/if}
+							</span>
+							<span class={bookCap > 0 && used > bookCap ? 'text-red-400' : 'text-gray-300'}>
+								{formatBudgetUsd(used)} / {bookCap > 0 ? formatBudgetUsd(bookCap) : '—'} notional
+							</span>
+						</div>
+						<div class="h-1.5 rounded bg-[#1a1a1a] overflow-hidden">
+							<div
+								class={`h-full ${bookCap > 0 && used / bookCap >= 1 ? 'bg-red-500' : bookCap > 0 && used / bookCap >= 0.75 ? 'bg-amber-500' : 'bg-cyan-600'}`}
+								style={`width: ${clampPercent(bookCap > 0 ? (used / bookCap) * 100 : 0)}%;`}
+							></div>
+						</div>
+					</div>
+				{/each}
+			</div>
+		{/if}
 
 		{#if liveBudgetGroups.length > 0}
 			<div class="space-y-2 pt-1">
@@ -472,6 +602,68 @@
 			</div>
 		{:else}
 			<div class="text-xs text-gray-500">No open live positions — full budget available.</div>
+		{/if}
+	</div>
+	{/if}
+
+	{#if liquidityGuard}
+	<div class="border border-[#333] bg-[#0d0d0d] rounded p-4 space-y-3">
+		<div class="flex items-center justify-between">
+			<h2 class="text-sm font-bold uppercase tracking-wider text-gray-200">Liquidity Guard</h2>
+			<div class="flex items-center gap-2">
+				<span class={`text-xs px-2 py-1 border rounded ${liquidityGuard.enabled ? 'text-green-400 border-green-800' : 'text-amber-400 border-amber-800'}`}>
+					{liquidityGuard.enabled ? 'Enforcing' : liquidityGuard.enabled === false ? 'Disabled' : 'Unavailable'}
+				</span>
+				<a href="/settings#trading/risk.live_liquidity_guard_enabled" class="text-[10px] uppercase tracking-wider text-gray-500 hover:text-gray-300 transition-colors">Edit limits</a>
+			</div>
+		</div>
+		<p class="text-[11px] text-gray-500">
+			Pre-trade microstructure checks on every live OPEN order — 24h volume floor, max spread, max share
+			of near-mid book depth, and max estimated price impact, measured against the mainnet book. Fails
+			closed when market data is unavailable; closes are never blocked.
+		</p>
+		{#if liquidityGuard.limits}
+			<div class="grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px]">
+				<div class="border border-[#222] bg-[#090909] rounded px-3 py-2">
+					<div class="text-gray-500">Min 24h volume</div>
+					<div class="text-gray-300">{formatBudgetUsd(Number(liquidityGuard.limits.live_min_daily_volume_usd ?? 0))}</div>
+				</div>
+				<div class="border border-[#222] bg-[#090909] rounded px-3 py-2">
+					<div class="text-gray-500">Max spread</div>
+					<div class="text-gray-300">{Number(liquidityGuard.limits.live_max_spread_bps ?? 0)} bps</div>
+				</div>
+				<div class="border border-[#222] bg-[#090909] rounded px-3 py-2">
+					<div class="text-gray-500">Depth window</div>
+					<div class="text-gray-300">{Number(liquidityGuard.limits.live_book_depth_window_bps ?? 0)} bps</div>
+				</div>
+				<div class="border border-[#222] bg-[#090909] rounded px-3 py-2">
+					<div class="text-gray-500">Max depth share</div>
+					<div class="text-gray-300">{Number(liquidityGuard.limits.live_max_book_participation_pct ?? 0)}%</div>
+				</div>
+				<div class="border border-[#222] bg-[#090909] rounded px-3 py-2">
+					<div class="text-gray-500">Max price impact</div>
+					<div class="text-gray-300">{Number(liquidityGuard.limits.live_max_price_impact_bps ?? 0)} bps</div>
+				</div>
+			</div>
+		{/if}
+		{#if liquidityDecisions.length > 0}
+			<div class="pt-1">
+				<div class="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Recent order checks</div>
+				<div class="space-y-1">
+					{#each liquidityDecisions.slice(0, 8) as decision}
+						<div class="border border-[#222] bg-[#090909] rounded px-3 py-1.5 flex items-center gap-2 text-[11px]">
+							<span class={`px-1.5 py-0.5 rounded border text-[10px] uppercase ${decision.allowed ? 'text-green-400 border-green-800' : 'text-red-400 border-red-800'}`}>
+								{decision.allowed ? 'Pass' : 'Block'}
+							</span>
+							<span class="font-bold text-gray-300">{decision.asset}</span>
+							<span class="text-gray-500 uppercase text-[10px]">{decision.side}</span>
+							<span class="text-gray-500 truncate" title={decision.reason}>{decision.reason}</span>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{:else}
+			<div class="text-xs text-gray-500">No live orders checked since the backend started.</div>
 		{/if}
 	</div>
 	{/if}

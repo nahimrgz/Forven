@@ -452,8 +452,13 @@ def _book_account_equity(account_address: str | None) -> float | None:
         return None
     try:
         from forven.exchange.hyperliquid import get_account_value
+        # EQ-BASIS-4: require a REAL exchange read — the paper-mode fallback in
+        # get_account_value returns the daemon's own bookkeeping (ignoring the
+        # address), which would size a real order off a phantom balance.
         acc = get_account_value(
-            testnet=_resolve_hyperliquid_testnet(), account_address=account_address
+            testnet=_resolve_hyperliquid_testnet(),
+            require_connection=True,
+            account_address=account_address,
         )
         return _coerce_positive_float(acc.get("accountValue")) if isinstance(acc, dict) else None
     except Exception as exc:
@@ -1068,6 +1073,14 @@ def _guard_open_trade_execution_intent(
             raise ValueError(
                 f"trade {trade_id} requested size {float(size):.6f} exceeds safe max {float(max_size):.6f}"
             )
+
+    # GO-LIVE-1: the operator's go-live per-asset notional ceiling also bounds
+    # the legacy/intent live path (the kernel path checks it before its order).
+    if str(trade.get("execution_type") or "").strip().lower() == "live":
+        from forven.exchange.risk import check_live_strategy_ceiling
+        _cl_ok, _cl_why = check_live_strategy_ceiling(strategy_id, float(size) * float(reference_price))
+        if not _cl_ok:
+            raise ValueError(f"trade {trade_id} blocked: {_cl_why}")
 
     risk_plan = _build_entry_risk_plan(
         direction=direction,
@@ -3321,6 +3334,32 @@ def _fail_unfilled_open_trade(trade_id: str | None, reason: str | None) -> None:
         tid,
         reason,
     )
+
+
+def _notify_live_open_blocked(strat_id: str, asset: str, reason: str, reason_class: str) -> None:
+    """A refused LIVE open is a real-capital safety event the operator must see
+    without reading scanner logs. The scan re-attempts while the signal stays
+    active, so dedupe per (strategy, cause); the trade_blocked policy adds a 1h
+    cooldown on top."""
+    try:
+        from forven.notifications import emit_notification
+        emit_notification(
+            "trade_blocked",
+            severity="warn",
+            source="scanner",
+            title=f"Live open blocked ({asset})",
+            summary=f"{strat_id}: {reason}",
+            body=f"{strat_id}: {reason}",
+            metadata={
+                "strategy_id": strat_id,
+                "asset": asset,
+                "execution_mode": "live",
+                "reason_class": reason_class,
+            },
+            dedupe_key=f"trade_blocked:{strat_id}:{reason_class}",
+        )
+    except Exception as exc:
+        log.debug("Could not emit trade_blocked notification: %s", exc)
 
 
 def _report_execution_failure(strategy_id: str | None, action: str, trade_id: str | None, reason: str | None = None) -> None:
@@ -6281,6 +6320,11 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
                     "[%s] BLOCKED %s live — could not read %s-book sub-account balance; "
                     "not sizing a real order off the master wallet", strat_id, asset, open_book,
                 )
+                _notify_live_open_blocked(
+                    strat_id, asset,
+                    f"{open_book}-book sub-account balance unavailable for sizing (fail closed)",
+                    "book_balance_unavailable",
+                )
                 return f"BLOCKED {asset} live — {open_book}-book balance unavailable for sizing"
         if books.short_book_available():
             _cross, _cross_reason = _opposite_book_would_cross(asset, open_book)
@@ -6320,13 +6364,28 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         _add_risk = abs(float(ref_price) - float(stop_price)) * float(units)
     else:
         _add_risk = _add_notional * 0.03  # no stop known — conservative floor (mirrors risk._BUDGET_NO_STOP_RISK_FRAC)
+    # BOOK-BUDGET-1: the order draws on ONE wallet — pass the routed book and its
+    # balance (sizing_equity was narrowed to exactly that above) so admission is
+    # also checked against the wallet's own capacity, not just the aggregate.
     _pb_ok, _pb_why = check_live_portfolio_budget(
         asset, direction, add_risk_usd=_add_risk, add_notional_usd=_add_notional,
         equity=_get_real_account_equity(),
+        book=open_book,
+        book_equity_usd=(float(sizing_equity) if (books_on and open_book) else None),
     )
     if not _pb_ok:
         log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _pb_why)
+        _notify_live_open_blocked(strat_id, asset, _pb_why, "portfolio_budget")
         return f"BLOCKED {asset} live — {_pb_why}"
+    # GO-LIVE-1: the per-strategy notional ceiling the operator accepted at the
+    # go-live confirmation. One position per asset + asset pinned to the container
+    # means this per-order bound IS the strategy's per-asset exposure bound.
+    from forven.exchange.risk import check_live_strategy_ceiling
+    _cl_ok, _cl_why = check_live_strategy_ceiling(strat_id, _add_notional)
+    if not _cl_ok:
+        log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _cl_why)
+        _notify_live_open_blocked(strat_id, asset, _cl_why, "go_live_ceiling")
+        return f"BLOCKED {asset} live — {_cl_why}"
     risk_pct = float(alloc_risk) if alloc_risk else min(float(size_fraction), 1.0)
     signal_data = {
         "kernel_managed": True, "kernel_entry_time": action.entry_time,
@@ -6824,6 +6883,12 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
                         "[%s] kernel live: real account equity unavailable — skipping OPEN %s "
                         "to avoid sizing off a fabricated fallback",
                         strat_id, asset,
+                    )
+                    _notify_live_open_blocked(
+                        strat_id, asset,
+                        "real account equity unavailable — live opens fail closed until the "
+                        "daemon equity snapshot recovers",
+                        "equity_unavailable",
                     )
                     out.append(f"BLOCKED {asset} — real account equity unavailable for live sizing")
                     continue

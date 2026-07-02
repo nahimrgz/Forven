@@ -545,6 +545,11 @@ def _auto_approve_promotions_enabled(
     future per-transition policy, but ``auto`` no longer narrows the grant to a
     single transition — that narrowing is exactly what left paper→live parked
     in approval limbo and blocked unattended operation.
+
+    GO-LIVE-1 exception (see ``_requires_operator_promotion_approval``):
+    promotion INTO live_graduated is carved out of both levers — real capital
+    requires an explicit operator confirmation with a notional ceiling, so
+    only gauntlet→paper self-approves under auto.
     """
     try:
         settings = kv_get("forven:settings", {}) or {}
@@ -561,11 +566,31 @@ def _auto_approve_promotions_enabled(
         return False
 
 
+def _allow_auto_live_promotion() -> bool:
+    """Whether paper→live may self-approve. Default False and meant to stay
+    False: going live is the one transition that converts a signal into real
+    capital, so it requires a human confirmation with a notional ceiling. The
+    setting exists only because every gate threshold is operator-editable."""
+    try:
+        settings = kv_get("forven:settings", {}) or {}
+        if isinstance(settings, dict):
+            return str(settings.get("allow_auto_live_promotion", "false")).strip().lower() == "true"
+    except Exception:
+        pass
+    return False
+
+
 def _requires_operator_promotion_approval(current_stage: str, target_stage: str) -> bool:
     """Return True when this transition promotes a strategy into a capital-consuming
     stage and operator auto-approval is disabled."""
     if (current_stage, target_stage) not in _OPERATOR_PROMOTION_TRANSITIONS:
         return False
+    # GO-LIVE-1: promotion INTO live is never auto-approvable — neither
+    # auto_approve_promotions nor promotion_mode="auto" grants it. The operator
+    # confirms each go-live explicitly (typed confirmation + per-asset notional
+    # ceiling at the approve/promote endpoints).
+    if target_stage == "live_graduated" and not _allow_auto_live_promotion():
+        return True
     return not _auto_approve_promotions_enabled(current_stage, target_stage)
 
 
@@ -2000,7 +2025,7 @@ def transition_stage(
                     equity_f = float(equity_raw) if equity_raw is not None else 0.0
                 except (TypeError, ValueError):
                     equity_f = 0.0
-                if equity_f > 0 and source in {"exchange", "books_aggregate"}:
+                if equity_f > 0 and source in {"exchange", "books_only", "books_aggregate"}:
                     kv_set(baseline_key, {"equity": equity_f, "source": source, "stamped_at": now})
                     log.info(
                         "Stamped live go-live equity baseline for %s: $%.2f (%s)",

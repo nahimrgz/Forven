@@ -443,6 +443,183 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     deepLinkTo: '/risk',
   },
 
+  // Risk: per-order hard ceilings (SIZE-CAP-1). Unlike the legacy per-trade cap,
+  // these bind the mirror-sized kernel path too — enforced inside
+  // check_live_portfolio_budget, which enforce_risk_caps cannot skip.
+  {
+    id: 'risk.live_hard_max_per_trade_risk_pct',
+    label: 'Live hard per-trade risk cap',
+    unit: '%',
+    default: 2,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_hard_max_per_trade_risk_pct',
+    description:
+      'Absolute ceiling on a single live order’s risk-to-stop (distance from entry to stop × size) as a percent of account equity. Applies to EVERY live open — including the kernel’s exact-parity sizing path, which skips the legacy per-trade cap. Blocks the order rather than resizing it, so backtest parity is preserved.',
+    usedBy: ['forven.exchange.risk', 'forven.scanner'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.live_hard_max_order_notional_pct',
+    label: 'Live hard per-order notional cap',
+    unit: '%',
+    default: 100,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_hard_max_order_notional_pct',
+    description:
+      'Absolute ceiling on a single live order’s notional (size × entry price) as a percent of account equity. The backstop against a runaway size from any sizing mode or leverage combination — enforced on every live open, not skippable by the kernel path.',
+    usedBy: ['forven.exchange.risk', 'forven.scanner'],
+    deepLinkTo: '/risk',
+  },
+
+  // BOOK-BUDGET-1: per-wallet capacity cap with direction books enabled.
+  {
+    id: 'risk.live_max_book_notional_pct',
+    label: 'Live max per-wallet notional',
+    unit: '%',
+    default: 100,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_max_book_notional_pct',
+    description:
+      'With direction books, each live order draws on ONE wallet (the long or short sub-account). Cap on the total open notional routed to a wallet as a percent of that wallet’s own equity — stops several strategies from stacking orders into one small wallet (capital is first-come-first-served; a refused open alerts and retries when the wallet frees up).',
+    usedBy: ['forven.exchange.risk', 'forven.scanner'],
+    deepLinkTo: '/risk',
+  },
+
+  // EQ-BASIS-1: live equity basis with direction books enabled.
+  {
+    id: 'risk.live_equity_include_master',
+    label: 'Count master wallet in live equity',
+    default: false,
+    type: 'toggle',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_equity_include_master',
+    description:
+      'When direction books are enabled, live orders route only to the long/short sub-accounts — so by default the equity that drives drawdown, daily-loss, and every budget cap is the SUM OF THE BOOKS only. Turn this on to also count the master wallet (inflates every cap by funds trades cannot actually lose).',
+    usedBy: ['forven.daemon', 'forven.exchange.risk'],
+    deepLinkTo: '/risk',
+    advanced: true,
+  },
+
+  // Risk: order-time liquidity guard (LIQ-1). Defends against the forced-buyer /
+  // exit-liquidity attack: a strategy signal marching the bot into a thin book.
+  {
+    id: 'risk.live_liquidity_guard_enabled',
+    label: 'Liquidity guard',
+    default: true,
+    type: 'toggle',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_liquidity_guard_enabled',
+    description:
+      'Pre-trade microstructure checks on every live OPEN order: 24h volume floor, max spread, max share of near-mid book depth, and max estimated walk-the-book price impact — measured against the MAINNET book. Fails closed when market data is unavailable. Closes are never blocked.',
+    usedBy: ['forven.exchange.liquidity', 'forven.exchange.hyperliquid'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.live_min_daily_volume_usd',
+    label: 'Min 24h volume to trade live',
+    unit: 'USD',
+    default: 5000000,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_min_daily_volume_usd',
+    description:
+      'A live open is refused when the asset traded less than this notional in the past 24h on mainnet. The liquidity floor for the tradeable universe: thin alts are exactly where an exit-liquidity attack is cheap to stage.',
+    usedBy: ['forven.exchange.liquidity'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.live_max_spread_bps',
+    label: 'Max spread to trade live',
+    unit: 'bps',
+    default: 50,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_max_spread_bps',
+    description:
+      'A live open is refused when the mainnet bid/ask spread exceeds this many basis points — a wide spread means the book is thin or being pulled.',
+    usedBy: ['forven.exchange.liquidity'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.live_book_depth_window_bps',
+    label: 'Depth window around mid',
+    unit: 'bps',
+    default: 100,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_book_depth_window_bps',
+    description:
+      'How far from mid (in basis points) resting orders still count as “near-mid depth” for the participation check below.',
+    usedBy: ['forven.exchange.liquidity'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.live_max_book_participation_pct',
+    label: 'Max share of near-mid depth',
+    unit: '%',
+    default: 25,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_max_book_participation_pct',
+    description:
+      'A live open is refused when the order’s notional would take more than this percent of what is resting on the taker side within the depth window. Keeps one order from BEING the market.',
+    usedBy: ['forven.exchange.liquidity'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.live_max_price_impact_bps',
+    label: 'Max estimated price impact',
+    unit: 'bps',
+    default: 50,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'live_max_price_impact_bps',
+    description:
+      'A live open is refused when walking the visible book to fill the order would move the size-weighted fill price more than this many basis points from mid (or the visible book cannot absorb the order at all).',
+    usedBy: ['forven.exchange.liquidity'],
+    deepLinkTo: '/risk',
+  },
+
+  // GO-LIVE-1: escape hatch for the go-live human confirmation. Exists only
+  // because every gate is operator-editable; meant to stay off.
+  {
+    id: 'bot-operations.allow_auto_live_promotion',
+    label: 'Allow automatic go-live (dangerous)',
+    default: false,
+    type: 'toggle',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'bot-operations',
+    backendPath: 'allow_auto_live_promotion',
+    description:
+      'When OFF (default), promoting a strategy into LIVE always requires a typed "GO LIVE" confirmation with an initial per-asset notional ceiling — even when promotions are otherwise auto-approved. Turning this ON lets the pipeline put real capital behind a strategy without a human in the loop.',
+    usedBy: ['forven.brain'],
+    advanced: true,
+  },
+
   // Risk: regime gating (deduped — ONLY under trading, not health)
   {
     id: 'risk.strict_regime_gating',

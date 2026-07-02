@@ -459,6 +459,34 @@
 
 	async function submitDecision(approvalId: number, action: PendingDecision, preferredTab?: DrawerTab) {
 		if (isBusy(approvalId)) return;
+		// GO-LIVE-1: approving a paper→live promotion is never a bare click — the
+		// backend requires a typed "GO LIVE" confirmation plus an initial per-asset
+		// notional ceiling (USD), so collect both before submitting.
+		const record = approvals.find((row) => row.id === approvalId);
+		let goLive: { confirm: string; live_notional_ceiling_usd: number } | undefined;
+		if (
+			action === 'approve' &&
+			record?.approval_type === 'strategy_promotion_approval' &&
+			(record?.requested_status || '').toLowerCase() === 'live_graduated'
+		) {
+			const ceilingRaw = window.prompt(
+				`Going LIVE trades real capital.\n\nInitial per-asset notional ceiling (USD) for ${record?.target_id ?? 'this strategy'} — the largest live position it may hold. Enforced on every order; editable later.`,
+				'1000'
+			);
+			if (ceilingRaw === null) return;
+			const ceiling = Number(ceilingRaw);
+			if (!Number.isFinite(ceiling) || ceiling <= 0) {
+				error = 'Go-live needs a positive notional ceiling (USD).';
+				return;
+			}
+			const typed = window.prompt(`Type GO LIVE to confirm promoting ${record?.target_id ?? 'this strategy'} to live trading:`);
+			if (typed === null) return;
+			if (typed.trim().toUpperCase() !== 'GO LIVE') {
+				error = 'Go-live not confirmed — you must type GO LIVE exactly.';
+				return;
+			}
+			goLive = { confirm: 'GO LIVE', live_notional_ceiling_usd: ceiling };
+		}
 		setBusy(approvalId, true);
 		actionMessage = null;
 		error = null;
@@ -467,6 +495,7 @@
 				actor: 'operator',
 				reason: `Manual decision via UI: ${action}`,
 				feedback: (reviseInput[approvalId] || '').trim() || undefined,
+				...(goLive ?? {}),
 			};
 			if (action === 'approve') await approveApproval(approvalId, payload);
 			else if (action === 'deny') await denyApproval(approvalId, payload);

@@ -1371,6 +1371,17 @@ def market_order(
     if mid == 0:
         return {"error": f"Could not get mid price for {asset}"}
 
+    # LIQ-1: pre-trade liquidity guard at the one chokepoint every live OPEN
+    # passes through (market_order has no close callers — closes ride
+    # close_position's reduce-only path and are never blocked here). Volume
+    # floor + spread + depth-participation + walk-the-book impact against the
+    # MAINNET book; fails closed when market data is unavailable.
+    from forven.exchange.liquidity import check_order_liquidity
+    liq_ok, liq_reason = check_order_liquidity(asset, is_buy, size, mid)
+    if not liq_ok:
+        log.warning("%s %s open blocked by liquidity guard: %s", asset, side, liq_reason)
+        return {"error": liq_reason, "liquidity_blocked": True}
+
     slippage = 1.02 if is_buy else 0.98
     price = round_to_tick(mid * slippage, asset, _resolve_exchange_url(exchange))
 

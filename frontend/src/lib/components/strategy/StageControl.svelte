@@ -19,8 +19,14 @@
 	// Populated when the promotion gate rejects the transition; enables the
 	// informed operator override path (mirrors the old Configuration-tab flow).
 	let blockReason = '';
+	// GO-LIVE-1: promoting into live requires typing the confirmation phrase and
+	// setting an initial per-asset notional ceiling (USD). The backend refuses a
+	// live promotion without both, so the UI collects them up front.
+	let goLiveConfirmText = '';
+	let goLiveCeilingUsd: number | null = null;
 
 	const TERMINAL = new Set(['archived', 'rejected']);
+	const GO_LIVE_PHRASE = 'GO LIVE';
 
 	type StageOption = { key: string; label: string; kind: 'forward' | 'backward' | 'terminal' | 'revive' };
 
@@ -28,6 +34,10 @@
 	$: stageOptions = buildOptions(currentStage, currentIndex, pipelineStages);
 	$: targetOption = stageOptions.find((option) => option.key === targetStage) ?? null;
 	$: isCapitalTarget = targetStage === 'paper' || targetStage === 'live_graduated';
+	$: isLiveTarget = targetStage === 'live_graduated';
+	$: goLiveArmed =
+		!isLiveTarget ||
+		(goLiveConfirmText.trim().toUpperCase() === GO_LIVE_PHRASE && (goLiveCeilingUsd ?? 0) > 0);
 
 	function buildOptions(
 		stage: string,
@@ -89,12 +99,16 @@
 		targetStage = null;
 		reason = '';
 		blockReason = '';
+		goLiveConfirmText = '';
+		goLiveCeilingUsd = null;
 	}
 
 	function selectTarget(key: string): void {
 		targetStage = key;
 		reason = '';
 		blockReason = '';
+		goLiveConfirmText = '';
+		goLiveCeilingUsd = null;
 	}
 
 	/** Open the panel pre-set to a target stage (used by "Run check" on the gauntlet card). */
@@ -104,7 +118,7 @@
 	}
 
 	async function confirm(override = false): Promise<void> {
-		if (!targetStage || submitting) return;
+		if (!targetStage || submitting || !goLiveArmed) return;
 		const target = targetStage;
 		submitting = true;
 		try {
@@ -115,6 +129,12 @@
 					(override ? 'Operator gate override' : `Manual stage change from strategy container`),
 				force: true,
 				override,
+				...(isLiveTarget
+					? {
+							confirm: goLiveConfirmText.trim().toUpperCase(),
+							liveNotionalCeilingUsd: goLiveCeilingUsd ?? undefined,
+						}
+					: {}),
 			});
 			addToast(`${strategyId} → ${lifecycleStageLabel(target)}`, 'success');
 			open = false;
@@ -183,6 +203,32 @@
 							Archiving removes the strategy from the active pipeline and stops scanning it.
 						</div>
 					{/if}
+					{#if isLiveTarget}
+						<div class="space-y-1.5 rounded border border-emerald-800/50 bg-emerald-950/20 p-2" data-testid="stage-control-go-live">
+							<div class="text-[11px] font-semibold text-emerald-200">
+								Going live trades real capital.
+							</div>
+							<div class="text-[11px] text-emerald-100/80">
+								Set the initial per-asset notional ceiling — the largest position (USD) this strategy may hold live. Enforced on every order; editable later.
+							</div>
+							<input
+								type="number"
+								min="1"
+								step="any"
+								bind:value={goLiveCeilingUsd}
+								data-testid="stage-control-live-ceiling"
+								placeholder="Notional ceiling (USD), e.g. 1000"
+								class="w-full rounded border border-[#2b2b2b] bg-black px-2 py-1 text-xs text-gray-200 placeholder:text-gray-600 focus:border-emerald-700 focus:outline-none"
+							/>
+							<input
+								type="text"
+								bind:value={goLiveConfirmText}
+								data-testid="stage-control-go-live-confirm"
+								placeholder={`Type ${GO_LIVE_PHRASE} to confirm`}
+								class="w-full rounded border border-[#2b2b2b] bg-black px-2 py-1 text-xs text-gray-200 placeholder:text-gray-600 focus:border-emerald-700 focus:outline-none"
+							/>
+						</div>
+					{/if}
 					<textarea
 						bind:value={reason}
 						data-testid="stage-control-reason"
@@ -202,7 +248,7 @@
 							<button
 								type="button"
 								data-testid="stage-control-override"
-								disabled={submitting}
+								disabled={submitting || !goLiveArmed}
 								class="rounded bg-amber-600 px-3 py-1 text-xs text-white transition hover:bg-amber-500 disabled:opacity-50"
 								on:click={() => void confirm(true)}
 							>{submitting ? 'Overriding…' : 'Override gate & promote'}</button>
@@ -210,7 +256,7 @@
 							<button
 								type="button"
 								data-testid="stage-control-confirm"
-								disabled={submitting}
+								disabled={submitting || !goLiveArmed}
 								class="rounded bg-cyan-600 px-3 py-1 text-xs text-white transition hover:bg-cyan-500 disabled:opacity-50"
 								on:click={() => void confirm(false)}
 							>{submitting ? 'Moving…' : 'Confirm'}</button>

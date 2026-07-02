@@ -118,6 +118,11 @@ def post_trading_halt_reset(body: ConfirmBody):
     return control_plane_ops.post_trading_halt_reset(body)
 
 
+@router.post("/api/risk/equity/rebaseline")
+def post_equity_rebaseline(body: ConfirmBody):
+    return control_plane_ops.post_equity_rebaseline(body)
+
+
 @router.post("/api/kill-switch/toggle")
 def post_kill_switch_toggle(body: dict):
     return control_plane_ops.post_kill_switch_toggle(body)

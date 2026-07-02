@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 from forven import api_core as core
@@ -494,6 +494,35 @@ def batch_transition_strategies(body: BatchTransitionBody):
 @router.post("/api/strategies/{strategy_id}/promote")
 def promote_strategy(strategy_id: str, body: lifecycle.StrategyPromoteBody):
     return lifecycle.promote_strategy(strategy_id, body)
+
+
+class LiveCeilingBody(BaseModel):
+    # None clears the ceiling (the account-wide budget caps still apply).
+    ceiling_usd: float | None = Field(default=None, gt=0)
+
+
+@router.put("/api/strategies/{strategy_id}/live-ceiling")
+def update_strategy_live_ceiling(strategy_id: str, body: LiveCeilingBody):
+    """GO-LIVE-1: set or clear a strategy's per-asset live notional ceiling.
+
+    The ceiling is normally set at the go-live confirmation; this lets the
+    operator adjust it afterwards (or add one to a strategy that went live
+    before ceilings existed). Enforced per order on every live open path."""
+    from forven.db import get_db
+    from forven.exchange.risk import set_live_notional_ceiling
+
+    sid = strategy_id.strip()
+    with get_db() as conn:
+        row = conn.execute("SELECT id, symbol FROM strategies WHERE id = ?", (sid,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    try:
+        entry = set_live_notional_ceiling(
+            sid, body.ceiling_usd, asset=row["symbol"], actor="ui",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "strategy_id": sid, "ceiling": entry or None}
 
 @router.patch("/api/lifecycle/strategies/{strategy_id}/params")
 def update_strategy_default_params(strategy_id: str, body: PatchResultParamsBody):

@@ -1731,6 +1731,10 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "code_strategy_requires_approval": False,
     "auto_approve_code_edits": False,
     "auto_approve_promotions": False,
+    # GO-LIVE-1: even with auto_approve_promotions/promotion_mode=auto, a
+    # paper→live promotion requires an explicit operator confirmation with a
+    # notional ceiling — unless this is deliberately flipped on (dangerous).
+    "allow_auto_live_promotion": False,
     # When a challenger materially beats an incumbent occupying a capital slot,
     # auto-apply the dethrone so the slot frees without operator action. Default
     # ON for autonomous operation — reversible (the incumbent is demoted
@@ -2591,9 +2595,36 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             ("live_max_total_open_risk_pct", 5.0),
             ("live_max_asset_exposure_pct", 150.0),
             ("live_max_group_exposure_pct", 200.0),
+            # SIZE-CAP-1: per-order hard ceilings (forven.exchange.risk).
+            ("live_hard_max_per_trade_risk_pct", 2.0),
+            ("live_hard_max_order_notional_pct", 100.0),
+            # BOOK-BUDGET-1: per-wallet gross-notional cap (forven.exchange.risk).
+            ("live_max_book_notional_pct", 100.0),
         ):
             if _pb_key in payload:
                 updates[_pb_key] = _coerce_float(payload.get(_pb_key), _coerce_float(updates.get(_pb_key), _pb_default))
+        # EQ-BASIS-1: whether the master wallet counts toward the live equity
+        # basis when direction books are enabled (forven.daemon).
+        if "live_equity_include_master" in payload:
+            updates["live_equity_include_master"] = _coerce_bool(
+                payload.get("live_equity_include_master"),
+                bool(updates.get("live_equity_include_master", False)),
+            )
+        # LIQ-1: order-time liquidity guard (forven.exchange.liquidity).
+        if "live_liquidity_guard_enabled" in payload:
+            updates["live_liquidity_guard_enabled"] = _coerce_bool(
+                payload.get("live_liquidity_guard_enabled"),
+                bool(updates.get("live_liquidity_guard_enabled", True)),
+            )
+        for _lq_key, _lq_default in (
+            ("live_min_daily_volume_usd", 5_000_000.0),
+            ("live_max_spread_bps", 50.0),
+            ("live_book_depth_window_bps", 100.0),
+            ("live_max_book_participation_pct", 25.0),
+            ("live_max_price_impact_bps", 50.0),
+        ):
+            if _lq_key in payload:
+                updates[_lq_key] = _coerce_float(payload.get(_lq_key), _coerce_float(updates.get(_lq_key), _lq_default))
         if "strict_regime_gating" in payload:
             updates["strict_regime_gating"] = _coerce_bool(payload.get("strict_regime_gating"), updates["strict_regime_gating"])
         if "regime_min_confidence" in payload:
@@ -2750,6 +2781,8 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["auto_approve_code_edits"] = _coerce_bool(payload.get("auto_approve_code_edits"), updates.get("auto_approve_code_edits", False))
         if "auto_approve_promotions" in payload:
             updates["auto_approve_promotions"] = _coerce_bool(payload.get("auto_approve_promotions"), updates.get("auto_approve_promotions", False))
+        if "allow_auto_live_promotion" in payload:
+            updates["allow_auto_live_promotion"] = _coerce_bool(payload.get("allow_auto_live_promotion"), updates.get("allow_auto_live_promotion", False))
         if "auto_approve_dethrone" in payload:
             updates["auto_approve_dethrone"] = _coerce_bool(payload.get("auto_approve_dethrone"), updates.get("auto_approve_dethrone", True))
         if "canonical_auto_deploy_enabled" in payload:

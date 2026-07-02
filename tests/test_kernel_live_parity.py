@@ -38,6 +38,9 @@ def test_live_kernel_execution_can_be_disabled(forven_db):
 def test_kernel_open_live_places_real_order(monkeypatch):
     calls = {}
     monkeypatch.setattr("forven.exchange.risk.can_open", lambda *a, **k: (True, 0.01, "ok"))
+    # Budget/hard-cap admission is covered by test_live_portfolio_budget; this
+    # test is about order routing, and 0.5-fraction sizing exceeds the default caps.
+    monkeypatch.setattr("forven.exchange.risk.check_live_portfolio_budget", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(scanner, "_open_trade_db", lambda *a, **k: "LIVE1")
     monkeypatch.setattr(scanner, "register", lambda *a, **k: None)
     # PORT-1: the portfolio-budget gate fails closed without an equity snapshot.
@@ -219,6 +222,10 @@ def test_kernel_refresh_live_respects_manual_stop(monkeypatch):
 def test_kernel_open_live_trailing_only_derives_initial_stop(monkeypatch):
     calls = {}
     monkeypatch.setattr("forven.exchange.risk.can_open", lambda *a, **k: (True, 0.01, "ok"))
+    # Budget/hard-cap admission is covered by test_live_portfolio_budget; this
+    # test is about the trailing-stop derivation, and 0.5-fraction sizing
+    # exceeds the default caps.
+    monkeypatch.setattr("forven.exchange.risk.check_live_portfolio_budget", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(scanner, "_open_trade_db", lambda *a, **k: "LIVE2")
     monkeypatch.setattr(scanner, "register", lambda *a, **k: None)
     # PORT-1: the portfolio-budget gate fails closed without an equity snapshot.
