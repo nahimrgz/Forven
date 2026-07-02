@@ -1,5 +1,33 @@
 # Data Manager Overhaul — Review & Plan (2026-07-01)
 
+> **Status 2026-07-02 (branch fable-updates):**
+> - **Phase 0** — SHIPPED (hardening run: dead dry-run guard, exclude_streams,
+>   CSV offload, writer locks, fsync, sim pump, missing-stream logging).
+> - **Phase 2** — SHIPPED (tail-append storage engine; all readers tail-aware).
+> - **Phase 1** — SHIPPED except the apply step: candle fetch is now
+>   perp-canonical (binanceusdm with spot fallback) in both the lake fetch and
+>   the scanner/price feed; `forven_market` metadata + splice write-guard live;
+>   `scripts/reconcile_market_mix.py` reports/rebuilds mixed series.
+>   **OPERATOR ACTION:** run `python scripts/reconcile_market_mix.py` (dry-run),
+>   then `--apply` with the backend stopped, then re-baseline. First dry-run
+>   confirmed BTC-USDT 1h mixed (spot metadata, ~4.6bps probe divergence).
+> - **Phase 3** — SHIPPED: unwired scaffolding deleted (validation,
+>   microstructure, onchain, derivatives, registry, hub.trades/orderbook,
+>   unused error types), CcxtSource capabilities truthful, candle-path circuit
+>   breaker (per-exchange, NoData-benign). NOT flipped: `data_engine.enabled`
+>   default stays OFF until engine-on parity runs in CI.
+> - **Phase 4** — SHIPPED: ingestion runs + backfill state survive restarts
+>   (KV), interrupted runs surface as failed, BV backfill has per-symbol
+>   progress + cancel endpoint, `/api/data/versions` is real (revision-log
+>   restatement history), data_collector auto-recovery actually sweeps,
+>   CRITICAL data checks page via notifications.
+> - **Phase 5** — completeness-aware catch-up planning SHIPPED (gappy-but-
+>   current series get a "gaps" task). Decisions: liquidations collector stays
+>   env-gated OFF (endpoint dead; WS forceOrder deferred until a consumer
+>   exists); BTC dominance stays snapshot-only (historical needs CoinGecko
+>   Pro); LSR/taker 1h period kept (no consumer demand); tick capture deleted
+>   with the scaffolding, resurrect from git when a strategy consumes it.
+
 Full review of the market-data layer (~9,700 lines: `forven/data.py`, `forven/data_manager.py`,
 `forven/dataeng/*`, `forven/binance_vision.py`, `forven/api_domains/data.py`, `forven/routers/data.py`,
 the `/data` frontend page, scheduler data jobs, health-monitor data checks, and the consumer side —

@@ -1665,20 +1665,38 @@ def fetch_candles(
     if is_sim_active():
         end_ms = int(get_now().timestamp() * 1000)
 
-        # Try pre-fetch cache first
+        # Try pre-fetch cache first — but, mirroring the live path's RESTART-1
+        # coverage gate, only serve it when it actually COVERS the request. The
+        # sim branch used to return ANY non-empty cache, so an under-prefetched
+        # window silently truncated the sim frame (short indicator warmups,
+        # kernel replays losing exit enforcement).
         from forven.sim.data_pump import get_cached_candles
         cached = get_cached_candles(normalized_coin, resolved_interval, end_ms, required_bars)
-        if cached is not None and not cached.empty:
+        if cached is not None and not cached.empty and len(cached) >= required_bars:
             return cached
 
-        # Fallback to API if cache miss
-        df = fetch_hyperliquid_candles(
-            normalized_coin,
-            bars=required_bars,
-            interval=resolved_interval,
-            end_time=end_ms,
-            clean=True,
-        )
+        # Cache miss or short cache: fetch the full window at the sim's
+        # virtual end time. If the venue can't serve more than the cache had,
+        # fall back to the (short) cache rather than failing the scan.
+        try:
+            df = fetch_hyperliquid_candles(
+                normalized_coin,
+                bars=required_bars,
+                interval=resolved_interval,
+                end_time=end_ms,
+                clean=True,
+            )
+        except Exception as exc:
+            if cached is not None and not cached.empty:
+                log.warning(
+                    "[%s] sim cache short (%d/%d bars @ %s) and direct fetch failed (%s) — "
+                    "serving the truncated cache",
+                    normalized_coin, len(cached), required_bars, resolved_interval, exc,
+                )
+                return cached
+            raise
+        if cached is not None and not cached.empty and len(df) <= len(cached):
+            return cached
         return df
 
     cached_rows, cache_age = load_candle_snapshot(normalized_coin, interval=resolved_interval)

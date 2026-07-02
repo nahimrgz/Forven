@@ -213,16 +213,6 @@ class DataHub:
             "sources": source_health,
         }
 
-    def trades(self, symbol: str, *, start: object | None = None, end: object | None = None, source: str = "binance") -> pd.DataFrame:
-        from forven.dataeng.microstructure import read_micro_rows
-
-        return read_micro_rows("trades", symbol, start=start, end=end, source=source)
-
-    def orderbook(self, symbol: str, *, start: object | None = None, end: object | None = None, source: str = "binance") -> pd.DataFrame:
-        from forven.dataeng.microstructure import read_micro_rows
-
-        return read_micro_rows("orderbook", symbol, start=start, end=end, source=source)
-
     def _legacy_candles_path(self, fs_symbol: str, timeframe: str) -> Path:
         from forven.data import parquet_path
 

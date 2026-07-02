@@ -1787,12 +1787,18 @@ class DataManager:
         self,
         symbol: str | None = None,
         streams: tuple = ("ohlcv", "funding", "oi"),
+        *,
+        progress_cb=None,
+        cancel_event=None,
     ) -> dict:
         """Bulk-backfill historical data from Binance Vision.
 
         If symbol is None, backfills all symbols discovered from the data/ohlcv/ directory.
         streams controls which stream types are backfilled.
-        Returns a summary dict.
+        ``progress_cb(done, total, current_symbol)`` is invoked before each
+        symbol; ``cancel_event`` (threading.Event) is checked between symbols
+        for a cooperative stop. Returns a summary dict (with ``cancelled``
+        set when stopped early).
         """
         from forven.data import DATA_DIR, symbol_to_fs
 
@@ -1806,7 +1812,17 @@ class DataManager:
             )
 
         summary: dict = {}
-        for fs_sym in fs_symbols:
+        total = len(fs_symbols)
+        for idx, fs_sym in enumerate(fs_symbols):
+            if cancel_event is not None and cancel_event.is_set():
+                summary["cancelled"] = True
+                log.info("BV backfill cancelled after %d/%d symbols", idx, total)
+                break
+            if progress_cb is not None:
+                try:
+                    progress_cb(idx, total, fs_sym)
+                except Exception:
+                    pass
             bv_symbol = bv_client.fs_to_bv(fs_sym)
             summary[fs_sym] = {}
             if "ohlcv" in streams:

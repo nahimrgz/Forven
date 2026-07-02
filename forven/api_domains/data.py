@@ -1011,6 +1011,86 @@ def get_quality_report(symbol: str, timeframe: str) -> dict:
     return _quality_report_from({"symbol": fs_symbol, "timeframe": timeframe}, q, 0)
 
 
+def get_dataset_versions(symbol: str | None = None, timeframe: str | None = None, limit: int = 50) -> list[dict]:
+    """Dataset version history — REAL, backed by the point-in-time revision log.
+
+    The frontend has always called /data/versions; no server route existed, so
+    it 404'd into a client-side reconstruction with checksum=None. Rows:
+    - one "current" row per series (live snapshot; checksum included only for
+      a single-series query — hashing every file on the unfiltered call is a
+      full-lake read);
+    - one row per RESTATEMENT event (bars superseded at the same observed_at),
+      from the append-only revision lake.
+    """
+    from forven.data import compute_checksum, scan_datasets, symbol_to_fs
+    from forven.dataeng.revisions import read_revisions, revisions_root
+
+    fs_filter = symbol_to_fs(symbol) if symbol else None
+    single_series = bool(fs_filter and timeframe)
+    rows: list[dict] = []
+
+    for ds in scan_datasets():
+        ds_symbol = str(ds.get("symbol") or "")
+        ds_tf = str(ds.get("timeframe") or "")
+        if fs_filter and ds_symbol != fs_filter:
+            continue
+        if timeframe and ds_tf != timeframe:
+            continue
+        rows.append(
+            {
+                "id": f"current-{ds_symbol}-{ds_tf}",
+                "symbol": _to_ui_symbol(ds_symbol),
+                "timeframe": ds_tf,
+                "source": ds.get("source") or "local",
+                "row_count": int(ds.get("row_count") or 0),
+                "start_ts": ds.get("start_ts"),
+                "end_ts": ds.get("end_ts"),
+                "checksum": compute_checksum(ds_symbol, ds_tf) if single_series else None,
+                "ingestion_run_id": None,
+                "created_at": ds.get("end_ts") or ds.get("start_ts") or _now(),
+            }
+        )
+
+    # Restatement events: enumerate only series that HAVE a revision log.
+    root = revisions_root()
+    if root.exists():
+        for sym_dir in sorted(root.iterdir()):
+            if not sym_dir.is_dir():
+                continue
+            if fs_filter and sym_dir.name != fs_filter:
+                continue
+            for rev_file in sorted(sym_dir.glob("*.parquet")):
+                rev_tf = rev_file.stem
+                if timeframe and rev_tf != timeframe:
+                    continue
+                try:
+                    revisions = read_revisions(sym_dir.name, rev_tf)
+                except Exception:
+                    continue
+                if revisions is None or revisions.empty:
+                    continue
+                grouped = revisions.groupby("observed_at")
+                for observed_at, group in grouped:
+                    ts = pd.to_datetime(group["timestamp"], utc=True, errors="coerce").dropna()
+                    rows.append(
+                        {
+                            "id": f"rev-{sym_dir.name}-{rev_tf}-{observed_at}",
+                            "symbol": _to_ui_symbol(sym_dir.name),
+                            "timeframe": rev_tf,
+                            "source": "restatement",
+                            "row_count": int(len(group)),
+                            "start_ts": ts.min().isoformat() if len(ts) else None,
+                            "end_ts": ts.max().isoformat() if len(ts) else None,
+                            "checksum": None,
+                            "ingestion_run_id": None,
+                            "created_at": str(observed_at),
+                        }
+                    )
+
+    rows.sort(key=lambda row: core._to_datetime_sort_key(row.get("created_at")), reverse=True)
+    return rows[: max(1, int(limit or 50))]
+
+
 def get_data_health():
     """Return merged DB/parquet health + per-stream freshness snapshot.
 
@@ -1921,46 +2001,118 @@ def get_active_symbols_with_reasons() -> list[dict]:
 
 
 _backfill_lock = threading.Lock()
+_backfill_cancel = threading.Event()
+_BACKFILL_STATE_KV_KEY = "data:backfill_state"
 _backfill_state: dict = {
     "running": False,
     "last_started_at": None,
     "last_result": None,
     "last_error": None,
+    "progress": None,
+    "cancel_requested": False,
 }
+_backfill_state_loaded = False
+
+
+def _load_backfill_state_locked() -> None:
+    """Seed last_result/last_error from KV once per process so the status
+    endpoint survives a restart (it was a process-local dict that reset to
+    empty). ``running`` is never restored — a restart kills the thread."""
+    global _backfill_state_loaded
+    if _backfill_state_loaded:
+        return
+    _backfill_state_loaded = True
+    try:
+        from forven.db import kv_get
+
+        saved = kv_get(_BACKFILL_STATE_KV_KEY, None)
+        if isinstance(saved, dict):
+            for key in ("last_started_at", "last_result", "last_error"):
+                if _backfill_state.get(key) is None:
+                    _backfill_state[key] = saved.get(key)
+    except Exception:
+        pass
+
+
+def _persist_backfill_state_locked() -> None:
+    try:
+        from forven.db import kv_set_best_effort
+
+        kv_set_best_effort(
+            _BACKFILL_STATE_KV_KEY,
+            {
+                "last_started_at": _backfill_state.get("last_started_at"),
+                "last_result": _backfill_state.get("last_result"),
+                "last_error": _backfill_state.get("last_error"),
+            },
+        )
+    except Exception:
+        pass
 
 
 def get_backfill_status() -> dict:
-    """Return current backfill state."""
+    """Return current backfill state (running flag, per-symbol progress,
+    last result/error — the latter restart-surviving via KV)."""
     with _backfill_lock:
+        _load_backfill_state_locked()
         return dict(_backfill_state)
+
+
+def post_cancel_backfill() -> dict:
+    """Request a cooperative stop of the running BV backfill (takes effect
+    between symbols)."""
+    with _backfill_lock:
+        if not _backfill_state["running"]:
+            raise HTTPException(status_code=409, detail="No backfill running")
+        _backfill_cancel.set()
+        _backfill_state["cancel_requested"] = True
+    return {"status": "cancelling"}
 
 
 def post_trigger_backfill(symbol: str | None = None) -> dict:
     """Trigger a Binance Vision backfill in a background thread."""
-    global _backfill_state
     with _backfill_lock:
         if _backfill_state["running"]:
             raise HTTPException(status_code=409, detail="Backfill already running")
-        _backfill_state = {
-            "running": True,
-            "last_started_at": _now(),
-            "last_result": None,
-            "last_error": None,
-        }
+        _load_backfill_state_locked()
+        _backfill_cancel.clear()
+        _backfill_state.update(
+            {
+                "running": True,
+                "last_started_at": _now(),
+                "last_result": None,
+                "last_error": None,
+                "progress": None,
+                "cancel_requested": False,
+            }
+        )
+
+    def _on_progress(done: int, total: int, current_symbol: str) -> None:
+        with _backfill_lock:
+            _backfill_state["progress"] = {
+                "done": int(done),
+                "total": int(total),
+                "current_symbol": current_symbol,
+            }
 
     def _run() -> None:
-        global _backfill_state
         try:
             from forven.data_manager import data_manager
-            result = data_manager.backfill(symbol=symbol)
+            result = data_manager.backfill(
+                symbol=symbol, progress_cb=_on_progress, cancel_event=_backfill_cancel
+            )
             with _backfill_lock:
                 _backfill_state["running"] = False
                 _backfill_state["last_result"] = result
+                _backfill_state["progress"] = None
+                _persist_backfill_state_locked()
         except Exception as exc:
             log.warning("post_trigger_backfill failed: %s", exc)
             with _backfill_lock:
                 _backfill_state["running"] = False
                 _backfill_state["last_error"] = str(exc)
+                _backfill_state["progress"] = None
+                _persist_backfill_state_locked()
 
     threading.Thread(target=_run, daemon=True, name="bv-backfill-ui").start()
     return {"status": "started", "symbol": symbol}

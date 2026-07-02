@@ -404,6 +404,45 @@ def market_for_source(source: str) -> str:
     return _SOURCE_MARKET.get(str(source or "").strip().lower(), "unknown")
 
 
+_market_mismatch_logged: set[str] = set()
+
+
+def _warn_market_mismatch(symbol: str, timeframe: str, incoming_source: str) -> None:
+    """Soft guard: surface (once per series per process) a write whose market
+    disagrees with the stored series' recorded market. Deliberately NOT a
+    rejection during the Phase-1 transition — rejecting would stop data flow
+    for every legacy spot series the moment perp-canonical fetch lands. The
+    reconcile tool (scripts/reconcile_market_mix.py) is the fix."""
+    incoming = market_for_source(incoming_source)
+    if incoming == "unknown":
+        return
+    try:
+        existing = get_dataset_market(symbol, timeframe)
+    except Exception:
+        return
+    if existing in (None, "", "unknown") or existing == incoming:
+        return
+    key = f"{symbol_to_fs(symbol)}::{timeframe}"
+    if key in _market_mismatch_logged:
+        return
+    _market_mismatch_logged.add(key)
+    log.warning(
+        "MARKET SPLICE: %s %s stored as %s but incoming write is %s (source=%s) — "
+        "series mixes venues; run scripts/reconcile_market_mix.py",
+        symbol, timeframe, existing, incoming, incoming_source,
+    )
+    _log_data_action(
+        "market_mismatch",
+        f"Market splice on {symbol_to_fs(symbol)} {timeframe}: stored {existing}, incoming {incoming}",
+        level="warning",
+        symbol=symbol_to_fs(symbol),
+        timeframe=timeframe,
+        stored_market=existing,
+        incoming_market=incoming,
+        source=incoming_source,
+    )
+
+
 def get_dataset_market(symbol: str, timeframe: str) -> str | None:
     """Recorded market (spot/perp/unknown) of a stored series from the parquet
     ``forven_market`` metadata; None when absent (pre-stamping files)."""
@@ -559,6 +598,7 @@ def _append_bars_locked(
         combined = _normalize_ohlcv_frame(pd.concat([tail_frame, frame], ignore_index=True))
     else:
         combined = frame
+    _warn_market_mismatch(symbol, timeframe, source)
     _write_lake_parquet(combined, tail, symbol=symbol, timeframe=timeframe, source=source)
     _invalidate_catalog_cache()
 
@@ -683,6 +723,7 @@ def load_parquet(symbol: str, timeframe: str, *, as_of: object | None = None) ->
 
 def save_parquet(df: pd.DataFrame, symbol: str, timeframe: str, source: str = "ccxt") -> None:
     path = parquet_path(symbol, timeframe)
+    _warn_market_mismatch(symbol, timeframe, source)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     out = _normalize_ohlcv_frame(df)
@@ -1287,13 +1328,15 @@ def get_exchange(exchange_id: str):
         exchange_cls = getattr(ccxt, normalized, None)
         if exchange_cls is None:
             raise ValueError(f"Unsupported exchange: {exchange_id}")
-        exchange = exchange_cls(
-            {
-                "enableRateLimit": True,
-                "timeout": 30000,  # 30s — prevent indefinite hangs that leak threads
-                "options": {"defaultType": "spot"},
-            }
-        )
+        config: dict[str, Any] = {
+            "enableRateLimit": True,
+            "timeout": 30000,  # 30s — prevent indefinite hangs that leak threads
+        }
+        # Derivative-native exchange classes (binanceusdm/binancecoinm) must not
+        # be forced to defaultType spot — they have no spot markets.
+        if normalized not in ("binanceusdm", "binancecoinm"):
+            config["options"] = {"defaultType": "spot"}
+        exchange = exchange_cls(config)
         _exchange_cache[normalized] = exchange
         return exchange
 
@@ -1407,6 +1450,58 @@ def _build_dataset_record(
         "asset_class": asset_class,
         "market_type": dataset_market_type(asset_class),
     }
+
+
+# ---------------------------------------------------------------------------
+# Candle-path circuit breaker. The dataeng SourceRegistry breaker only ever
+# guarded the derivatives fetch — the MAIN candle path retried a dead venue
+# 5x with up-to-60s sleeps per symbol per cycle. One breaker per resolved
+# exchange id (== per (source, candles)): after 3 consecutive failed fetches
+# the venue fails fast, with a half-open retrial after 5 minutes. An empty
+# window is NOT a failure (NoData is benign, mirroring the derivatives fix).
+# ---------------------------------------------------------------------------
+
+_candle_breakers_lock = threading.Lock()
+_candle_breakers: dict[str, Any] = {}
+
+
+def _candle_breaker(exchange_id: str):
+    from forven.dataeng.source import CircuitBreaker
+
+    key = str(exchange_id or "binance").strip().lower()
+    with _candle_breakers_lock:
+        breaker = _candle_breakers.get(key)
+        if breaker is None:
+            breaker = CircuitBreaker(failure_threshold=3, recovery_timeout_seconds=300.0)
+            _candle_breakers[key] = breaker
+        return breaker
+
+
+def _resolve_ohlcv_target(exchange_id: str, symbol: str) -> tuple[Any, str, str]:
+    """(exchange, ccxt_symbol, source_id) for an OHLCV fetch.
+
+    Perp-canonical (data-manager overhaul Phase 1): for the default "binance"
+    exchange, a USDT/USDC pair with a listed USD-M linear perp fetches the
+    PERP klines (binanceusdm, "BTC/USDT:USDT") — matching the HL-perp
+    execution venue and the Binance Vision futures history that deep-backfills
+    the same series. Spot is the automatic fallback for bases without a perp.
+    Explicit non-binance exchange_ids are honoured unchanged.
+    """
+    normalized = str(exchange_id or "binance").strip().lower() or "binance"
+    ccxt_symbol = symbol_to_ccxt(symbol)
+    if normalized == "binance":
+        parts = ccxt_symbol.split("/")
+        if len(parts) == 2 and parts[1] in ("USDT", "USDC"):
+            perp_symbol = f"{ccxt_symbol}:{parts[1]}"
+            try:
+                if perp_symbol in _cached_markets("binanceusdm"):
+                    return get_exchange("binanceusdm"), perp_symbol, "binanceusdm"
+            except Exception as exc:
+                log.warning(
+                    "USD-M market resolution failed for %s (falling back to spot): %s",
+                    ccxt_symbol, exc,
+                )
+    return get_exchange(normalized), ccxt_symbol, normalized
 
 
 def _footer_dataset_record(fs_symbol: str, timeframe: str, source: str) -> dict[str, Any]:
@@ -1544,9 +1639,14 @@ def fetch_ohlcv_chunked(
             progress_callback=progress_callback,
         )
 
-    exchange = get_exchange(exchange_id)
-    ccxt_symbol = symbol_to_ccxt(symbol)
     fs_symbol = symbol_to_fs(symbol)
+    exchange, ccxt_symbol, exchange_id = _resolve_ohlcv_target(exchange_id, symbol)
+    breaker = _candle_breaker(exchange_id)
+    if not breaker.allow_request():
+        raise RuntimeError(
+            f"candle source {exchange_id} circuit is open after repeated failures; "
+            f"failing fast for {ccxt_symbol} {timeframe} (half-open retrial in <=5min)"
+        )
     now_ms = int(time.time() * 1000)
     tf_ms = _timeframe_to_ms(timeframe)
 
@@ -1564,30 +1664,38 @@ def fetch_ohlcv_chunked(
 
     end_ms_to_use = until_ms if until_ms is not None else (now_ms + tf_ms)
 
-    if all_available:
-        if snapshot is not None and not snapshot.empty:
-            earliest = _to_ms(snapshot["timestamp"].iloc[0])
-            latest = _to_ms(snapshot["timestamp"].iloc[-1])
-            if latest + tf_ms <= end_ms_to_use:
-                fetched_blocks.append(
-                    _fetch_range(exchange, ccxt_symbol, timeframe, latest + tf_ms, end_ms_to_use, progress_callback=progress_callback)
-                )
-            if earliest - tf_ms > 0:
-                fetched_blocks.append(
-                    _fetch_range(exchange, ccxt_symbol, timeframe, 0, earliest - tf_ms, progress_callback=progress_callback)
-                )
+    try:
+        if all_available:
+            if snapshot is not None and not snapshot.empty:
+                earliest = _to_ms(snapshot["timestamp"].iloc[0])
+                latest = _to_ms(snapshot["timestamp"].iloc[-1])
+                if latest + tf_ms <= end_ms_to_use:
+                    fetched_blocks.append(
+                        _fetch_range(exchange, ccxt_symbol, timeframe, latest + tf_ms, end_ms_to_use, progress_callback=progress_callback)
+                    )
+                if earliest - tf_ms > 0:
+                    fetched_blocks.append(
+                        _fetch_range(exchange, ccxt_symbol, timeframe, 0, earliest - tf_ms, progress_callback=progress_callback)
+                    )
+            else:
+                fetched_blocks.append(_fetch_range(exchange, ccxt_symbol, timeframe, 0, end_ms_to_use, progress_callback=progress_callback))
+        elif since_ms is not None:
+            fetched_blocks.append(_fetch_range(exchange, ccxt_symbol, timeframe, int(since_ms), end_ms_to_use, progress_callback=progress_callback))
         else:
-            fetched_blocks.append(_fetch_range(exchange, ccxt_symbol, timeframe, 0, end_ms_to_use, progress_callback=progress_callback))
-    elif since_ms is not None:
-        fetched_blocks.append(_fetch_range(exchange, ccxt_symbol, timeframe, int(since_ms), end_ms_to_use, progress_callback=progress_callback))
-    else:
-        effective_limit = max(1, int(limit or 1000))
-        if effective_limit <= CHUNK_LIMIT:
-            rows = _fetch_ohlcv_once(exchange, ccxt_symbol, timeframe, None, effective_limit)
-            fetched_blocks.append(_rows_to_frame(rows))
-        else:
-            start_ms = _estimate_limit_window_start(effective_limit, timeframe)
-            fetched_blocks.append(_fetch_range(exchange, ccxt_symbol, timeframe, start_ms, end_ms_to_use, progress_callback=progress_callback))
+            effective_limit = max(1, int(limit or 1000))
+            if effective_limit <= CHUNK_LIMIT:
+                rows = _fetch_ohlcv_once(exchange, ccxt_symbol, timeframe, None, effective_limit)
+                fetched_blocks.append(_rows_to_frame(rows))
+            else:
+                start_ms = _estimate_limit_window_start(effective_limit, timeframe)
+                fetched_blocks.append(_fetch_range(exchange, ccxt_symbol, timeframe, start_ms, end_ms_to_use, progress_callback=progress_callback))
+    except Exception:
+        # A venue error (network/HTTP/exchange) counts against the breaker so a
+        # dead venue fails fast after 3 strikes instead of paying the full
+        # retry ladder per symbol. Empty windows never reach here (not errors).
+        breaker.record_failure()
+        raise
+    breaker.record_success()
 
     fetched = merge_and_dedup(None, pd.concat(fetched_blocks, ignore_index=True) if fetched_blocks else None)
 
@@ -1636,14 +1744,68 @@ def fetch_ohlcv_chunked(
     base["bars_new"] = int(max(0, len(merged) - (len(current) if current is not None else 0)))
     return base
 
+# Ingestion runs survive a backend restart via a compact KV snapshot: runs
+# that were pending/running when the process died are surfaced as FAILED
+# ("backend restarted") instead of vanishing — the frontend used to guess at
+# this with a "your queued run was lost, click again" recovery path.
+_INGESTION_RUNS_KV_KEY = "data:ingestion_runs"
+_INGESTION_RUNS_PERSIST_CAP = 100
+_ingestion_runs_loaded = False
+
+
+def _load_ingestion_runs_locked() -> None:
+    """Seed the in-memory run store from KV once per process. Caller holds
+    _ingestion_runs_lock."""
+    global _ingestion_runs_loaded
+    if _ingestion_runs_loaded:
+        return
+    _ingestion_runs_loaded = True
+    try:
+        from forven.db import kv_get
+
+        saved = kv_get(_INGESTION_RUNS_KV_KEY, [])
+        if not isinstance(saved, list):
+            return
+        for run in saved:
+            if not isinstance(run, dict) or not run.get("id"):
+                continue
+            if run.get("status") in ("pending", "running"):
+                run = {
+                    **run,
+                    "status": "failed",
+                    "error": "backend restarted mid-run",
+                    "completed_at": _now_iso(),
+                }
+            _ingestion_runs.setdefault(str(run["id"]), run)
+    except Exception:
+        pass
+
+
+def _persist_ingestion_runs_locked() -> None:
+    """Best-effort compact KV snapshot (most recent runs). Caller holds
+    _ingestion_runs_lock; a DB hiccup must never break the ingestion path."""
+    try:
+        from forven.db import kv_set_best_effort
+
+        runs = sorted(
+            (run for run in _ingestion_runs.values() if isinstance(run, dict)),
+            key=lambda run: str(run.get("started_at") or ""),
+        )[-_INGESTION_RUNS_PERSIST_CAP:]
+        kv_set_best_effort(_INGESTION_RUNS_KV_KEY, runs)
+    except Exception:
+        pass
+
+
 def get_active_ingestion_runs():
     with _ingestion_runs_lock:
+        _load_ingestion_runs_locked()
         return list(_ingestion_runs.values())
 
 
 def get_ingestion_run(run_id: str) -> dict | None:
     """Keyed lookup of one ingestion run (copy), or None."""
     with _ingestion_runs_lock:
+        _load_ingestion_runs_locked()
         run = _ingestion_runs.get(str(run_id))
         return dict(run) if isinstance(run, dict) else None
 
@@ -1692,8 +1854,10 @@ def submit_ingestion(
         "error": None
     }
     with _ingestion_runs_lock:
+        _load_ingestion_runs_locked()
         _ingestion_runs[run_id] = run
         _prune_ingestion_runs_locked()
+        _persist_ingestion_runs_locked()
 
     def _worker():
         with _ingestion_runs_lock:
@@ -1720,11 +1884,13 @@ def submit_ingestion(
                 _ingestion_runs[run_id]["bars_fetched"] = res.get("bars_fetched", 0)
                 _ingestion_runs[run_id]["bars_new"] = res.get("bars_new", 0)
                 _ingestion_runs[run_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _persist_ingestion_runs_locked()
         except Exception as e:
             with _ingestion_runs_lock:
                 _ingestion_runs[run_id]["status"] = "failed"
                 _ingestion_runs[run_id]["error"] = str(e)
                 _ingestion_runs[run_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _persist_ingestion_runs_locked()
 
     THREAD_POOL.submit(_worker)
     return run

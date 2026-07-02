@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -1086,7 +1087,20 @@ async def _attempt_recovery(state: HealthState, name: str, status: ComponentStat
             success = bool(result.get("recovered", 0))
 
         elif name == "data_collector":
-            action = "Triggered data refetch (alert only for now)"
+            # Actually trigger a keep-alive sweep (this was an alert-only stub
+            # that reported success without doing anything). Bounded to the 8
+            # stalest pairs — same budget as the scheduled job — and run in a
+            # daemon thread so recovery never blocks the monitor loop.
+            from forven.data_manager import data_manager
+
+            def _refetch() -> None:
+                try:
+                    data_manager.collect_ohlcv(max_pairs_per_run=8)
+                except Exception as exc:
+                    log.warning("data_collector recovery sweep failed: %s", exc)
+
+            threading.Thread(target=_refetch, daemon=True, name="data-collector-recovery").start()
+            action = "Triggered OHLCV keep-alive sweep (8 stalest pairs)"
             success = True
 
         elif name == "lab_worker":

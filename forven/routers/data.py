@@ -154,6 +154,13 @@ def get_quality_report(symbol: str, timeframe: str):
     return data_domain.get_quality_report(symbol=symbol, timeframe=timeframe)
 
 
+@router.get("/api/data/versions")
+def get_dataset_versions(symbol: str | None = None, timeframe: str | None = None, limit: int = 50):
+    """Dataset version history backed by the point-in-time revision log. The
+    frontend has always called this route; it never existed server-side."""
+    return data_domain.get_dataset_versions(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
 @router.get("/api/data/health")
 def get_data_health():
     return data_domain.get_data_health()
@@ -384,6 +391,12 @@ def trigger_backfill(symbol: str | None = None):
 @router.get("/api/data/backfill/status")
 def get_backfill_status():
     return data_domain.get_backfill_status()
+
+
+@router.post("/api/data/backfill/cancel")
+def cancel_backfill():
+    """Cooperatively stop the running Binance Vision backfill (between symbols)."""
+    return data_domain.post_cancel_backfill()
 
 
 @router.get("/api/data/coverage")
