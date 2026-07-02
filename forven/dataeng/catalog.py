@@ -144,6 +144,19 @@ class Catalog:
             )
             con.execute(
                 """
+                CREATE TABLE IF NOT EXISTS symbol_registry (
+                    symbol VARCHAR PRIMARY KEY,          -- filesystem form (BTC-USDT)
+                    market VARCHAR NOT NULL,             -- perp / spot
+                    status VARCHAR NOT NULL,             -- active / delisted
+                    inception_ts TIMESTAMPTZ,            -- venue onboard date / first bar
+                    delist_ts TIMESTAMPTZ,               -- last bar when no active market remains
+                    quote_volume_24h DOUBLE,             -- liquidity rank input
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            con.execute(
+                """
                 INSERT OR REPLACE INTO meta (key, value)
                 VALUES ('schema_version', ?)
                 """,
@@ -200,6 +213,47 @@ class Catalog:
         for row in rows:
             self.upsert_series_coverage(row)
         return rows
+
+    def upsert_symbol_registry(
+        self,
+        symbol: str,
+        *,
+        market: str,
+        status: str,
+        inception_ts: str | None = None,
+        delist_ts: str | None = None,
+        quote_volume_24h: float | None = None,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO symbol_registry (
+                    symbol, market, status, inception_ts, delist_ts,
+                    quote_volume_24h, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, now())
+                """,
+                [symbol, market, status, inception_ts, delist_ts, quote_volume_24h],
+            )
+
+    def list_symbol_registry(self) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT symbol, market, status, inception_ts, delist_ts, quote_volume_24h
+                FROM symbol_registry
+                ORDER BY symbol
+                """
+            ).fetchall()
+        keys = ["symbol", "market", "status", "inception_ts", "delist_ts", "quote_volume_24h"]
+        result: list[dict[str, Any]] = []
+        for values in rows:
+            row = dict(zip(keys, values, strict=True))
+            row["inception_ts"] = _utc_iso(row["inception_ts"])
+            row["delist_ts"] = _utc_iso(row["delist_ts"])
+            row["quote_volume_24h"] = float(row["quote_volume_24h"]) if row["quote_volume_24h"] is not None else None
+            result.append(row)
+        return result
 
 
 def _read_parquet_bounds(path: Path) -> tuple[str | None, str | None, int]:

@@ -1366,6 +1366,16 @@ def execute_data_engine_catchup(
     except Exception as exc:  # noqa: BLE001
         log.warning("Data Engine catch-up: universe coverage ensure skipped: %s", exc)
 
+    # Keep the symbol registry current (new listings, delistings) on the same
+    # cadence — one markets+tickers call per 30-min run. Best-effort: the
+    # drain must never fail on a registry hiccup.
+    try:
+        from forven.dataeng.universe import refresh_symbol_registry
+
+        refresh_symbol_registry()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Data Engine catch-up: symbol registry refresh skipped: %s", exc)
+
     from forven.dataeng.catalog import Catalog
     from forven.dataeng.catchup import CatchUpPlanner
 
@@ -2116,6 +2126,89 @@ def post_trigger_backfill(symbol: str | None = None) -> dict:
 
     threading.Thread(target=_run, daemon=True, name="bv-backfill-ui").start()
     return {"status": "started", "symbol": symbol}
+
+
+_universe_lock = threading.Lock()
+_universe_cancel = threading.Event()
+_universe_state: dict = {
+    "running": False,
+    "last_started_at": None,
+    "last_result": None,
+    "last_error": None,
+    "progress": None,
+}
+
+
+def get_data_universe() -> dict:
+    """Symbol registry (inception/delist/liquidity) + the planned research
+    universe ladder + seed job state."""
+    from forven.dataeng.universe import get_symbol_registry, plan_research_universe
+
+    try:
+        registry = get_symbol_registry()
+    except Exception as exc:
+        log.warning("get_data_universe registry read failed: %s", exc)
+        registry = []
+    try:
+        plan = plan_research_universe()
+    except Exception as exc:
+        log.warning("get_data_universe plan failed: %s", exc)
+        plan = []
+    with _universe_lock:
+        seed_state = dict(_universe_state)
+    return {
+        "registry_count": len(registry),
+        "active": sum(1 for row in registry if row.get("status") == "active"),
+        "delisted": sum(1 for row in registry if row.get("status") == "delisted"),
+        "registry": registry,
+        "plan": plan,
+        "seed": seed_state,
+    }
+
+
+def post_refresh_universe_registry() -> dict:
+    from forven.dataeng.universe import refresh_symbol_registry
+
+    return refresh_symbol_registry()
+
+
+def post_seed_research_universe() -> dict:
+    """Seed deep history for the research universe in a background thread.
+    Idempotent/resumable; cancel via post_cancel_universe_seed."""
+    with _universe_lock:
+        if _universe_state["running"]:
+            raise HTTPException(status_code=409, detail="Universe seed already running")
+        _universe_cancel.clear()
+        _universe_state.update(
+            {"running": True, "last_started_at": _now(), "last_result": None, "last_error": None, "progress": None}
+        )
+
+    def _on_progress(done: int, total: int, symbol: str) -> None:
+        with _universe_lock:
+            _universe_state["progress"] = {"done": int(done), "total": int(total), "current_symbol": symbol}
+
+    def _run() -> None:
+        try:
+            from forven.dataeng.universe import seed_research_universe
+
+            result = seed_research_universe(progress_cb=_on_progress, cancel_event=_universe_cancel)
+            with _universe_lock:
+                _universe_state.update({"running": False, "last_result": result, "progress": None})
+        except Exception as exc:
+            log.warning("Research universe seed failed: %s", exc)
+            with _universe_lock:
+                _universe_state.update({"running": False, "last_error": str(exc), "progress": None})
+
+    threading.Thread(target=_run, daemon=True, name="universe-seed").start()
+    return {"status": "started"}
+
+
+def post_cancel_universe_seed() -> dict:
+    with _universe_lock:
+        if not _universe_state["running"]:
+            raise HTTPException(status_code=409, detail="No universe seed running")
+        _universe_cancel.set()
+    return {"status": "cancelling"}
 
 
 def get_coverage() -> dict:

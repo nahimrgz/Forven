@@ -244,6 +244,129 @@ class BinanceVisionClient:
             log.warning("BV metrics parse error: %s", exc)
             return None
 
+    @staticmethod
+    def _parse_metrics_multi(zip_bytes: bytes, oi_timeframes: list[str]) -> dict | None:
+        """Parse ONE daily metrics ZIP into every stream it carries.
+
+        The metrics files hold 5-min rows with open interest AND the global
+        long/short + taker volume ratios — the previous per-(symbol, timeframe)
+        OI backfill re-downloaded the same daily file per timeframe and threw
+        the ratio columns away. Returns {"oi": {tf: df}, "lsr": df, "taker": df}
+        (any part may be None when the columns are absent in old archives).
+        """
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
+                if csv_name is None:
+                    return None
+                raw = _read_zip_member_capped(zf, csv_name)
+            df = pd.read_csv(io.BytesIO(raw))
+            if "create_time" not in df.columns:
+                return None
+            df["timestamp"] = pd.to_datetime(df["create_time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+
+            out: dict = {"oi": {}, "lsr": None, "taker": None}
+            if "sum_open_interest" in df.columns:
+                oi = pd.to_numeric(df["sum_open_interest"], errors="coerce").dropna()
+                for tf in oi_timeframes:
+                    resampled = oi.resample(tf).last().dropna()
+                    out["oi"][tf] = resampled.rename("open_interest").reset_index()
+            if "count_long_short_ratio" in df.columns:
+                ratio = pd.to_numeric(df["count_long_short_ratio"], errors="coerce").dropna()
+                hourly = ratio.resample("1h").last().dropna()
+                lsr = hourly.rename("ls_ratio").reset_index()
+                # REST schema carries long_pct/short_pct; derive from the ratio
+                # so the columns stay consistent: r = long/short, long+short = 1.
+                lsr["long_pct"] = lsr["ls_ratio"] / (1.0 + lsr["ls_ratio"])
+                lsr["short_pct"] = 1.0 - lsr["long_pct"]
+                out["lsr"] = lsr[["timestamp", "long_pct", "short_pct", "ls_ratio"]]
+            if "sum_taker_long_short_vol_ratio" in df.columns:
+                taker = pd.to_numeric(df["sum_taker_long_short_vol_ratio"], errors="coerce").dropna()
+                hourly = taker.resample("1h").last().dropna()
+                out["taker"] = hourly.rename("taker_buy_sell_ratio").reset_index()
+            return out
+        except Exception as exc:
+            log.warning("BV metrics-multi parse error: %s", exc)
+            return None
+
+    def backfill_metrics(
+        self,
+        fs_symbol: str,
+        oi_timeframes: list[str],
+        *,
+        oi_paths: dict,
+        lsr_path,
+        taker_path,
+        save_fn,
+        load_fn,
+        days_bound: int | None = None,
+    ) -> dict:
+        """Deep-backfill OI + long/short ratio + taker ratio from daily metrics
+        files in ONE pass per day. ``days_bound`` caps how far back to walk (BV
+        serves metrics as one file per day — unbounded means thousands of
+        requests per symbol). Frames accumulate in memory and merge ONCE per
+        stream. Returns rows-added per stream.
+        """
+        bv_symbol = self.fs_to_bv(fs_symbol)
+        start = self.probe_start_date(bv_symbol, "openInterest")
+        if start is None:
+            return {}
+        now = datetime.now(timezone.utc)
+        start_dt = datetime(start[0], start[1], 1, tzinfo=timezone.utc)
+        if days_bound and days_bound > 0:
+            start_dt = max(start_dt, now - timedelta(days=int(days_bound)))
+
+        # Resume: skip days already present in the first OI timeframe's file.
+        covered: set = set()
+        first_tf = oi_timeframes[0] if oi_timeframes else None
+        if first_tf is not None:
+            existing = load_fn(oi_paths[first_tf])
+            if existing is not None and not existing.empty:
+                ts = pd.to_datetime(existing["timestamp"], utc=True, errors="coerce").dropna()
+                covered = {t.date() for t in ts}
+
+        collected_oi: dict = {tf: [] for tf in oi_timeframes}
+        collected_lsr: list = []
+        collected_taker: list = []
+        current = start_dt
+        while current.date() < now.date():
+            day = current.date()
+            current += timedelta(days=1)
+            if day in covered:
+                continue
+            url = self._daily_metrics_url(bv_symbol, day.year, day.month, day.day)
+            zip_bytes = self._fetch_zip_csv(url)
+            if zip_bytes is None:
+                continue
+            frames = self._parse_metrics_multi(zip_bytes, oi_timeframes)
+            if frames is None:
+                continue
+            for tf, frame in frames["oi"].items():
+                if frame is not None and not frame.empty:
+                    collected_oi[tf].append(frame)
+            if frames["lsr"] is not None and not frames["lsr"].empty:
+                collected_lsr.append(frames["lsr"])
+            if frames["taker"] is not None and not frames["taker"].empty:
+                collected_taker.append(frames["taker"])
+
+        added = {"oi": 0, "lsr": 0, "taker": 0}
+        for tf, frames_list in collected_oi.items():
+            if frames_list:
+                combined = pd.concat(frames_list, ignore_index=True)
+                added["oi"] += self._merge_and_save_stream(combined, oi_paths[tf], "oi", fs_symbol, save_fn, load_fn)
+        if collected_lsr:
+            combined = pd.concat(collected_lsr, ignore_index=True)
+            added["lsr"] += self._merge_and_save_stream(
+                combined, lsr_path, "long_short_ratio", fs_symbol, save_fn, load_fn
+            )
+        if collected_taker:
+            combined = pd.concat(collected_taker, ignore_index=True)
+            added["taker"] += self._merge_and_save_stream(
+                combined, taker_path, "taker_volume", fs_symbol, save_fn, load_fn
+            )
+        return added
+
     # ------------------------------------------------------------------
     # Start date probing
     # ------------------------------------------------------------------

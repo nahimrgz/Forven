@@ -1262,6 +1262,26 @@ class DataManager:
         # repeat look-ups within one cycle hit the DB at most once.
         self._cycle_cache_active: bool = False
         self._cycle_cache_store: dict[Any, Any] = {}
+        # Delisted-symbol skip set from the symbol registry (survivorship
+        # work): a delisted perp has no new bars, so sweeping it every cycle
+        # is pure wasted API budget. TTL-cached; empty when no registry.
+        self._delisted_cache: tuple[float, set[str]] = (0.0, set())
+
+    _DELISTED_CACHE_TTL_SECONDS = 1800.0
+
+    def _delisted_symbols(self) -> set[str]:
+        now = datetime.now(timezone.utc).timestamp()
+        cached_at, cached = self._delisted_cache
+        if now - cached_at < self._DELISTED_CACHE_TTL_SECONDS:
+            return cached
+        try:
+            from forven.dataeng.universe import delisted_symbols
+
+            cached = delisted_symbols()
+        except Exception:
+            cached = set()
+        self._delisted_cache = (now, cached)
+        return cached
 
     @contextlib.contextmanager
     def _cycle_cache(self):
@@ -1307,6 +1327,8 @@ class DataManager:
         fs_symbol = symbol_to_fs(raw)
         parts = [part for part in fs_symbol.split("-") if part]
         if len(parts) == 2 and parts[1] in _KEEPALIVE_QUOTES:
+            if fs_symbol in self._delisted_symbols():
+                return None  # delisted: no new bars exist to collect
             if not require_dataset or (Path(DATA_DIR) / fs_symbol).exists():
                 return fs_symbol
             return None
@@ -1314,6 +1336,8 @@ class DataManager:
         if len(parts) == 1:
             for quote in _KEEPALIVE_QUOTES:
                 candidate = f"{fs_symbol}-{quote}"
+                if candidate in self._delisted_symbols():
+                    continue
                 if (Path(DATA_DIR) / candidate).exists():
                     return candidate
 
@@ -1756,6 +1780,32 @@ class DataManager:
             out["funding_error"] = str(exc)
         return out
 
+    def _backfill_metrics(self, fs_sym: str, bv_symbol: str, *, days_bound: int | None = None) -> dict:
+        """Deep-backfill OI + long/short ratio + taker ratio from BV daily
+        metrics files in ONE pass (each daily zip carries all three; the legacy
+        _backfill_oi re-downloaded it per timeframe and discarded the ratios)."""
+        out: dict = {}
+        try:
+            timeframes = sorted(self.get_active_timeframes(fs_sym) or {"1h", "4h"})
+            added = bv_client.backfill_metrics(
+                fs_sym,
+                timeframes,
+                oi_paths={tf: OI_DIR / fs_sym / f"{tf}.parquet" for tf in timeframes},
+                lsr_path=DERIVATIVES_DIR / fs_sym / "long_short_ratio_1h.parquet",
+                taker_path=DERIVATIVES_DIR / fs_sym / "taker_volume_1h.parquet",
+                save_fn=_save_stream_parquet,
+                load_fn=_load_stream_parquet,
+                days_bound=days_bound,
+            )
+            for stream_name, rows in (added or {}).items():
+                out[f"metrics:{stream_name}"] = rows
+                if rows:
+                    log.info("BV metrics backfill %s %s: +%d rows", fs_sym, stream_name, rows)
+        except Exception as exc:
+            log.warning("BV metrics backfill failed for %s: %s", fs_sym, exc)
+            out["metrics_error"] = str(exc)
+        return out
+
     def _backfill_oi(self, fs_sym: str, bv_symbol: str) -> dict:
         out: dict = {}
         timeframes_oi = self.get_active_timeframes(fs_sym) or {"1h", "4h"}
@@ -1829,8 +1879,8 @@ class DataManager:
                 summary[fs_sym].update(self._backfill_ohlcv(fs_sym, bv_symbol))
             if "funding" in streams:
                 summary[fs_sym].update(self._backfill_funding(fs_sym, bv_symbol))
-            if "oi" in streams:
-                summary[fs_sym].update(self._backfill_oi(fs_sym, bv_symbol))
+            if "oi" in streams or "metrics" in streams:
+                summary[fs_sym].update(self._backfill_metrics(fs_sym, bv_symbol))
         return summary
 
     def _check_and_backfill(self) -> None:

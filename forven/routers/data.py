@@ -399,6 +399,29 @@ def cancel_backfill():
     return data_domain.post_cancel_backfill()
 
 
+@router.get("/api/data/universe")
+def get_data_universe():
+    """Symbol registry (inception/delist/liquidity) + research-universe plan + seed state."""
+    return data_domain.get_data_universe()
+
+
+@router.post("/api/data/universe/refresh")
+def refresh_universe_registry():
+    """Refresh the symbol registry from the venue (active perps, delistings)."""
+    return data_domain.post_refresh_universe_registry()
+
+
+@router.post("/api/data/universe/seed")
+def seed_research_universe():
+    """Deep-seed the research universe (BV full history + REST tail); resumable."""
+    return data_domain.post_seed_research_universe()
+
+
+@router.post("/api/data/universe/seed/cancel")
+def cancel_universe_seed():
+    return data_domain.post_cancel_universe_seed()
+
+
 @router.get("/api/data/coverage")
 def get_coverage():
     return data_domain.get_coverage()

@@ -205,7 +205,7 @@ class TestBackfillCancelProgress:
         processed: list[str] = []
         monkeypatch.setattr(DataManager, "_backfill_ohlcv", lambda self, fs, bv: processed.append(fs) or {})
         monkeypatch.setattr(DataManager, "_backfill_funding", lambda self, fs, bv: {})
-        monkeypatch.setattr(DataManager, "_backfill_oi", lambda self, fs, bv: {})
+        monkeypatch.setattr(DataManager, "_backfill_metrics", lambda self, fs, bv, **kw: {})
 
         cancel = threading.Event()
         progress: list[tuple[int, int, str]] = []
