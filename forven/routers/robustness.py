@@ -941,6 +941,9 @@ def _run_walk_forward_analysis(body: WalkForwardBody) -> dict:
         )
 
     result["verdict"] = "FAIL" if failures else "PASS"
+    # walk_forward() sets `robust` from its own looser rule; keep it in lockstep with
+    # the policy verdict so a persisted payload can't carry robust:true + verdict:FAIL.
+    result["robust"] = not failures
     result["verdict_reasons"] = failures
     result["verdict_thresholds"] = {
         "max_degradation": max_degradation,

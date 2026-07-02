@@ -474,19 +474,42 @@ async function openBacktestHistory(target: HTMLDivElement): Promise<void> {
 	await waitForCondition(() => target.querySelector('[data-testid^="backtest-row-"]') !== null);
 }
 
-async function openRobustnessTab(target: HTMLDivElement): Promise<void> {
+async function openOptimizationTab(target: HTMLDivElement): Promise<void> {
 	await waitForCondition(() =>
 		Array.from(target.querySelectorAll('button')).some((candidate) =>
-			(candidate.textContent ?? '').includes('Robustness'),
+			(candidate.textContent ?? '').includes('Optimization'),
 		),
 	);
-	clickButtonByText(target, 'Robustness');
+	clickButtonByText(target, 'Optimization');
 	await waitForCondition(() => target.textContent?.includes('Run Optimization') ?? false);
 }
 
+async function openRobustnessTab(target: HTMLDivElement): Promise<void> {
+	await waitForCondition(() =>
+		Array.from(target.querySelectorAll('button')).some((candidate) =>
+			(candidate.textContent ?? '').trim() === 'Robustness',
+		),
+	);
+	const tab = Array.from(target.querySelectorAll('button')).find(
+		(candidate) => (candidate.textContent ?? '').trim() === 'Robustness',
+	);
+	click(tab ?? null);
+	await waitForCondition(() => target.textContent?.includes('Robustness Runners') ?? false);
+}
+
 async function openOptimizationHistory(target: HTMLDivElement): Promise<void> {
-	await openRobustnessTab(target);
+	await openOptimizationTab(target);
 	await waitForCondition(() => target.querySelector('[data-testid^="optimization-row-"]') !== null);
+}
+
+async function openConfigurationTab(target: HTMLDivElement): Promise<void> {
+	await waitForCondition(() =>
+		Array.from(target.querySelectorAll('button')).some((candidate) =>
+			(candidate.textContent ?? '').includes('Configuration'),
+		),
+	);
+	clickButtonByText(target, 'Configuration');
+	await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
 }
 
 async function waitForAddParamMetadata(target: HTMLDivElement): Promise<void> {
@@ -840,7 +863,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		expect(target.querySelector('[data-testid="optimization-params-panel"]')).not.toBeNull();
 		expect(target.querySelector('[data-testid="opt-param-select-fast"]')).not.toBeNull();
@@ -862,7 +885,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		const panel = () => target.querySelector('[data-testid="optimization-params-panel"]') as HTMLElement | null;
 		const selectAll = () => target.querySelector('[data-testid="opt-param-select-all"]') as HTMLInputElement | null;
@@ -922,7 +945,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.submitOptimization.mockResolvedValue({ job_id: 'OPT-JOB-1', status: 'succeeded' });
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		setSelectValue(target.querySelector<HTMLSelectElement>('#container-opt-timeframe'), '4h');
 		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-start'), '2025-01-15');
@@ -997,7 +1020,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.submitOptimization.mockResolvedValue({ job_id: 'OPT-JOB-LEGACY-LEV', status: 'succeeded' });
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		clickByTestId(target, 'opt-param-select-fast');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '10');
@@ -1035,7 +1058,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		await waitForCondition(() => target.querySelector('[data-testid="opt-exec-select-leverage"]') !== null);
 		clickByTestId(target, 'opt-exec-select-leverage');
@@ -1063,7 +1086,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		);
 
 		app = mount(StrategyDetailPage, { target });
-		await openRobustnessTab(target);
+		await openOptimizationTab(target);
 
 		clickByTestId(target, 'opt-param-select-fast');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '20');
@@ -1303,6 +1326,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(container);
 
 		app = mount(StrategyDetailPage, { target });
+		await openConfigurationTab(target);
 		await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
 		await waitForCondition(() => target.textContent?.includes('Execution Settings') ?? false);
 
@@ -1438,6 +1462,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForCondition(() => target.textContent?.includes('available from ETH-RSI_MOMENTUM-S7762062.') ?? false);
 
@@ -1458,6 +1483,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1480,6 +1506,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1511,6 +1538,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			});
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 			await waitForAddParamMetadata(target);
 
@@ -1544,6 +1572,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.textContent?.includes('All supported params from') ?? false);
 
 			const addParamSelect = target.querySelector<HTMLSelectElement>('[data-testid="add-param-select"]');
@@ -1563,6 +1592,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.querySelector('[data-testid="add-param-select"]') !== null);
 
 			const addParamSelect = target.querySelector<HTMLSelectElement>('[data-testid="add-param-select"]');
@@ -1585,6 +1615,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			);
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
 
 			expect(target.textContent).toContain('Default Parameters');
@@ -1621,6 +1652,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 			});
 
 			app = mount(StrategyDetailPage, { target });
+			await openConfigurationTab(target);
 			await waitForCondition(() => target.textContent?.includes('Default Parameters') ?? false);
 
 			const fastInput = target.querySelector<HTMLInputElement>('input[type="number"]');
@@ -1815,29 +1847,25 @@ describe('/lab/strategy/[id] backtest history', () => {
 		}, { pinnedBacktestId: 'B1001' });
 	});
 
-	it('opens a single robustness runner from gauntlet status tiles', async () => {
+	it('expands the selected robustness runner from gauntlet status tiles', async () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(buildContainer(['B1001']));
 
 		app = mount(StrategyDetailPage, { target });
 		await openRobustnessTab(target);
-		clickButtonByText(target, 'Robustness Suite');
 		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-test-monte_carlo"]') !== null);
 
+		// All five runner headers render as accordions; only the selected test starts expanded.
 		expect(target.textContent).toContain('Walk-Forward Analysis');
-		expect(target.textContent).not.toContain('Monte Carlo Simulation');
+		expect(target.textContent).toContain('Monte Carlo Simulation');
+		expect(target.querySelector('[data-testid="runner-body-walk_forward"]')).not.toBeNull();
+		expect(target.querySelector('[data-testid="runner-body-monte_carlo"]')).toBeNull();
+		expect(target.querySelector('[data-testid="runner-body-param_jitter"]')).toBeNull();
 
 		clickByTestId(target, 'gauntlet-test-monte_carlo');
-		await waitForCondition(() => target.textContent?.includes('Monte Carlo Simulation') ?? false);
-
-		expect(target.textContent).not.toContain('Walk-Forward Analysis');
-		expect(target.textContent).toContain('Monte Carlo Simulation');
-		expect(target.textContent).not.toContain('Parameter Jitter');
+		await waitForCondition(() => target.querySelector('[data-testid="runner-body-monte_carlo"]') !== null);
 
 		clickByTestId(target, 'gauntlet-test-parameter_jitter');
-		await waitForCondition(() => target.textContent?.includes('Parameter Jitter') ?? false);
-
-		expect(target.textContent).not.toContain('Monte Carlo Simulation');
-		expect(target.textContent).toContain('Parameter Jitter');
+		await waitForCondition(() => target.querySelector('[data-testid="runner-body-param_jitter"]') !== null);
 	});
 
 	it('marks the gauntlet status tile with the completed runner verdict', async () => {
@@ -1889,7 +1917,6 @@ describe('/lab/strategy/[id] backtest history', () => {
 
 		app = mount(StrategyDetailPage, { target });
 		await openRobustnessTab(target);
-		clickButtonByText(target, 'Robustness Suite');
 		await waitForCondition(() => target.querySelector('[data-testid="gauntlet-test-verdict-walk_forward"]') !== null);
 		expect(target.querySelector('[data-testid="gauntlet-test-verdict-walk_forward"]')?.textContent).toContain('OFF');
 

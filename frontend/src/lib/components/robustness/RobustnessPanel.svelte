@@ -84,12 +84,14 @@
 	let unsubscribeTrackedProcesses: (() => void) | null = null;
 	let lastHistorySignature = '';
 
+	// All five runners render as accordions; only the selected test starts expanded
+	// so the suite reads as one scannable list instead of five open panels.
 	let expandedSections: Record<SuiteTestKey, boolean> = {
-		walk_forward: true,
-		monte_carlo: true,
-		param_jitter: true,
-		cost_stress: true,
-		regime_split: true,
+		walk_forward: activeTestKey === 'walk_forward',
+		monte_carlo: activeTestKey === 'monte_carlo',
+		param_jitter: activeTestKey === 'param_jitter',
+		cost_stress: activeTestKey === 'cost_stress',
+		regime_split: activeTestKey === 'regime_split',
 	};
 
 	function toggleSection(key: SuiteTestKey) {
@@ -1210,11 +1212,11 @@
 </div>
 
 <!-- ════════════════════════════════════════════════════════════════════
-     SELECTED RUNNER SECTION — opened from the gauntlet status tiles
+     RUNNER ACCORDIONS — all five tests, selected one expanded (gauntlet
+     status tiles select + expand; headers toggle)
      ════════════════════════════════════════════════════════════════════ -->
 
 <!-- ──── Walk-Forward Analysis ──── -->
-{#if activeTestKey === 'walk_forward'}
 <div class="mb-3 rounded-2xl border border-[#1d1d1d] bg-[linear-gradient(180deg,#0b0b0b_0%,#070707_100%)] overflow-hidden">
 	<button
 		class="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-[#0e0e0e]"
@@ -1229,7 +1231,7 @@
 	</button>
 
 	{#if expandedSections.walk_forward}
-		<div class="border-t border-[#1a1a1a] px-4 py-4">
+		<div class="border-t border-[#1a1a1a] px-4 py-4" data-testid="runner-body-walk_forward">
 			<div class="grid gap-4 lg:grid-cols-2">
 				<SymbolInput id="wf-symbol" label="Symbol" bind:value={walkForwardForm.symbol} suggestions={symbolSuggestions} />
 				<TimeframeSelect id="wf-timeframe" label="Timeframe" bind:value={walkForwardForm.timeframe} />
@@ -1269,6 +1271,14 @@
 						<span class="text-[10px] uppercase tracking-wide text-gray-500">Results</span>
 						<span class={`rounded px-1.5 py-0.5 text-[10px] font-bold ${verdictBadge(String(walkForwardResult.verdict))}`}>{walkForwardResult.verdict}</span>
 					</div>
+					{#if walkForwardResult.verdict_reasons?.length}
+						<div class="mb-3 rounded border border-red-900/40 bg-red-950/15 px-2.5 py-2 text-[11px] text-red-200" data-testid="wf-verdict-reasons">
+							<div class="text-[10px] font-semibold uppercase tracking-wide">Why it failed</div>
+							<ul class="mt-1 list-disc space-y-0.5 pl-4">
+								{#each walkForwardResult.verdict_reasons as reason}<li>{reason}</li>{/each}
+							</ul>
+						</div>
+					{/if}
 					<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
 						<div class="rounded-lg border border-[#1f1f1f] bg-black px-3 py-2">
 							<div class="text-[10px] text-gray-500">Avg IS Sharpe</div>
@@ -1318,10 +1328,8 @@
 		</div>
 	{/if}
 </div>
-{/if}
 
 <!-- ──── Monte Carlo ──── -->
-{#if activeTestKey === 'monte_carlo'}
 <div class="mb-3 rounded-2xl border border-[#1d1d1d] bg-[linear-gradient(180deg,#0b0b0b_0%,#070707_100%)] overflow-hidden">
 	<button
 		class="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-[#0e0e0e]"
@@ -1336,7 +1344,7 @@
 	</button>
 
 	{#if expandedSections.monte_carlo}
-		<div class="border-t border-[#1a1a1a] px-4 py-4">
+		<div class="border-t border-[#1a1a1a] px-4 py-4" data-testid="runner-body-monte_carlo">
 			<div class="grid gap-4 lg:grid-cols-3">
 				<ResultPicker id="mc-result" label="Gauntlet result" bind:value={monteCarloForm.result_id} items={backtestHistory} helpText="Source Gauntlet run for trade bootstrap." />
 				<NumericInputField id="mc-sims" label="Simulations" bind:value={monteCarloForm.n_simulations} min="100" max="10000" helpText="Number of equity path simulations." />
@@ -1367,14 +1375,24 @@
 						{/if}
 						<span class="text-[10px] text-gray-600">{monteCarloResult.n_simulations} sims / {monteCarloResult.n_trades} trades</span>
 					</div>
-					<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-						<div class="rounded-lg border border-[#1f1f1f] bg-black px-3 py-2">
-							<div class="text-[10px] text-gray-500">Percentile Rank</div>
-							<div class="mt-1 font-mono text-sm text-cyan-300">{monteCarloResult.percentile_rank}%</div>
+					{#if monteCarloResult.verdict_reasons?.length}
+						<div class="mb-3 rounded border border-red-900/40 bg-red-950/15 px-2.5 py-2 text-[11px] text-red-200" data-testid="mc-verdict-reasons">
+							<div class="text-[10px] font-semibold uppercase tracking-wide">Why it failed</div>
+							<ul class="mt-1 list-disc space-y-0.5 pl-4">
+								{#each monteCarloResult.verdict_reasons as reason}<li>{reason}</li>{/each}
+							</ul>
 						</div>
-						<div class="rounded-lg border border-[#1f1f1f] bg-black px-3 py-2">
+					{/if}
+					<!-- Verdict-relevant stats lead: PASS requires prob_profitable above the policy
+					     floor AND the P95 bootstrapped drawdown under the cap. -->
+					<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+						<div class="rounded-lg border border-[#1f1f1f] bg-black px-3 py-2" title={`Share of bootstrapped paths ending profitable. Verdict requires ≥ ${monteCarloResult.verdict_thresholds?.min_prob_profitable ?? '—'}%.`}>
 							<div class="text-[10px] text-gray-500">Prob Profitable</div>
 							<div class="mt-1 font-mono text-sm text-emerald-400">{monteCarloResult.prob_profitable}%</div>
+						</div>
+						<div class="rounded-lg border border-[#1f1f1f] bg-black px-3 py-2" title={`95th-percentile max drawdown across simulations. Verdict requires ≤ ${monteCarloResult.verdict_thresholds?.max_dd_p95 ?? '—'}%.`}>
+							<div class="text-[10px] text-gray-500">P95 Max DD</div>
+							<div class="mt-1 font-mono text-sm text-red-400">{monteCarloResult.drawdown_distribution?.p95 ?? '--'}%</div>
 						</div>
 						<div class="rounded-lg border border-[#1f1f1f] bg-black px-3 py-2">
 							<div class="text-[10px] text-gray-500">Prob Loss &gt;10%</div>
@@ -1390,6 +1408,11 @@
 						<div class="mt-3 rounded-lg bg-[#111] p-2">
 							<div class="mb-1 text-[10px] text-gray-500 uppercase">Simulated Equity Curves</div>
 							<MonteCarloChart equityPaths={monteCarloResult.equity_paths} height={220} />
+						</div>
+					{:else}
+						<div class="mt-3 rounded border border-[#2a2a2a] bg-[#0d0d0d] px-2.5 py-2 text-[11px] text-gray-500">
+							Simulated equity curves are unavailable for this stored result (the full simulation
+							artifact was pruned). Re-run Monte Carlo to regenerate them.
 						</div>
 					{/if}
 
@@ -1450,10 +1473,8 @@
 		</div>
 	{/if}
 </div>
-{/if}
 
 <!-- ──── Param Jitter ──── -->
-{#if activeTestKey === 'param_jitter'}
 <div class="mb-3 rounded-2xl border border-[#1d1d1d] bg-[linear-gradient(180deg,#0b0b0b_0%,#070707_100%)] overflow-hidden">
 	<button
 		class="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-[#0e0e0e]"
@@ -1468,7 +1489,7 @@
 	</button>
 
 	{#if expandedSections.param_jitter}
-		<div class="border-t border-[#1a1a1a] px-4 py-4">
+		<div class="border-t border-[#1a1a1a] px-4 py-4" data-testid="runner-body-param_jitter">
 			<div class="grid gap-4 lg:grid-cols-3">
 				<ResultPicker id="pj-result" label="Gauntlet result" bind:value={paramJitterForm.result_id} items={backtestHistory} helpText="Baseline for parameter perturbation." />
 				<NumericInputField id="pj-pct" label="Jitter %" bind:value={paramJitterForm.jitter_pct} min="1" max="50" helpText="How much to perturb each parameter." />
@@ -1536,16 +1557,19 @@
 								stats={{ mean: paramJitterResult.original_sharpe }}
 							/>
 						</div>
+					{:else}
+						<div class="mt-3 rounded border border-[#2a2a2a] bg-[#0d0d0d] px-2.5 py-2 text-[11px] text-gray-500">
+							The Sharpe distribution chart is unavailable for this stored result (the full
+							iteration artifact was pruned). Re-run the jitter test to regenerate it.
+						</div>
 					{/if}
 				</div>
 			{/if}
 		</div>
 	{/if}
 </div>
-{/if}
 
 <!-- ──── Cost Stress ──── -->
-{#if activeTestKey === 'cost_stress'}
 <div class="mb-3 rounded-2xl border border-[#1d1d1d] bg-[linear-gradient(180deg,#0b0b0b_0%,#070707_100%)] overflow-hidden">
 	<button
 		class="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-[#0e0e0e]"
@@ -1560,7 +1584,7 @@
 	</button>
 
 	{#if expandedSections.cost_stress}
-		<div class="border-t border-[#1a1a1a] px-4 py-4">
+		<div class="border-t border-[#1a1a1a] px-4 py-4" data-testid="runner-body-cost_stress">
 			<div class="grid gap-4 lg:grid-cols-2">
 				<SymbolInput id="cs-symbol" label="Symbol" bind:value={costStressForm.symbol} suggestions={symbolSuggestions} />
 				<TimeframeSelect id="cs-timeframe" label="Timeframe" bind:value={costStressForm.timeframe} />
@@ -1643,10 +1667,8 @@
 		</div>
 	{/if}
 </div>
-{/if}
 
 <!-- ──── Regime Split ──── -->
-{#if activeTestKey === 'regime_split'}
 <div class="mb-3 rounded-2xl border border-[#1d1d1d] bg-[linear-gradient(180deg,#0b0b0b_0%,#070707_100%)] overflow-hidden">
 	<button
 		class="flex w-full items-center justify-between px-4 py-3 text-left transition hover:bg-[#0e0e0e]"
@@ -1661,7 +1683,7 @@
 	</button>
 
 	{#if expandedSections.regime_split}
-		<div class="border-t border-[#1a1a1a] px-4 py-4">
+		<div class="border-t border-[#1a1a1a] px-4 py-4" data-testid="runner-body-regime_split">
 			<div class="grid gap-4 lg:grid-cols-[1fr_auto]">
 				<ResultPicker id="rs-result" label="Gauntlet result" bind:value={regimeSplitForm.result_id} items={backtestHistory} helpText="Which run to split by market regime." />
 				<div class="flex items-end">
@@ -1688,42 +1710,76 @@
 						{#if regimeSplitResult.method}
 							<span class="rounded border border-[#2a2a2a] bg-black px-1.5 py-0.5 text-[10px] text-gray-300">{methodLabel(regimeSplitResult.method)}</span>
 						{/if}
-						<span class="text-[10px] text-gray-600">{regimeSplitResult.n_trades} trades across {regimeSplitResult.n_regimes} regimes</span>
+						<span class="text-[10px] text-gray-600">
+							{regimeSplitResult.n_trades} trades · {regimeSplitResult.n_regimes} qualifying regime{regimeSplitResult.n_regimes === 1 ? '' : 's'}{regimeSplitResult.n_regimes_observed != null && regimeSplitResult.n_regimes_observed !== regimeSplitResult.n_regimes ? ` of ${regimeSplitResult.n_regimes_observed} observed` : ''}
+						</span>
 					</div>
+					{#if regimeSplitResult.verdict_reasons?.length}
+						<div class="mb-3 rounded border border-red-900/40 bg-red-950/15 px-2.5 py-2 text-[11px] text-red-200" data-testid="regime-verdict-reasons">
+							<div class="text-[10px] font-semibold uppercase tracking-wide">Why it failed</div>
+							<ul class="mt-1 list-disc space-y-0.5 pl-4">
+								{#each regimeSplitResult.verdict_reasons as reason}<li>{reason}</li>{/each}
+							</ul>
+						</div>
+					{/if}
 					{#if regimeSplitResult.regimes?.length > 0}
+						{@const regimesHaveReturns = regimeSplitResult.regimes.some((regime) => regime.total_return_pct != null)}
 						<div class="mb-3 rounded-lg bg-[#111] p-2 flex justify-center">
 							<RegimePnlChart regimes={regimeSplitResult.regimes} width={600} height={220} />
 						</div>
+						<!-- The verdict is decided in RETURN space (position-size-invariant); dollar
+						     PnL can be synthesized when the baseline lacks real trade PnL. Show the
+						     return columns whenever the payload carries them; only legacy persisted
+						     results fall back to the $ view. -->
 						<table class="w-full text-xs">
 							<thead class="bg-[#0d0d0d] text-gray-500">
 								<tr>
 									<th class="px-2 py-1 text-left">Regime</th>
 									<th class="px-2 py-1 text-right">Trades</th>
 									<th class="px-2 py-1 text-right">Win Rate</th>
-									<th class="px-2 py-1 text-right">Avg PnL</th>
-									<th class="px-2 py-1 text-right">Total PnL</th>
-									<th class="px-2 py-1 text-right">Best</th>
-									<th class="px-2 py-1 text-right">Worst</th>
+									{#if regimesHaveReturns}
+										<th class="px-2 py-1 text-right" title="Average per-trade return in this regime (verdict input)">Avg Ret%</th>
+										<th class="px-2 py-1 text-right" title="Summed per-trade returns in this regime — profitability here decides the verdict">Total Ret%</th>
+										<th class="px-2 py-1 text-right">Best%</th>
+										<th class="px-2 py-1 text-right">Worst%</th>
+									{:else}
+										<th class="px-2 py-1 text-right">Avg PnL</th>
+										<th class="px-2 py-1 text-right">Total PnL</th>
+										<th class="px-2 py-1 text-right">Best</th>
+										<th class="px-2 py-1 text-right">Worst</th>
+									{/if}
 								</tr>
 							</thead>
 							<tbody>
 								{#each regimeSplitResult.regimes as regime}
-									<tr class="border-t border-[#111]">
-										<td class="px-2 py-1 font-mono text-gray-300">{regime.name}</td>
+									{@const underMinTrades = regimeSplitResult.regime_min_trades != null && regime.trade_count < regimeSplitResult.regime_min_trades}
+									<tr class={`border-t border-[#111] ${underMinTrades ? 'opacity-50' : ''}`} title={underMinTrades ? `Fewer than ${regimeSplitResult.regime_min_trades} trades — shown for context but not counted toward the verdict` : undefined}>
+										<td class="px-2 py-1 font-mono text-gray-300">{regime.name}{underMinTrades ? ' *' : ''}</td>
 										<td class="px-2 py-1 text-right font-mono text-gray-400">{regime.trade_count}</td>
 										<td class="px-2 py-1 text-right font-mono {Number(regime.win_rate) >= 50 ? 'text-emerald-400' : 'text-red-400'}">{regime.win_rate}%</td>
-										<td class="px-2 py-1 text-right font-mono {Number(regime.avg_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${regime.avg_pnl}</td>
-										<td class="px-2 py-1 text-right font-mono {Number(regime.total_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${regime.total_pnl}</td>
-										<td class="px-2 py-1 text-right font-mono text-emerald-400">${regime.best_trade}</td>
-										<td class="px-2 py-1 text-right font-mono text-red-400">${regime.worst_trade}</td>
+										{#if regimesHaveReturns}
+											<td class="px-2 py-1 text-right font-mono {Number(regime.avg_return_pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}">{Number(regime.avg_return_pct ?? 0).toFixed(2)}%</td>
+											<td class="px-2 py-1 text-right font-mono {Number(regime.total_return_pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}">{Number(regime.total_return_pct ?? 0).toFixed(2)}%</td>
+											<td class="px-2 py-1 text-right font-mono text-emerald-400">{Number(regime.best_return_pct ?? 0).toFixed(2)}%</td>
+											<td class="px-2 py-1 text-right font-mono text-red-400">{Number(regime.worst_return_pct ?? 0).toFixed(2)}%</td>
+										{:else}
+											<td class="px-2 py-1 text-right font-mono {Number(regime.avg_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${regime.avg_pnl}</td>
+											<td class="px-2 py-1 text-right font-mono {Number(regime.total_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${regime.total_pnl}</td>
+											<td class="px-2 py-1 text-right font-mono text-emerald-400">${regime.best_trade}</td>
+											<td class="px-2 py-1 text-right font-mono text-red-400">${regime.worst_trade}</td>
+										{/if}
 									</tr>
 								{/each}
 							</tbody>
 						</table>
+						{#if regimeSplitResult.profitable_regime_share != null}
+							<div class="mt-2 text-center font-mono text-xs text-gray-400">
+								Profitable regime share: {(Number(regimeSplitResult.profitable_regime_share) * 100).toFixed(0)}% of qualifying regimes
+							</div>
+						{/if}
 					{/if}
 				</div>
 			{/if}
 		</div>
 	{/if}
 </div>
-{/if}

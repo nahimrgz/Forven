@@ -10,7 +10,6 @@
 		getResult,
 		getResultChartContext,
 		getStrategyContainer,
-		promoteForvenStrategy,
 		submitBacktest,
 		submitOptimization,
 		updateStrategyDisplayName,
@@ -77,6 +76,7 @@
 	import TradingViewExportModal from '$lib/components/strategy/TradingViewExportModal.svelte';
 	import StrategyExportMenu from '$lib/components/strategy/StrategyExportMenu.svelte';
 	import StrategyImportDialog from '$lib/components/strategy/StrategyImportDialog.svelte';
+	import StageControl from '$lib/components/strategy/StageControl.svelte';
 	import type { StrategyImportResult } from '$lib/api';
 	import { openDeepdive } from '$lib/stores/deepdiveStore';
 
@@ -158,13 +158,14 @@
 	}
 
 	// TabKey identifiers predate the current UI labels. Mapping (code -> visible label):
+	//   'overview'       -> "Overview" (stage pipeline, readiness, gauntlet status, active run)
 	//   'backtests'      -> "Gauntlet History" (the "Run the Gauntlet" button submits a backtest)
-	//   'optimizations'  -> "Robustness" (hosts the optimization + robustness sub-tabs)
+	//   'optimizations'  -> "Optimization"
+	//   'robustness'     -> "Robustness" (the five validation runners)
 	// PromotionReadiness on:action maps: 'run_confirmation_backtest' -> 'backtests';
-	//   'run_optimization'/'apply_best_params'/'*_validation_suite' -> 'optimizations'.
-	type TabKey = 'configuration' | 'backtests' | 'optimizations' | 'execution';
+	//   'run_optimization'/'apply_best_params' -> 'optimizations'; '*_validation_suite' -> 'robustness'.
+	type TabKey = 'overview' | 'configuration' | 'backtests' | 'optimizations' | 'robustness' | 'execution';
 	type SubmitStatus = 'idle' | 'submitting' | 'running' | 'completed' | 'failed';
-	type RobustnessSubTab = 'optimization' | 'robustness';
 	type RobustnessRunnerTestKey = 'walk_forward' | 'monte_carlo' | 'param_jitter' | 'cost_stress' | 'regime_split';
 	type RobustnessRunnerCompleteEvent = {
 		key: RobustnessRunnerTestKey;
@@ -250,17 +251,14 @@
 
 	let strategyId = '';
 	let returnTo = '/lab';
-	let activeTab: TabKey = 'configuration';
+	let activeTab: TabKey = 'overview';
 	let loading = true;
 	let error = '';
 	let lastLoadedId = '';
 	let container: StrategyContainerPayload | null = null;
-	let promoting = false;
-	let promoteReason = '';
-	let showPromoteConfirm = false;
-	// When the promotion gate blocks a capital-stage promotion, hold its reason
-	// so the confirm box can show it and offer an informed operator override.
-	let promoteBlockReason = '';
+	// Header-level stage control; owns the promote/demote/archive confirm flow
+	// (including the gate-blocked -> informed-override path) from ANY tab.
+	let stageControl: StageControl | null = null;
 	let submitStatus: SubmitStatus = 'idle';
 	let submitMessage = '';
 	let submitJobId: string | null = null;
@@ -342,9 +340,29 @@
 		n_trials: 100,
 	};
 
-	let robustnessSubTab: RobustnessSubTab = 'optimization';
 	let selectedRobustnessTest: GauntletTestKey = 'walk_forward';
 	let robustnessStatusOverrides: Partial<Record<GauntletTestKey, GauntletTestEntry>> = {};
+
+	// ── Overview: active-run snapshot ────────────────────────────────────────────
+	// The run whose params/metrics drive paper/live (pinned) or, absent a pin, the
+	// most recent Gauntlet run. Its full result is fetched lazily for the Overview
+	// equity curve.
+	let overviewResult: BacktestResult | null = null;
+	let overviewResultId = '';
+	let overviewResultError = '';
+	let overviewResultLoading = false;
+	$: overviewEquityOos = overviewResult?.equity_curve ?? null;
+	$: overviewEquityFull = overviewResult?.equity_curve_full ?? null;
+	$: overviewUsingFullCurve = Array.isArray(overviewEquityFull) && overviewEquityFull.length > 1;
+	$: overviewEquityForChart = overviewUsingFullCurve ? (overviewEquityFull ?? []) : (overviewEquityOos ?? []);
+	$: overviewBenchmarkForChart = overviewUsingFullCurve
+		? (overviewResult?.benchmark_curve_full ?? null)
+		: (overviewResult?.benchmark_curve ?? null);
+	$: overviewOosStartTimestamp =
+		overviewUsingFullCurve && Array.isArray(overviewEquityOos) && overviewEquityOos.length > 0
+			? (overviewEquityOos[0]?.timestamp ?? null)
+			: null;
+	$: overviewHasEquity = Array.isArray(overviewEquityForChart) && overviewEquityForChart.length > 1;
 
 	type HistorySortField =
 		| 'created'
@@ -390,6 +408,19 @@
 	);
 	$: historySortIndicator = (field: HistorySortField): string =>
 		historySortBy === field ? (historySortDir === 'desc' ? ' \u2193' : ' \u2191') : '';
+	// The run driving execution: the pinned run, else the newest by creation time.
+	// Derived from the RAW list so re-sorting the history table can't change it.
+	$: activeRunItem =
+		(pinnedBacktestId
+			? backtestHistoryRaw.find((item) => item.result_id === pinnedBacktestId)
+			: null) ??
+		[...backtestHistoryRaw].sort(
+			(left, right) => parseTimestamp(right.created_at) - parseTimestamp(left.created_at),
+		)[0] ??
+		null;
+	$: if (activeTab === 'overview' && activeRunItem && String(activeRunItem.result_id || '').trim() !== overviewResultId) {
+		void loadOverviewResult(activeRunItem);
+	}
 	$: optimizationHistory = container?.history.optimizations ?? [];
 	$: walkForwardHistory = container?.history.walk_forward ?? [];
 	$: validationHistory = container?.history.validation ?? [];
@@ -1342,10 +1373,6 @@
 		return fallback;
 	}
 
-
-	function selectRobustnessTab(tab: RobustnessSubTab): void {
-		robustnessSubTab = tab;
-	}
 
 	function selectedRunnerTestKey(key: GauntletTestKey): RobustnessRunnerTestKey {
 		return key === 'parameter_jitter' ? 'param_jitter' : key;
@@ -2720,51 +2747,37 @@
 		tradingViewExportWarnings = [];
 	}
 
-	async function confirmPromotion(override = false): Promise<void> {
-		if (!nextPipelineStage) return;
-		const target = nextPipelineStage;
-		promoting = true;
-		try {
-			await promoteForvenStrategy(strategyId, target.key, {
-				fromStatus: currentLifecycleStage,
-				reason: promoteReason.trim() || (override ? 'Operator gate override' : 'Manual promotion from configuration tab'),
-				force: true,
-				override,
-			});
-			addToast(`Promoted ${strategyId} to ${target.label}`, 'success');
-			showPromoteConfirm = false;
-			promoteReason = '';
-			promoteBlockReason = '';
-			await loadContainer();
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : 'Promotion failed';
-			if (!override) {
-				// The promotion gate rejected it. Surface the reason and let the
-				// operator make an informed decision to override the gate.
-				promoteBlockReason = msg;
-			} else {
-				addToast(msg, 'error');
-			}
-		} finally {
-			promoting = false;
+	function openStageChange(targetStage?: string): void {
+		if (!stageControl) return;
+		if (targetStage) {
+			stageControl.openFor(targetStage);
+		} else if (nextPipelineStage) {
+			stageControl.openFor(nextPipelineStage.key);
 		}
 	}
 
-	async function archiveStrategyFromConfig(): Promise<void> {
-		if (typeof window !== 'undefined' && !window.confirm(`Archive strategy ${strategyId}?`)) return;
-		promoting = true;
+	async function handleStageChanged(): Promise<void> {
+		await loadContainer();
+	}
+
+	async function loadOverviewResult(item: StrategyContainerHistoryItem): Promise<void> {
+		const resultId = String(item.result_id || '').trim();
+		if (!resultId || overviewResultId === resultId) return;
+		overviewResultId = resultId;
+		overviewResult = null;
+		overviewResultError = '';
+		overviewResultLoading = true;
 		try {
-			await promoteForvenStrategy(strategyId, 'archived', {
-				fromStatus: currentLifecycleStage,
-				reason: 'Archived from configuration tab',
-				force: true,
-			});
-			addToast(`${strategyId} archived`, 'success');
-			await loadContainer();
+			const result = await getResult(resultId);
+			if (destroyed || overviewResultId !== resultId) return;
+			overviewResult = result ?? null;
 		} catch (err) {
-			addToast(err instanceof Error ? err.message : 'Archive failed', 'error');
+			if (destroyed || overviewResultId !== resultId) return;
+			overviewResultError = err instanceof Error ? err.message : 'Failed to load run details';
 		} finally {
-			promoting = false;
+			if (overviewResultId === resultId) {
+				overviewResultLoading = false;
+			}
 		}
 	}
 
@@ -3239,6 +3252,12 @@
 		// Clear per-test robustness overrides so a run on the PREVIOUS strategy can't leak
 		// PASS/FAIL tiles onto this one (the SPA reuses this component across [id] changes).
 		robustnessStatusOverrides = {};
+		// Force the Overview snapshot to refetch — the active run (or its stored
+		// metrics) may have changed as part of whatever triggered this reload.
+		overviewResult = null;
+		overviewResultId = '';
+		overviewResultError = '';
+		overviewResultLoading = false;
 		let nextSelectedBacktest: StrategyContainerHistoryItem | null = null;
 		let loadSucceeded = false;
 		try {
@@ -3603,7 +3622,30 @@
 				</a>
 			{/if}
 			<span class="text-gray-700">•</span>
-			<span class="text-[11px] text-gray-400 uppercase">{String(container.configuration.stage ?? container.strategy.state ?? '-')}</span>
+			<StageControl
+				bind:this={stageControl}
+				strategyId={container.strategy.id}
+				currentStage={currentLifecycleStage}
+				pipelineStages={PIPELINE_STAGES}
+				on:changed={() => void handleStageChanged()}
+			/>
+			<button
+				type="button"
+				data-testid="active-driver-chip"
+				class={`flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] transition ${
+					pinnedBacktestId
+						? 'border-emerald-600/60 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40'
+						: 'border-[#2b2b2b] bg-black text-gray-400 hover:text-gray-200'
+				}`}
+				title={pinnedBacktestId
+					? `Gauntlet run ${pinnedBacktestId} is pinned — its params and metrics drive paper/live execution. Click to view.`
+					: 'No run is pinned — the manually-saved container defaults drive paper/live execution. Click to view the Gauntlet history.'}
+				on:click={() => (activeTab = 'backtests')}
+			>
+				<span class={`h-1.5 w-1.5 rounded-full ${pinnedBacktestId ? 'bg-emerald-400' : 'bg-gray-500'}`}></span>
+				<span class="uppercase tracking-[0.12em]">Driver</span>
+				<span class="font-mono normal-case tracking-normal">{pinnedBacktestId || 'Container defaults'}</span>
+			</button>
 			{#if container.strategy.canonical}
 				<span
 					data-canonical-badge
@@ -3667,38 +3709,23 @@
 		{/if}
 		<div class="border-b border-[#222] bg-[#0a0a0a] px-4">
 			<div role="group" aria-label="Strategy detail sections" class="flex gap-6 text-xs uppercase tracking-wide">
-				<button
-					type="button"
-					aria-pressed={activeTab === 'configuration'}
-					class="border-b-2 py-2 transition-colors {activeTab === 'configuration' ? 'border-white text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
-					on:click={() => (activeTab = 'configuration')}
-				>
-					Configuration
-				</button>
-				<button
-					type="button"
-					aria-pressed={activeTab === 'backtests'}
-					class="border-b-2 py-2 transition-colors {activeTab === 'backtests' ? 'border-white text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
-					on:click={() => (activeTab = 'backtests')}
-				>
-					Gauntlet History
-				</button>
-				<button
-					type="button"
-					aria-pressed={activeTab === 'optimizations'}
-					class="border-b-2 py-2 transition-colors {activeTab === 'optimizations' ? 'border-white text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
-					on:click={() => (activeTab = 'optimizations')}
-				>
-					Robustness
-				</button>
-				<button
-					type="button"
-					aria-pressed={activeTab === 'execution'}
-					class="border-b-2 py-2 transition-colors {activeTab === 'execution' ? 'border-white text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
-					on:click={() => (activeTab = 'execution')}
-				>
-					Execution
-				</button>
+				{#each [
+					{ key: 'overview', label: 'Overview' },
+					{ key: 'configuration', label: 'Configuration' },
+					{ key: 'backtests', label: 'Gauntlet History' },
+					{ key: 'optimizations', label: 'Optimization' },
+					{ key: 'robustness', label: 'Robustness' },
+					{ key: 'execution', label: 'Execution' },
+				] as tab (tab.key)}
+					<button
+						type="button"
+						aria-pressed={activeTab === tab.key}
+						class="border-b-2 py-2 transition-colors {activeTab === tab.key ? 'border-white text-white' : 'border-transparent text-gray-500 hover:text-gray-300'}"
+						on:click={() => (activeTab = tab.key as TabKey)}
+					>
+						{tab.label}
+					</button>
+				{/each}
 			</div>
 		</div>
 
@@ -3725,6 +3752,213 @@
 							{/if}
 						</div>
 					{/if}
+				</div>
+			{/if}
+
+			{#if activeTab === 'overview'}
+				<div class="grid grid-cols-1 gap-3 xl:grid-cols-[0.95fr_1.05fr]">
+					<div class="space-y-3">
+						<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
+							<div class="flex items-center justify-between gap-2">
+								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Pipeline</div>
+								<div class="flex items-center gap-2 text-[11px]">
+									<span class="text-gray-500">{latestLifecycleEvent ? fmtDate(latestLifecycleEvent.created_at) : '--'}</span>
+									<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-400">{orderedRecentEvents.length} event{orderedRecentEvents.length === 1 ? '' : 's'}</span>
+								</div>
+							</div>
+							{#if latestLifecycleEvent}
+								<div class="mt-2 text-xs text-gray-400">{summarizeLifecycleEvent(latestLifecycleEvent)}</div>
+							{/if}
+							{#if currentLifecycleStage in TERMINAL_STAGES}
+								<div class="mt-2 rounded border border-red-900/40 bg-red-950/15 px-2 py-1.5 text-xs text-red-200">
+									<span class="font-medium">{lifecycleStageLabel(currentLifecycleStage)}.</span>
+									<span class="ml-1 text-red-300/80">{TERMINAL_STAGES[currentLifecycleStage]}</span>
+								</div>
+								<div class="mt-2">
+									<button
+										type="button"
+										data-testid="overview-revive-button"
+										on:click={() => openStageChange('quick_screen')}
+										class="rounded border border-emerald-700/50 bg-emerald-950/30 px-3 py-1.5 text-xs text-emerald-200 transition-colors hover:bg-emerald-900/40"
+									>Revive to Quick Screen</button>
+								</div>
+							{:else}
+								<div class="mt-2 flex gap-1.5">
+									{#each currentStageDescriptors as stage}
+										<button
+											on:click={() => { selectedReadinessStage = stage.key === currentLifecycleStage ? null : stage.key; }}
+											title={stage.tooltip ?? ''}
+											class={`flex-1 rounded border px-2 py-1.5 text-center cursor-pointer transition-colors ${
+												readinessViewStage === stage.key
+													? 'border-cyan-600/60 bg-cyan-950/20 text-cyan-200 ring-1 ring-cyan-500/40'
+													: stage.kind === 'current'
+														? 'border-cyan-600/40 bg-cyan-950/10 text-cyan-300/70'
+														: stage.kind === 'past'
+															? 'border-emerald-900/40 bg-emerald-950/10 text-emerald-200'
+															: 'border-[#1f1f1f] bg-[#070707] text-gray-500 hover:border-gray-700 hover:text-gray-400'
+											}`}
+										>
+											<div class="text-[10px] uppercase tracking-wide">{stage.label}</div>
+										</button>
+									{/each}
+								</div>
+								<div class="mt-2">
+									<PromotionReadiness
+										{strategyId}
+										stage={readinessViewStage}
+										quickScreenRows={quickScreenRows}
+										on:action={(e) => {
+											const action = e.detail?.action;
+											if (action === 'run_optimization' || action === 'apply_best_params') activeTab = 'optimizations';
+											else if (action === 'run_confirmation_backtest') activeTab = 'backtests';
+											else if (action === 'run_validation_suite' || action === 're_run_validation_suite') activeTab = 'robustness';
+										}}
+									/>
+								</div>
+
+								<div class="mt-2 flex flex-wrap items-center gap-2">
+									{#if nextPipelineStage}
+										<button
+											data-testid="overview-promote-button"
+											on:click={() => openStageChange(nextPipelineStage?.key)}
+											class="rounded border border-cyan-700/50 bg-cyan-950/30 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-900/40 transition-colors"
+										>Promote to {nextPipelineStage.label}</button>
+									{/if}
+									<button on:click={() => goto(`/bot-factory/editor?strategy=${strategyId}`)} class="rounded border border-violet-700/50 bg-violet-950/30 px-3 py-1.5 text-xs text-violet-200 hover:bg-violet-900/40 transition-colors">Deploy as Bot</button>
+									<button
+										data-testid="overview-archive-button"
+										on:click={() => openStageChange('archived')}
+										class="rounded border border-red-900/40 bg-red-950/20 px-3 py-1.5 text-xs text-red-300 hover:bg-red-900/30 transition-colors"
+									>Archive</button>
+								</div>
+							{/if}
+						</div>
+
+						<GauntletStatusCard
+							{strategyId}
+							stage={currentLifecycleStage}
+							selectedTestKey={selectedRobustnessTest}
+							testOverrides={robustnessStatusOverrides}
+							on:selectTest={(event) => {
+								selectedRobustnessTest = event.detail.key;
+								activeTab = 'robustness';
+							}}
+							on:promote={() => openStageChange()}
+						/>
+					</div>
+
+					<div class="space-y-3">
+						<div
+							class={`rounded-lg border p-3 ${activeRunItem && pinnedBacktestId && pinnedBacktestId === activeRunItem.result_id ? 'border-emerald-700/60 shadow-[inset_2px_0_0_0_rgba(16,185,129,0.9)] bg-[#090909]' : 'border-[#1d1d1d] bg-[#090909]'}`}
+							data-testid="overview-active-run-card"
+						>
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<div class="flex items-center gap-2">
+									<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Execution Driver</div>
+									{#if activeRunItem}
+										{#if pinnedBacktestId && pinnedBacktestId === activeRunItem.result_id}
+											<span class="rounded-full border border-emerald-600/60 bg-emerald-950/30 px-2 py-0.5 text-[9px] uppercase tracking-wide text-emerald-200" title="This pinned run's params and metrics drive paper/live execution.">Pinned · Active</span>
+										{:else}
+											<span class="rounded-full border border-amber-900/60 bg-amber-950/15 px-2 py-0.5 text-[9px] uppercase tracking-wide text-amber-200" title="No run is pinned — the manually-saved container defaults drive paper/live. Showing the latest Gauntlet run.">Latest run · defaults drive execution</span>
+										{/if}
+									{/if}
+								</div>
+								{#if activeRunItem}
+									<button
+										type="button"
+										data-testid="overview-open-active-run"
+										class="rounded border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] uppercase tracking-wide text-gray-400 transition hover:text-white"
+										on:click={() => { activeTab = 'backtests'; if (activeRunItem) void openResult(activeRunItem); }}
+									>Open Run</button>
+								{/if}
+							</div>
+							{#if !activeRunItem}
+								<div class="mt-3 rounded border border-[#1f1f1f] bg-[#070707] px-4 py-6 text-sm text-gray-500">
+									No Gauntlet runs yet — run one from the Gauntlet History tab to see how this strategy performs.
+								</div>
+							{:else}
+								<div class="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-gray-500">
+									<span class="font-mono text-cyan-300">{activeRunItem.result_id}</span>
+									<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 font-mono text-gray-300">{activeRunItem.symbol || '--'} / {activeRunItem.timeframe || '--'}</span>
+									<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5">{fmtShortDate(activeRunItem.start_date)} → {fmtShortDate(activeRunItem.end_date)}</span>
+									<span>{fmtDate(activeRunItem.created_at)}</span>
+								</div>
+								<div class="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4 xl:grid-cols-7" data-testid="overview-active-run-metrics">
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title="Out-of-sample CAGR (annualized)">
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">OOS CAGR</div>
+										<div class={`mt-1 font-mono text-sm ${isCagrReliable(activeRunItem) ? signedPercentClass(readOutOfSampleCagr(activeRunItem)) : 'text-gray-500'}`}>{formatOutOfSampleCagr(activeRunItem)}</div>
+									</div>
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title="Out-of-sample annualized Sharpe">
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">OOS Sharpe</div>
+										<div class={`mt-1 font-mono text-sm ${isSharpeReliable(activeRunItem) ? 'text-gray-300' : 'text-gray-500'}`}>{formatOutOfSampleSharpe(activeRunItem)}</div>
+									</div>
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title="Maximum peak-to-trough drawdown">
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">Max DD</div>
+										<div class="mt-1 font-mono text-sm text-red-400">{pct(readDrawdownPercentMetric(activeRunItem, 'max_drawdown_pct', 'max_drawdown'))}</div>
+									</div>
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title="Combined win rate">
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">Win%</div>
+										<div class="mt-1 font-mono text-sm text-gray-300">{pct(readPercentMetric(activeRunItem, 'win_rate', 'win_rate_pct'))}</div>
+									</div>
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title="Total completed trades">
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">Trades</div>
+										<div class="mt-1 font-mono text-sm text-gray-300">{historyTradesCount(activeRunItem)}</div>
+									</div>
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title="Gross profit / gross loss">
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">PF</div>
+										<div class="mt-1 font-mono text-sm text-gray-300">{formatProfitFactor(activeRunItem)}</div>
+									</div>
+									<div class="rounded border border-[#1f1f1f] bg-black px-2.5 py-2" title={`Gauntlet robustness score; below ${gauntletMinScore ?? 60} fails the promotion gate`}>
+										<div class="text-[9px] uppercase tracking-wide text-gray-500">Rob%</div>
+										<div class="mt-1 font-mono text-sm text-gray-300">{formatRobustness(activeRunItem)}</div>
+									</div>
+								</div>
+								{#if overviewResultLoading}
+									<div class="mt-3 rounded border border-cyan-900/40 bg-cyan-950/10 px-3 py-4 text-xs text-cyan-100">Loading equity curve…</div>
+								{:else if overviewResultError}
+									<div class="mt-3 rounded border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-xs text-amber-200">{overviewResultError}</div>
+								{:else if overviewHasEquity}
+									<div class="mt-3" data-testid="overview-equity-curve">
+										{#key overviewResultId}
+											<EquityChart
+												data={overviewEquityForChart}
+												benchmarkData={overviewBenchmarkForChart}
+												oosStartTimestamp={overviewOosStartTimestamp}
+												showDrawdown={true}
+												height={240}
+											/>
+										{/key}
+									</div>
+								{/if}
+							{/if}
+						</div>
+
+						<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
+							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Lifecycle Feed</div>
+							{#if orderedRecentEvents.length === 0}
+								<div class="mt-2 text-xs text-gray-500">No events recorded.</div>
+							{:else}
+								<div class="mt-2 max-h-[320px] overflow-auto space-y-1.5">
+									{#each orderedRecentEvents as event}
+										<div class="rounded border border-[#1f1f1f] bg-[#070707] px-2.5 py-2">
+											<div class="flex items-center justify-between gap-2 text-[11px]">
+												<div class="flex items-center gap-1.5">
+													<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 font-mono text-gray-300">{lifecycleStageLabel(event.from_state)}</span>
+													<span class="text-gray-600">-></span>
+													<span class="rounded border border-cyan-900/40 bg-cyan-950/20 px-1.5 py-0.5 font-mono text-cyan-200">{lifecycleStageLabel(event.to_state)}</span>
+													<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-500">{lifecycleActorLabel(event.actor)}</span>
+												</div>
+												<span class="shrink-0 text-gray-500">{fmtDate(event.created_at)}</span>
+											</div>
+											{#if event.reason && event.reason.trim()}
+												<div class="mt-1 text-xs text-gray-400">{event.reason.trim()}</div>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							{/if}
+						</div>
+					</div>
 				</div>
 			{/if}
 
@@ -3849,125 +4083,6 @@
 					</div>
 				</div>
 
-				<div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[0.95fr_1.05fr]">
-					<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
-						<div class="flex items-center justify-between gap-2">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Pipeline</div>
-							<div class="flex items-center gap-2 text-[11px]">
-								<span class="text-gray-500">{latestLifecycleEvent ? fmtDate(latestLifecycleEvent.created_at) : '--'}</span>
-								<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-400">{orderedRecentEvents.length} event{orderedRecentEvents.length === 1 ? '' : 's'}</span>
-							</div>
-						</div>
-						{#if latestLifecycleEvent}
-							<div class="mt-2 text-xs text-gray-400">{summarizeLifecycleEvent(latestLifecycleEvent)}</div>
-						{/if}
-						{#if currentLifecycleStage in TERMINAL_STAGES}
-							<div class="mt-2 rounded border border-red-900/40 bg-red-950/15 px-2 py-1.5 text-xs text-red-200">
-								<span class="font-medium">{lifecycleStageLabel(currentLifecycleStage)}.</span>
-								<span class="ml-1 text-red-300/80">{TERMINAL_STAGES[currentLifecycleStage]}</span>
-							</div>
-						{:else}
-							<div class="mt-2 flex gap-1.5">
-								{#each currentStageDescriptors as stage}
-									<button
-										on:click={() => { selectedReadinessStage = stage.key === currentLifecycleStage ? null : stage.key; }}
-										title={stage.tooltip ?? ''}
-										class={`flex-1 rounded border px-2 py-1.5 text-center cursor-pointer transition-colors ${
-											readinessViewStage === stage.key
-												? 'border-cyan-600/60 bg-cyan-950/20 text-cyan-200 ring-1 ring-cyan-500/40'
-												: stage.kind === 'current'
-													? 'border-cyan-600/40 bg-cyan-950/10 text-cyan-300/70'
-													: stage.kind === 'past'
-														? 'border-emerald-900/40 bg-emerald-950/10 text-emerald-200'
-														: 'border-[#1f1f1f] bg-[#070707] text-gray-500 hover:border-gray-700 hover:text-gray-400'
-										}`}
-									>
-										<div class="text-[10px] uppercase tracking-wide">{stage.label}</div>
-									</button>
-								{/each}
-							</div>
-							<div class="mt-2">
-								<PromotionReadiness
-									{strategyId}
-									stage={readinessViewStage}
-									quickScreenRows={quickScreenRows}
-									on:action={(e) => {
-										const action = e.detail?.action;
-										if (action === 'run_optimization') {
-											activeTab = 'optimizations';
-											robustnessSubTab = 'optimization';
-										}
-										else if (action === 'run_confirmation_backtest') activeTab = 'backtests';
-										else if (action === 'apply_best_params') {
-											activeTab = 'optimizations';
-											robustnessSubTab = 'optimization';
-										}
-										else if (action === 'run_validation_suite' || action === 're_run_validation_suite') {
-											activeTab = 'optimizations';
-											robustnessSubTab = 'robustness';
-										}
-									}}
-								/>
-							</div>
-
-							<div class="mt-2 flex flex-wrap items-center gap-2">
-								{#if nextPipelineStage}
-									{#if !showPromoteConfirm}
-										<button on:click={() => { showPromoteConfirm = true; promoteReason = ''; promoteBlockReason = ''; }} class="rounded border border-cyan-700/50 bg-cyan-950/30 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-900/40 transition-colors">Promote to {nextPipelineStage.label}</button>
-									{:else}
-										<div class="flex-1 rounded border border-cyan-800/40 bg-cyan-950/20 p-2 space-y-2">
-											<div class="text-xs text-cyan-200">Promote to <span class="font-semibold">{nextPipelineStage.label}</span>?</div>
-											<textarea bind:value={promoteReason} placeholder="Reason (optional)" rows="1" class="w-full rounded bg-black border border-[#2b2b2b] text-xs text-gray-300 px-2 py-1 placeholder:text-gray-600 focus:border-cyan-700 focus:outline-none"></textarea>
-											{#if promoteBlockReason}
-												<div class="rounded border border-amber-700/50 bg-amber-950/30 p-2 text-[11px]">
-													<div class="font-semibold text-amber-200">Promotion gate blocked this:</div>
-													<div class="mt-0.5 text-amber-100/90">{promoteBlockReason}</div>
-													<div class="mt-1 text-amber-300/70">Overriding promotes anyway (logged). The mainnet hard-gate is separate and unaffected.</div>
-												</div>
-											{/if}
-											<div class="flex gap-1.5">
-												{#if promoteBlockReason}
-													<button disabled={promoting} on:click={() => confirmPromotion(true)} class="rounded bg-amber-600 px-3 py-1 text-xs text-white hover:bg-amber-500 disabled:opacity-50">{promoting ? 'Overriding...' : 'Override gate & promote'}</button>
-												{:else}
-													<button disabled={promoting} on:click={() => confirmPromotion(false)} class="rounded bg-cyan-600 px-3 py-1 text-xs text-white hover:bg-cyan-500 disabled:opacity-50">{promoting ? 'Promoting...' : 'Confirm'}</button>
-												{/if}
-												<button on:click={() => { showPromoteConfirm = false; promoteBlockReason = ''; }} class="rounded border border-[#2b2b2b] bg-black px-3 py-1 text-xs text-gray-400 hover:text-gray-200">Cancel</button>
-											</div>
-										</div>
-									{/if}
-								{/if}
-								<button on:click={() => goto(`/bot-factory/editor?strategy=${strategyId}`)} class="rounded border border-violet-700/50 bg-violet-950/30 px-3 py-1.5 text-xs text-violet-200 hover:bg-violet-900/40 transition-colors">Deploy as Bot</button>
-								<button on:click={archiveStrategyFromConfig} class="rounded border border-red-900/40 bg-red-950/20 px-3 py-1.5 text-xs text-red-300 hover:bg-red-900/30 transition-colors">Archive</button>
-							</div>
-						{/if}
-					</div>
-
-					<div class="rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
-						<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Lifecycle Feed</div>
-						{#if orderedRecentEvents.length === 0}
-							<div class="mt-2 text-xs text-gray-500">No events recorded.</div>
-						{:else}
-							<div class="mt-2 max-h-[400px] overflow-auto space-y-1.5">
-								{#each orderedRecentEvents as event}
-									<div class="rounded border border-[#1f1f1f] bg-[#070707] px-2.5 py-2">
-										<div class="flex items-center justify-between gap-2 text-[11px]">
-											<div class="flex items-center gap-1.5">
-												<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 font-mono text-gray-300">{lifecycleStageLabel(event.from_state)}</span>
-												<span class="text-gray-600">-></span>
-												<span class="rounded border border-cyan-900/40 bg-cyan-950/20 px-1.5 py-0.5 font-mono text-cyan-200">{lifecycleStageLabel(event.to_state)}</span>
-												<span class="rounded border border-[#2b2b2b] bg-black px-1.5 py-0.5 text-gray-500">{lifecycleActorLabel(event.actor)}</span>
-											</div>
-											<span class="shrink-0 text-gray-500">{fmtDate(event.created_at)}</span>
-										</div>
-										{#if event.reason && event.reason.trim()}
-											<div class="mt-1 text-xs text-gray-400">{event.reason.trim()}</div>
-										{/if}
-									</div>
-								{/each}
-							</div>
-						{/if}
-					</div>
-				</div>
 					</div>
 				</div>
 			{/if}
@@ -4297,23 +4412,6 @@
 			{/if}
 
 			{#if activeTab === 'optimizations'}
-				<!-- Sub-tab navigation -->
-				<div class="mb-4 flex gap-1 rounded border border-[#222] bg-[#090909] p-1">
-					{#each [
-						{ key: 'optimization', label: 'Optimization' },
-						{ key: 'robustness', label: 'Robustness Suite' },
-					] as tab}
-						<button
-							class="flex-1 rounded px-2 py-1.5 text-[11px] uppercase tracking-wide transition-colors
-								{robustnessSubTab === tab.key ? 'bg-[#1a1a1a] text-white border border-[#333]' : 'text-gray-500 hover:text-gray-300 border border-transparent'}"
-							on:click={() => selectRobustnessTab(tab.key as RobustnessSubTab)}
-						>
-							{tab.label}
-						</button>
-					{/each}
-				</div>
-
-				{#if robustnessSubTab === 'optimization'}
 					<div class="mb-3 rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
 						<div class="grid gap-3 lg:grid-cols-[1fr_1fr_auto]">
 							<div class="grid gap-2 sm:grid-cols-2">
@@ -4635,9 +4733,9 @@
 							{/if}
 						</div>
 					</div>
-				{/if}
+			{/if}
 
-				{#if robustnessSubTab === 'robustness'}
+			{#if activeTab === 'robustness'}
 					<div class="space-y-3">
 						<GauntletStatusCard
 							{strategyId}
@@ -4647,11 +4745,7 @@
 							on:selectTest={(event) => {
 								selectedRobustnessTest = event.detail.key;
 							}}
-							on:promote={() => {
-								showPromoteConfirm = true;
-								promoteReason = '';
-								promoteBlockReason = '';
-							}}
+							on:promote={() => openStageChange()}
 						/>
 						<RobustnessPanel
 							{strategyId}
@@ -4705,9 +4799,8 @@
 					</div>
 				{/if}
 
-			{/if}
 
-			{#if (activeTab === 'backtests' || activeTab === 'optimizations') && (resultLoading || !!resultError || !!selectedResult)}
+			{#if (activeTab === 'backtests' || activeTab === 'optimizations' || activeTab === 'robustness') && (resultLoading || !!resultError || !!selectedResult)}
 				<div class="mt-3 rounded-lg border border-[#1d1d1d] bg-[#090909] p-3">
 					{#if resultLoading}
 						<div class="py-4 text-center text-sm text-gray-500">Loading result details...</div>
