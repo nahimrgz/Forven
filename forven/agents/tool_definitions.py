@@ -144,8 +144,6 @@ _BACKTESTING_TOOL_NAMES = _BACKTESTING_PERM_NAMES
 # shell, or mutates state (no write_file/run_shell/store_*/register_strategy).
 CHAT_ASK_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file",            # inspect strategy code / workspace files
-    "search_memory",        # operator-facing memory recall
-    "search_chroma",        # vector recall over narratives/research
     "recall_similar_situation",  # Brain's situational recall
     "list_local_datasets",  # what OHLCV data is on disk
     "get_local_ohlcv",      # read cached candles

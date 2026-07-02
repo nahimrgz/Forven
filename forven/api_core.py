@@ -4230,18 +4230,6 @@ def _backtest_trash_table(conn):
         )
 
 
-def _delete_backtest_record(result_id: str):
-    """Delete one backtest result from Chroma collection."""
-    result_id = str(result_id or "").strip()
-    if not result_id:
-        return
-    try:
-        from forven.vectordb import get_collection
-        get_collection("backtest_results").delete(ids=[result_id])
-    except Exception:
-        pass
-
-
 def _coerce_float(value, default: float | None = 0.0) -> float | None:
     """Safely parse common float-like values from legacy metadata."""
     fallback_none = default is None
@@ -5290,56 +5278,15 @@ def _coalesce_ws_messages(messages: list[dict]) -> dict | None:
 
 
 def _chroma_backtest_records():
-    """Return all backtest result records from Chroma in a deterministic order.
+    """Legacy secondary backtest-result source — permanently empty.
 
-    Runs ChromaDB in a subprocess to isolate segfaults on Windows (ONNX
-    runtime crashes).  Falls back to an empty list on any failure.
+    The ChromaDB vector layer was removed 2026-07-02 (it had been disabled in
+    production for months and held no records). SQLite backtest_results rows +
+    artifacts are the canonical store; callers that still merge this source get
+    an empty list. Kept as a stub so the merge sites need no rewrite — safe to
+    inline away whenever those paths are next touched.
     """
-    # Check availability in the main process first.  If ChromaDB embeddings
-    # are broken (common on Windows/ONNX), skip the subprocess entirely to
-    # avoid spawning nested health-check subprocesses that deadlock under
-    # file lock contention.
-    from forven.vectordb import _check_chroma_available
-    if not _check_chroma_available():
-        return []
-
-    import subprocess
-    import sys
-
-    script = (
-        "import json\n"
-        "from forven.vectordb import get_collection\n"
-        "col = get_collection('backtest_results')\n"
-        "if col is None or col.count() == 0:\n"
-        "    print(json.dumps([]))\n"
-        "else:\n"
-        "    records = col.get(include=['metadatas'], limit=col.count())\n"
-        "    ids = records.get('ids', [])\n"
-        "    metas = records.get('metadatas') or []\n"
-        "    rows = []\n"
-        "    for i, rid in enumerate(ids):\n"
-        "        rows.append({'id': rid, 'metadata': metas[i] if i < len(metas) else {}})\n"
-        "    print(json.dumps(rows))\n"
-    )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=60,
-        )
-        if proc.returncode != 0:
-            log.warning(
-                "ChromaDB read subprocess failed (exit %d): %s",
-                proc.returncode, (proc.stderr or "")[:200],
-            )
-            return []
-        rows = json.loads(proc.stdout)
-        if isinstance(rows, list):
-            rows.sort(key=_record_backtest_sort_time, reverse=True)
-            return rows
-        return []
-    except Exception as exc:
-        log.warning("Could not read local backtest_results collection: %s", exc)
-        return []
+    return []
 
 
 def _resolve_backtest_results_remote_api() -> str | None:
@@ -5695,7 +5642,7 @@ def _normalize_backtest_summary(record: dict) -> dict:
     backtest_months = _meta_float("backtest_months")
     derived_backtest_months = None
 
-    # Filter -999.0 sentinel values (written by vectordb for absent metrics).
+    # Filter -999.0 sentinel values (legacy rows used them for absent metrics).
     if monthly_return is not None and monthly_return == -999.0:
         monthly_return = None
     if annualized_return is not None and annualized_return == -999.0:
@@ -6257,7 +6204,7 @@ async def post_brain_chat_direct(body: BrainChatBody):
     )
     from forven.agents.tool_definitions import CHAT_ASK_TOOL_NAMES
     from forven.brain import resolve_brain_provider_model
-    from forven.context import build_chat_context, store_conversation
+    from forven.context import build_chat_context
 
     provider, model = resolve_brain_provider_model(
         str(body.provider or "").strip() or None,
@@ -6339,15 +6286,6 @@ async def post_brain_chat_direct(body: BrainChatBody):
         response_text = str(result[0])
     else:
         response_text = str(result)
-
-    # Persist the exchange for long-term recall — best-effort, never blocks the
-    # response (store_conversation is itself fire-and-forget, but guard anyway).
-    try:
-        await store_conversation(
-            None, message, response_text, source="ui_chat"
-        )
-    except Exception:
-        log.debug("UI chat conversation store skipped", exc_info=True)
 
     return {"ok": True, "response": response_text, "mode": "direct"}
 
@@ -8189,11 +8127,7 @@ def get_backtest_results(
 
 
 def update_backtest_result_params(result_id: str, new_params: dict) -> dict:
-    """Update the parameters in an existing backtest result's config_json.
-
-    Updates SQLite first (reliable), then best-effort ChromaDB update.
-    """
-    # Update SQLite first (reliable)
+    """Update the parameters in an existing backtest result's config_json."""
     try:
         with get_db() as conn:
             row = conn.execute(
@@ -8209,23 +8143,6 @@ def update_backtest_result_params(result_id: str, new_params: dict) -> dict:
                 )
     except Exception:
         pass
-
-    # Best-effort ChromaDB update
-    try:
-        from forven.vectordb import get_collection
-        collection = get_collection("backtest_results")
-        if collection is not None:
-            existing = collection.get(ids=[result_id], include=["metadatas", "documents"])
-            if existing["ids"]:
-                meta = existing["metadatas"][0]
-                config = json.loads(meta.get("config_json", "{}"))
-                config["params"] = new_params
-                meta["config_json"] = json.dumps(config, separators=(",", ":"))
-                if isinstance(new_params, dict):
-                    meta["params"] = json.dumps(new_params, separators=(",", ":"))
-                collection.upsert(ids=[result_id], documents=existing["documents"], metadatas=[meta])
-    except Exception:
-        pass  # ChromaDB update is best-effort
 
     return {"ok": True, "result_id": result_id, "updated_params": new_params}
 
@@ -8634,7 +8551,6 @@ def permanent_delete_backtest_result(result_id: str):
     with get_db() as conn:
         conn.execute("DELETE FROM backtest_result_trash WHERE result_id = ?", (result_id,))
         _set_backtest_result_trash(conn, result_id, deleted=False)
-        _delete_backtest_record(result_id)
     return {"status": "ok", "id": result_id}
 
 
@@ -10026,22 +9942,17 @@ def _persist_completed_backtest_run(
     )
 
     try:
-        from forven.vectordb import store_backtest_result
+        from forven.quant_skills_extractor import record_backtest_for_learning
 
-        store_backtest_result(
+        record_backtest_for_learning(
             strategy_id=strategy_id,
             asset=asset,
             strategy_type=str(strategy_type),
             params=params if isinstance(params, dict) else {},
             metrics=metrics_for_storage,
             fitness=float(sharpe),
-            result_id=result_id,
-            job_id=job_id,
             strategy_name=strategy_name,
-            lifecycle_strategy_id=lifecycle_tag,
             config=compact_config,
-            definition_json=definition_json if isinstance(definition_json, dict) else None,
-            result_type="backtest",
         )
     except Exception:
         pass
@@ -10978,25 +10889,20 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
     )
 
     try:
-        from forven.vectordb import store_backtest_result
+        from forven.quant_skills_extractor import record_backtest_for_learning
 
-        store_backtest_result(
+        record_backtest_for_learning(
             strategy_id=strategy_id,
             asset=asset,
             strategy_type=str(strategy_type),
             params=merged_params,
             metrics=metrics_for_storage,
             fitness=float(sharpe),
-            result_id=result_id,
-            job_id=job_id,
             strategy_name=strategy_name,
-            lifecycle_strategy_id=lifecycle_tag,
             config=compact_config,
-            definition_json=body.definition_json if isinstance(body.definition_json, dict) else None,
-            result_type="backtest",
         )
     except Exception:
-        pass  # ChromaDB store is best-effort; SQLite row already persisted
+        pass  # learning loop is best-effort; SQLite row already persisted
     _write_backtest_result_artifacts(
         result_id, job_id, run.get("trades"),
         equity_curve=run.get("equity_curve"),
@@ -11340,22 +11246,17 @@ def post_optimization_submit(body: OptimizationSubmitBody):
             )
 
             try:
-                from forven.vectordb import store_backtest_result
+                from forven.quant_skills_extractor import record_backtest_for_learning
 
-                store_backtest_result(
+                record_backtest_for_learning(
                     strategy_id=strategy_id,
                     asset=asset,
                     strategy_type=str(strategy_type),
                     params=best_params if isinstance(best_params, dict) else {},
                     metrics=metrics_for_storage,
                     fitness=float(best_fitness),
-                    result_id=result_id,
-                    job_id=job_id,
                     strategy_name=strategy_name,
-                    lifecycle_strategy_id=opt_lifecycle_tag,
                     config=compact_config,
-                    definition_json=definition_json,
-                    result_type="optimization",
                 )
             except Exception:
                 pass

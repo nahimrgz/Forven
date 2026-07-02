@@ -64,7 +64,6 @@ FACTORY_RESET_CATEGORIES = {
         "tables": ["strategies", "strategy_events", "strategy_recovery_state", "strategy_recovery_events", "archived_strategies", "approvals", "strategy_candidates", "backtest_runs", "backtest_results", "backtest_result_trash", "gauntlet_workflows", "gauntlet_steps", "gauntlet_artifacts", "gauntlet_events", "hypotheses", "hypothesis_artifacts", "data_gaps", "data_gap_links"],
         "counter_reset": True,
         "results_dir": True,
-        "chroma_collections": ["backtest_results", "research_hypotheses"],
     },
     "agent_task_history": {
         "label": "Agent Tasks & Audit",
@@ -77,7 +76,6 @@ FACTORY_RESET_CATEGORIES = {
         "description": "All trade records, portfolio positions, slippage audits, and decay audits",
         "default_keep": False,
         "tables": ["trades", "portfolio_positions", "trade_slippage_audit", "strategy_decay_audit"],
-        "chroma_collections": ["trade_post_mortems", "execution_slippage"],
     },
     "activity_log": {
         "label": "Activity Log",
@@ -86,10 +84,10 @@ FACTORY_RESET_CATEGORIES = {
         "tables": ["activity_log", "notifications", "notification_deliveries"],
     },
     "ai_memory": {
-        "label": "AI Memory & Vectors",
-        "description": "ChromaDB vector collections and workspace memory files (LESSONS.md, evolution_journal.md)",
+        "label": "AI Memory",
+        "description": "Workspace memory files (LESSONS.md, evolution_journal.md)",
         "default_keep": False,
-        "tables": ["memory_annotations", "memory_events"],
+        "tables": [],
         "files": True,
     },
     "scheduler_jobs": {
@@ -1145,42 +1143,6 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     dismissed_by TEXT,
     dismissed_note TEXT
 );
-
-CREATE TABLE IF NOT EXISTS memory_annotations (
-    source TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_kind TEXT,
-    title_override TEXT,
-    tags_json TEXT,
-    note TEXT,
-    tier TEXT,
-    pinned INTEGER NOT NULL DEFAULT 0,
-    hidden INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
-    PRIMARY KEY (source, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_memory_annotations_updated_at
-    ON memory_annotations (updated_at);
-CREATE INDEX IF NOT EXISTS idx_memory_annotations_pinned
-    ON memory_annotations (pinned);
-CREATE INDEX IF NOT EXISTS idx_memory_annotations_hidden
-    ON memory_annotations (hidden);
-
-CREATE TABLE IF NOT EXISTS memory_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    payload_json TEXT,
-    actor TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_memory_events_lookup
-    ON memory_events (source, source_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memory_events_created_at
-    ON memory_events (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
@@ -3211,8 +3173,7 @@ def _run_migrations(conn: sqlite3.Connection):
         END
     """)
 
-    # Hermes-inspired Phase 3 (P3-T01): quant skill versioning + outcome closure
-    # + brain lessons. Brain-only persistence layer.
+    # Hermes-inspired Phase 3 (P3-T01): quant skill versioning + outcome closure.
     #
     # quant_skills_history captures every write to a SKILL.md as a row, so we
     # can answer "what changed in v3?" without re-reading the disk file. Skills
@@ -3280,56 +3241,17 @@ def _run_migrations(conn: sqlite3.Connection):
         "ON skill_outcome_events (skill_name, strategy_id, triggered_by)"
     )
 
-    # brain_lessons stores Brain's self-judgment lessons. Mirrors the
-    # brain_decisions FTS5 mirror pattern from Phase 1 so search_lessons() can
-    # match against situation_pattern + lesson_text.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS brain_lessons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            situation_pattern TEXT NOT NULL,
-            lesson_text TEXT NOT NULL,
-            evidence_decisions_json TEXT NOT NULL DEFAULT '[]',
-            confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
-            last_validated_at TEXT,
-            created_by TEXT NOT NULL DEFAULT 'brain'
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_brain_lessons_created_at "
-        "ON brain_lessons (created_at DESC)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_brain_lessons_confidence "
-        "ON brain_lessons (confidence DESC)"
-    )
+    # brain_lessons removed 2026-07-02: the KB never gained an autonomous writer
+    # (0 rows after months), so the module, endpoints, and prompt blocks were
+    # deleted. Drop the leftover tables on existing installs.
+    conn.execute("DROP TABLE IF EXISTS brain_lessons_fts")
+    conn.execute("DROP TABLE IF EXISTS brain_lessons")
 
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS brain_lessons_fts USING fts5(
-            situation_pattern, lesson_text,
-            content='brain_lessons', content_rowid='id'
-        )
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS brain_lessons_ai AFTER INSERT ON brain_lessons BEGIN
-            INSERT INTO brain_lessons_fts(rowid, situation_pattern, lesson_text)
-            VALUES (new.id, new.situation_pattern, new.lesson_text);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS brain_lessons_ad AFTER DELETE ON brain_lessons BEGIN
-            INSERT INTO brain_lessons_fts(brain_lessons_fts, rowid, situation_pattern, lesson_text)
-            VALUES ('delete', old.id, old.situation_pattern, old.lesson_text);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS brain_lessons_au AFTER UPDATE ON brain_lessons BEGIN
-            INSERT INTO brain_lessons_fts(brain_lessons_fts, rowid, situation_pattern, lesson_text)
-            VALUES ('delete', old.id, old.situation_pattern, old.lesson_text);
-            INSERT INTO brain_lessons_fts(rowid, situation_pattern, lesson_text)
-            VALUES (new.id, new.situation_pattern, new.lesson_text);
-        END
-    """)
+    # Memory Bank removed 2026-07-02: the operator curation layer was never
+    # used (0 annotations/events after months). Page, router, and domain module
+    # are gone; drop the leftover overlay tables on existing installs.
+    conn.execute("DROP TABLE IF EXISTS memory_annotations")
+    conn.execute("DROP TABLE IF EXISTS memory_events")
 
     # Hermes-inspired Phase 4 (P4-T01): MCP client server registry + per-agent
     # grants. Operational state, separate from brain_* memory tables.
@@ -3384,7 +3306,6 @@ FTS5_TABLES: tuple[str, ...] = (
     "brain_decisions_fts",
     "agent_tasks_fts",
     "task_audit_log_fts",
-    "brain_lessons_fts",
 )
 
 
@@ -6200,17 +6121,6 @@ def _factory_reset_delete_directory_contents(path: Path) -> None:
             continue
 
 
-def _factory_reset_wipe_chroma_collections(collections: list[str]) -> None:
-    if not collections:
-        return
-    try:
-        from forven.vectordb import wipe_collections
-
-        wipe_collections(collections)
-    except Exception:
-        pass
-
-
 def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials_wipe: bool = False) -> dict:
     """Factory reset data categories not selected in `keep_categories`.
 
@@ -6280,10 +6190,6 @@ def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials
                 for key in keys:
                     conn.execute("DELETE FROM kv WHERE key = ?", (key,))
 
-            # Surgically wipe related Chroma collections
-            if config.get("chroma_collections"):
-                _factory_reset_wipe_chroma_collections(config["chroma_collections"])
-
             # Surgically wipe results artifacts
             if config.get("results_dir"):
                 repo_root = Path(__file__).parent.parent
@@ -6311,6 +6217,8 @@ def factory_reset(keep_categories: list[str] | None = None, *, allow_credentials
             conn.execute("INSERT OR REPLACE INTO container_counters (prefix, next_val) VALUES ('E', 1)")
 
     if "ai_memory" in wipe_set:
+        # Clean the legacy ChromaDB store left behind by old installs (the
+        # vector layer itself was removed).
         chroma_dir = FORVEN_HOME / "chromadb"
         if chroma_dir.exists():
             shutil.rmtree(chroma_dir, ignore_errors=True)
@@ -7008,24 +6916,6 @@ def mark_backtest_failed(strategy_id: str, failure_type: str, reason: str) -> No
             WHERE id = ?""",
             (f"\n[BACKTEST_FAILED] {failure_type}: {reason} at {now}", now, strategy_id)
         )
-    
-    # Store in ChromaDB for post-mortem
-    try:
-        from forven.vectordb import store_post_mortem
-        store_post_mortem(
-            doc_id=f"{strategy_id}_backtest_failed",
-            strategy_id=strategy_id,
-            content=f"Backtest failed: {failure_type}. Reason: {reason}. This container was marked as backtest_failed to prevent phantom container syndrome.",
-            metadata={
-                "failure_type": failure_type,
-                "reason": reason,
-                "lifecycle_stage": "backtest_failed"
-            }
-        )
-    except Exception:
-        pass  # Don't fail if ChromaDB is unavailable
-
-
 
 
 # =============================================================================
@@ -7384,69 +7274,6 @@ def verify_fitness_before_archive(strategy_id: str) -> tuple[bool, str]:
             return False, f"Strategy {strategy_id} has no valid performance metrics - archive REJECTED"
         
         return True, ""
-
-
-def verify_chroma_persistence(result_id: str) -> tuple[bool, str]:
-    """
-    ChromaDB Persistence Check (Guardrail #2).
-    Verify write confirmation after every backtest completes.
-    Returns (persisted, error_message).
-    """
-    normalized_result_id = str(result_id or "").strip()
-    if not normalized_result_id:
-        return False, "Missing result_id for ChromaDB persistence verification"
-    try:
-        from forven.vectordb import _check_chroma_available
-
-        if not _check_chroma_available():
-            return False, "ChromaDB unavailable; persistence verification skipped"
-    except Exception as e:
-        return False, f"ChromaDB availability verification error: {str(e)}"
-
-    try:
-        import subprocess
-        import sys
-        import textwrap
-
-        from forven.config import CHROMA_DIR
-
-        script = textwrap.dedent(
-            """
-            import json
-            import pathlib
-            import sys
-
-            import chromadb
-
-            result_id = sys.argv[1]
-            chroma_dir = pathlib.Path(sys.argv[2])
-            client = chromadb.PersistentClient(path=str(chroma_dir))
-            collection = client.get_or_create_collection(
-                "backtest_results",
-                metadata={"hnsw:space": "cosine"},
-            )
-            result = collection.get(ids=[result_id])
-            print(json.dumps({"persisted": bool(result and result.get("ids") and result_id in result["ids"])}))
-            """
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", script, normalized_result_id, str(CHROMA_DIR)],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if proc.returncode != 0:
-            return (
-                False,
-                "ChromaDB verification subprocess failed "
-                f"(exit {proc.returncode}): {(proc.stderr or '').strip()[:300]}",
-            )
-        payload = json.loads(proc.stdout or "{}")
-        if bool(payload.get("persisted")):
-            return True, ""
-        return False, f"Result {normalized_result_id} not found in ChromaDB - PERSISTENCE VERIFICATION FAILED"
-    except Exception as e:
-        return False, f"ChromaDB verification subprocess error: {str(e)}"
 
 
 def detect_ghost_containers() -> list[dict]:

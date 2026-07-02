@@ -791,6 +791,30 @@ def _brain_response_text(response: object) -> str:
     return text
 
 
+def _record_brain_spend(provider: str, model: str | None, response: object) -> None:
+    """Persist Brain-cycle token usage into the daily spend rollup.
+
+    Worker agent tasks account every call in agent_tasks/agent_spend_daily, but
+    the Brain loop discarded its usage tuple — its (large, memory-heavy) context
+    cost was invisible everywhere. Best-effort, never the critical path.
+    """
+    usage = response[1] if isinstance(response, tuple) and len(response) > 1 else None
+    if not isinstance(usage, dict):
+        return
+    try:
+        from forven.cost_pricing import estimate_cost_usd
+        from forven.db import record_agent_spend
+
+        record_agent_spend(
+            "brain",
+            cost_usd=estimate_cost_usd(provider, model, usage),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+    except Exception:
+        log.debug("brain spend accounting skipped", exc_info=True)
+
+
 async def _run_agent_task(agent: dict, task: dict) -> dict:
     payload = _parse_agent_task_input_data(task)
     if _is_crucible_planner_backtest_task(agent, task, payload):
@@ -899,20 +923,13 @@ async def _run_brain_task(task: dict) -> None:
         finally:
             reset_tool_context(tool_tokens)
 
+        _record_brain_spend(provider, model, response)
         response_text = _brain_response_text(response)
         with get_db() as conn:
             conn.execute(
                 "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
                 (datetime.now(timezone.utc).isoformat(), json.dumps({"response": response_text}), task["id"]),
             )
-
-        # Persist the exchange for long-term recall — best-effort, never blocks.
-        try:
-            from forven.context import store_conversation
-
-            await store_conversation(None, message, response_text, source="ui_chat")
-        except Exception:
-            log.debug("UI chat conversation store skipped", exc_info=True)
         return
 
     ui_context = str(payload.get("context") or "").strip()
@@ -1029,6 +1046,8 @@ async def _run_brain_task(task: dict) -> None:
         reset_active_decision_id(decision_token)
         reset_tool_context(tool_tokens)
 
+    _record_brain_spend(provider, model, response)
+
     if decision_id:
         try:
             from forven.db import get_task_tool_calls
@@ -1071,16 +1090,6 @@ async def _run_brain_task(task: dict) -> None:
                 task["id"],
             ),
         )
-
-    try:
-        from forven.vectordb import store_narrative
-
-        store_narrative(
-            f"[Brain] {str(response)[:500]}",
-            metadata={"type": "brain_cycle", "source": "forven"},
-        )
-    except Exception:
-        log.debug("Skipping Chroma narrative storage for brain task %s", task.get("id"), exc_info=True)
 
 
 def acquire_runtime_worker_lock(lock_name: str = "api_runtime_worker.lock") -> bool:

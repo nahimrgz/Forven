@@ -58,33 +58,6 @@ def _extract_baseline_sharpe(metrics_raw) -> float | None:
     return _to_float(baseline)
 
 
-def _lookup_chroma_baseline_sharpe(strategy_id: str) -> float | None:
-    """Fallback baseline Sharpe from Chroma backtest metadata."""
-    try:
-        from forven.vectordb import get_collection
-
-        col = get_collection("backtest_results")
-        if col.count() == 0:
-            return None
-        data = col.get(where={"strategy_id": strategy_id}, include=["metadatas"])
-        metadatas = data.get("metadatas") or []
-        if not metadatas:
-            return None
-
-        sharpes = []
-        for meta in metadatas:
-            if not meta:
-                continue
-            sharpe = _to_float(meta.get("sharpe"))
-            if sharpe is not None and sharpe > 0:
-                sharpes.append(sharpe)
-        if sharpes:
-            return max(sharpes)
-    except Exception:
-        return None
-    return None
-
-
 def _annualized_sharpe(pnls: list[float], window_hours: int) -> float:
     if len(pnls) < 2:
         return 0.0
@@ -159,9 +132,6 @@ def run_decay_tracker(
                 skipped.append({"strategy_id": strategy_id, "reason": "unsupported_decay_stage"})
                 continue
             baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"))
-            if baseline_sharpe is None or baseline_sharpe <= 0:
-                baseline_sharpe = _lookup_chroma_baseline_sharpe(strategy_id)
-
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 skipped.append({"strategy_id": strategy_id, "reason": "missing_or_nonpositive_baseline_sharpe"})
                 continue
@@ -303,7 +273,7 @@ def run_decay_tracker(
                         f"- Closed trades in window: {event['trade_count_72h']}\n\n"
                         "Tasks:\n"
                         "1. Re-run backtests and walk-forward validation with current data.\n"
-                        "2. Search execution_slippage in ChromaDB and incorporate realistic slippage.\n"
+                        "2. Review trade_slippage_audit for this strategy and incorporate realistic slippage.\n"
                         "3. Propose parameter updates or a replacement strategy.\n"
                         "4. Store results in backtest_results and summarize recommendations."
                     ),
@@ -428,8 +398,6 @@ def run_decay_kill_switch() -> dict:
             strategy_id = strategy["id"]
 
             baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"))
-            if baseline_sharpe is None or baseline_sharpe <= 0:
-                baseline_sharpe = _lookup_chroma_baseline_sharpe(strategy_id)
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 continue
 
@@ -573,7 +541,7 @@ def run_slippage_monitor(
     lookback_hours: int = 168,
     max_trades: int = 2000,
 ) -> dict:
-    """Compute signal vs fill slippage and store audits + Chroma samples."""
+    """Compute signal vs fill slippage and store audit rows."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
     analyzed_at = _now_iso()
 
@@ -696,26 +664,6 @@ def run_slippage_monitor(
                 WHERE datetime(analyzed_at) >= datetime(?)""",
             (cutoff,),
         ).fetchall()
-
-    # Push changed samples to ChromaDB (trade-level semantic store).
-    if changed_samples:
-        try:
-            from forven.vectordb import store_slippage_sample
-
-            for sample in changed_samples:
-                store_slippage_sample(
-                    trade_id=sample["trade_id"],
-                    strategy=sample["strategy"],
-                    asset=sample["asset"],
-                    direction=sample["direction"],
-                    leg=sample["leg"],
-                    signal_price=sample["signal_price"],
-                    fill_price=sample["fill_price"],
-                    slippage_bps=sample["slippage_bps"],
-                    abs_slippage_bps=sample["abs_slippage_bps"],
-                )
-        except Exception as e:
-            log.warning("ChromaDB slippage store failed: %s", e)
 
     penalties: dict[str, dict] = {}
     grouped: dict[str, list[float]] = {}

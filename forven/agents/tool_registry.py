@@ -54,28 +54,6 @@ TRUNCATION_LINE_MARKER = "…[truncated]"
 
 log = logging.getLogger("forven.agents.tool_registry")
 
-# Memory tools backed by the in-process ChromaDB vector store. When ChromaDB is
-# disabled (FORVEN_DISABLE_CHROMA_IN_PROCESS — a deliberate guard against an ONNX
-# segfault on some GPUs), these are no-ops: searches always return empty and the
-# store_* tools previously reported FALSE success while persisting nothing. They
-# are gated OUT of the advertised toolset while the vector layer is unavailable,
-# so agents don't waste calls (or build on memory they think was saved). The gate
-# is on live availability, so they auto-return if ChromaDB is ever re-enabled.
-_CHROMA_BACKED_TOOL_NAMES: frozenset[str] = frozenset(
-    {"search_memory", "store_memory", "search_chroma", "store_chroma"}
-)
-
-
-def _chroma_memory_unavailable() -> bool:
-    """True when ChromaDB-backed memory tools should be hidden (vector layer off)."""
-    try:
-        from forven.vectordb import _in_process_chroma_disabled
-
-        return _in_process_chroma_disabled()
-    except Exception:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Registry data structures
 # ---------------------------------------------------------------------------
@@ -393,10 +371,7 @@ def get_tools_for_agent(
     use_context = context in VALID_CONTEXTS
     if use_context:
         overrides = _load_toolset_overrides(agent_id, context or "")
-    hide_chroma = _chroma_memory_unavailable()
     for tool in _REGISTRY.values():
-        if hide_chroma and tool.name in _CHROMA_BACKED_TOOL_NAMES:
-            continue
         if "*" not in tool.permissions and not any(
             subject in tool.permissions for subject in subjects
         ):
@@ -427,15 +402,11 @@ def filter_tools_for_context(
     No-op when *context* is None or not one of ``VALID_CONTEXTS``. Tool names
     not present in the registry are kept (fail open on unknown names).
     """
-    hide_chroma = _chroma_memory_unavailable()
     if context not in VALID_CONTEXTS:
-        # Still drop dead chroma-backed memory tools even without a context.
-        return [e for e in tools if not (hide_chroma and e.get("name") in _CHROMA_BACKED_TOOL_NAMES)]
+        return tools
     overrides = _load_toolset_overrides(agent_id, context or "")
     out: list[dict] = []
     for entry in tools:
-        if hide_chroma and entry.get("name") in _CHROMA_BACKED_TOOL_NAMES:
-            continue
         tool = _REGISTRY.get(entry.get("name"))
         if tool is None or _resolve_tool_enabled(tool, overrides, context or ""):
             out.append(entry)

@@ -44,7 +44,6 @@ from forven.routers.deepdive import router as deepdive_router
 from forven.routers.assistant import router as assistant_router
 from forven.routers.jobs import router as jobs_router
 from forven.routers.legacy import router as legacy_router
-from forven.routers.memory import router as memory_router
 from forven.routers.diagnostics import router as diagnostics_router
 from forven.routers.mcp import router as mcp_router
 from forven.routers.notifications import router as notifications_router
@@ -192,11 +191,6 @@ if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
-    # ChromaDB's Rust/ONNX path can raise a native access violation on Windows
-    # during agent vector recall. Keep API-owned workers from loading it
-    # in-process; vectordb callers degrade to empty recall instead of crashing
-    # uvicorn.
-    os.environ.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
 
 
 _RUNTIME_LOGGING_CONFIGURED = False
@@ -656,7 +650,6 @@ if not any(isinstance(f, RequestIdLogFilter) for f in _root_logger.filters):
 app.include_router(status_router)
 app.include_router(diagnostics_router)
 app.include_router(notifications_router)
-app.include_router(memory_router)
 app.include_router(hypotheses_router)
 app.include_router(data_gap_router)
 app.include_router(approvals_router)

@@ -265,11 +265,6 @@ export type {
 } from './backtesting';
 
 export {
-	getMemoryOverview,
-	searchMemory,
-	getMemoryItem,
-	updateMemoryAnnotation,
-	applyMemoryAction,
 	getQuantSkills,
 	getQuantSkillDetail,
 	getSkillCandidateHypotheses,
@@ -280,20 +275,6 @@ export {
 	archiveSkill,
 } from './memory';
 export type {
-	MemorySource,
-	MemoryView,
-	MemoryItem,
-	MemorySourceHealth,
-	MemoryTimelineEntry,
-	MemoryMetrics,
-	MemoryOverviewResponse,
-	MemoryTimeRange,
-	MemorySearchRequest,
-	MemorySearchResponse,
-	MemoryItemDetailResponse,
-	MemoryAnnotationUpdate,
-	MemoryActionRequest,
-	MemoryActionResponse,
 	QuantSkill,
 	SkillCandidateHypothesis,
 	QuantSkillsStats,
@@ -861,13 +842,6 @@ export {
 	recallSimilarSituation,
 	getBrainAuxiliary,
 	updateBrainAuxiliary,
-	listBrainLessons,
-	searchBrainLessons,
-	createBrainLesson,
-	getBrainLesson,
-	updateBrainLesson,
-	deleteBrainLesson,
-	validateBrainLesson,
 } from './brain';
 export type {
 	BrainMemoryState,
@@ -896,11 +870,6 @@ export type {
 	BrainAuxiliaryTaskKind,
 	BrainAuxiliaryEntry,
 	BrainAuxiliaryResponse,
-	BrainLesson,
-	BrainLessonsListResponse,
-	BrainLessonsSearchResponse,
-	BrainLessonCreateBody,
-	BrainLessonUpdateBody,
 } from './brain';
 
 export {

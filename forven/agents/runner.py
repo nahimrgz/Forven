@@ -834,8 +834,6 @@ _ARTIFACT_TOOLS: frozenset[str] = frozenset({
     "promote_strategy",
     "assign_agent_task",
     "write_file",
-    "store_memory",
-    "store_chroma",
 })
 
 
@@ -1325,7 +1323,7 @@ async def _run_agent_task_inner(
         # check the agent's narrative against what actually happened. The LLM
         # has been observed to claim it created artifacts when the underlying
         # tool errored; the ledger exposes the audit-log truth at the top of
-        # every surface (UI, Discord, vectordb narrative).
+        # every surface (UI, Discord).
         try:
             ledger_text, tool_trace = _build_tool_ledger(task_display_id)
         except Exception:
@@ -1554,16 +1552,6 @@ async def _run_agent_task_inner(
             )
         else:
             log_activity("info", f"agent:{agent_id}", f"Completed task: {task.get('title', '')}")
-
-        # Store agent narrative in ChromaDB
-        try:
-            from forven.vectordb import store_narrative
-            store_narrative(
-                f"[{agent.get('name', agent_id)}] {response[:500]}",
-                metadata={"agent": agent_id, "task_type": task.get("type", "")},
-            )
-        except Exception:
-            pass
 
         # Provider runtime-health is recorded inside _call_with_tools, keyed on
         # the provider that ACTUALLY ran — so a working fallback never marks a

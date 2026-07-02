@@ -2,7 +2,7 @@
 
 This is the equivalent of OpenClaw's gateway. When Judder sends a message:
 1. Bot receives it
-2. Builds brain context (workspace + SQLite + ChromaDB)
+2. Builds brain context (workspace + SQLite)
 3. Calls AI with the message
 4. Posts the response back to the same channel
 5. Logs the interaction
@@ -538,12 +538,11 @@ def _build_default_agents() -> list[dict]:
             "instructions": (
                 "You are the Quant Researcher for Forven. Your focus is benchmarking, market structure research, data-gap discovery, and data integrity.\n"
                 "1. Read LESSONS.md and archived failure patterns before proposing anything.\n"
-                "2. Search ChromaDB (backtest_results, research_hypotheses, post-mortems) for useful precedents and missing coverage.\n"
-                "3. Analyze the current market regime, external sources, and exploitable edges.\n"
-                "4. Surface benchmark candidates, market observations, and data gaps that strategy-developer agents can use.\n"
-                "5. For any assigned post_mortem task, produce an explicit failure diagnosis with metric evidence, breached thresholds, and corrective actions.\n"
-                "6. Store each failure post-mortem in ChromaDB trade_post_mortems and summarize guardrails as agent narratives.\n"
-                "7. Own data integrity and feature reliability: validate feature definitions, audit dataset drift, feature decay, gaps, and outliers before strategy changes ship; treat data quality as a first-class risk factor.\n"
+                "2. Analyze the current market regime, external sources, and exploitable edges.\n"
+                "3. Surface benchmark candidates, market observations, and data gaps that strategy-developer agents can use.\n"
+                "4. For any assigned post_mortem task, produce an explicit failure diagnosis with metric evidence, breached thresholds, and corrective actions.\n"
+                "5. Record each failure post-mortem in the workspace (post_mortems/) and summarize guardrails in LESSONS.md.\n"
+                "6. Own data integrity and feature reliability: validate feature definitions, audit dataset drift, feature decay, gaps, and outliers before strategy changes ship; treat data quality as a first-class risk factor.\n"
                 "TRADE FREQUENCY: Every strategy must generate at least 30 trades/year. 4h charts: ~1 entry per 12 days. 1h charts: ~1 entry per 3 days. Fewer than 10/year fails WFA.\n"
                 "FILTER DISCIPLINE: Use at most 2 entry filters simultaneously (primary signal + one confirmation). Never stack 3+ conditions — it collapses trade frequency.\n"
                 "ADX LIMITS: adx_min must not exceed 30 on 1h/4h. If using adx_min AND adx_max, they must differ by ≥15 points.\n"
@@ -1350,7 +1349,6 @@ class ForvenBot(commands.Bot):
         """Generate an AI response for an agent-specific Discord bot."""
         from forven.ai import call_ai
         from forven.context import build_agent_context
-        from forven.vectordb import store_narrative
         from forven.workspace import append_workspace, read_workspace
 
         agent = self._agent_data
@@ -1433,26 +1431,12 @@ class ForvenBot(commands.Bot):
         except Exception as e:
             log.warning("Agent memory append failed (%s): %s", agent_id, e)
 
-        try:
-            summary = f"[Discord agent:{agent_id} #{channel_name}] Judder: {content[:200]} | {agent_name}: {response[:300]}"
-            store_narrative(
-                summary,
-                metadata={
-                    "type": "conversation",
-                    "channel": channel_name,
-                    "source": agent_id,
-                    "agent_id": agent_id,
-                },
-            )
-        except Exception:
-            pass
-
         return _sanitize_response(response)
 
     async def _generate_response(self, content: str, channel_id: str, channel_name: str, is_dm: bool) -> str:
         """Generate an AI response to a user message."""
         from forven.ai import call_ai
-        from forven.context import build_chat_context, store_conversation
+        from forven.context import build_chat_context
 
         # Build lightweight chat context (no operational noise)
         context = build_chat_context()
@@ -1510,12 +1494,6 @@ class ForvenBot(commands.Bot):
             )
         except Exception as e:
             log.warning("Workspace memory append failed: %s", e)
-
-        # AUTO-STORE: Save conversation to narrative memory for long-term recall
-        try:
-            await store_conversation(channel_name, content, response)
-        except Exception as e:
-            log.warning("Conversation store failed: %s", e)
 
         # Strip hallucinated tool calls before returning to Discord
         return _sanitize_response(response)
@@ -1938,7 +1916,7 @@ class ForvenBot(commands.Bot):
                     # Full-featured tools for chat — can look things up AND take actions
                     _chat_tool_names = {
                         # Read / search
-                        "read_file", "search_memory", "search_chroma",
+                        "read_file",
                         # Action tools
                         "run_backtest", "run_shell", "write_file",
                         # Brain tools
@@ -1952,8 +1930,6 @@ class ForvenBot(commands.Bot):
                             "\n\n---\n\n# TOOLS\n"
                             "You have tools to look things up AND take actions when asked:\n"
                             "- **read_file**: Read workspace files\n"
-                            "- **search_memory**: Search long-term memory\n"
-                            "- **search_chroma**: Search past experiments and post-mortems\n"
                             "- **run_backtest**: Run a backtest for a specific Strategy Container\n"
                             "- **run_shell**: Execute shell commands\n"
                             "- **write_file**: Create or update files\n"
@@ -2002,11 +1978,7 @@ class ForvenBot(commands.Bot):
                         "- **run_shell**: Execute commands (backtests, data checks)\n"
                         "- **read_file**: Read workspace files (LESSONS.md, evolution_journal.md, memory/)\n"
                         "- **write_file**: Write/append to workspace files (update lessons, log findings, evolve strategies)\n"
-                        "- **search_memory**: Search narrative memory for long-term context\n"
-                        "- **store_memory**: Store insights in narrative memory\n"
-                        "- **run_backtest**: Run a strategy backtest and get fitness score\n"
-                        "- **search_chroma**: Search ChromaDB for past experiments, post-mortems, and execution slippage\n"
-                        "- **store_chroma**: Store data in ChromaDB vector store\n\n"
+                        "- **run_backtest**: Run a strategy backtest and get fitness score\n\n"
                         "## Backtesting (Forven)\n"
                         "- **forven_list_datasets**: List available backtesting datasets\n"
                         "- **forven_create_strategy**: Create a strategy on Forven Backtesting\n"
@@ -2016,7 +1988,7 @@ class ForvenBot(commands.Bot):
                         "- **forven_get_results**: Get detailed backtest results\n\n"
                         "IMPORTANT: When you review agent output, ALWAYS assign follow-up tasks.\n"
                         "When you discover a lesson, UPDATE LESSONS.md. When you evolve a strategy, UPDATE evolution_journal.md.\n"
-                        "When you find something worth remembering long-term, STORE it in narrative memory.\n"
+                        "When you find something worth remembering long-term, write it to a workspace memory file.\n"
                         "You are the Brain — you don't just observe, you ACT. Assign work NOW."
                     )
 
@@ -2083,16 +2055,6 @@ class ForvenBot(commands.Bot):
                             "UPDATE tasks SET status='done', completed_at=?, result=? WHERE id=?",
                             (datetime.now(timezone.utc).isoformat(), json.dumps({"response": response[:2000]}), task["id"]),
                         )
-
-                    # Store brain cycle narrative in ChromaDB
-                    try:
-                        from forven.vectordb import store_narrative
-                        store_narrative(
-                            f"[Brain] {response[:500]}",
-                            metadata={"type": "brain_cycle", "source": "forven"},
-                        )
-                    except Exception:
-                        pass
 
                 # Post response to Discord if channel specified
                 delivery_channel = payload.get("channel")
@@ -2543,7 +2505,6 @@ def run_discord_audit(send_probe: bool = False) -> dict:
 
 async def start_bot():
     """Start the Discord bot (blocking)."""
-    os.environ.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
     if not _acquire_bot_lock():
         status = get_bot_lock_status()
         active_pid = status.get("active_pid")
@@ -2552,7 +2513,6 @@ async def start_bot():
         return
 
     try:
-        log.info("Bot process forcing subprocess-only/disabled ChromaDB access for stability on this host")
         # Symmetry with run_bot(): arm fail-closed spend enforcement before any
         # owns-runtime loop can start.
         from forven.model_selection import ensure_enforcement_armed
@@ -2595,7 +2555,6 @@ def run_bot():
         level=_logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
-    os.environ.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
     if not _acquire_bot_lock():
         status = get_bot_lock_status()
         active_pid = status.get("active_pid")
@@ -2616,7 +2575,6 @@ def run_bot():
         return
 
     try:
-        log.info("Bot process forcing subprocess-only/disabled ChromaDB access for stability on this host")
         log.info("Starting Forven gateway (bot + scheduler + task processor)")
         # Arm fail-closed spend enforcement BEFORE any task/scheduler loop starts,
         # so a bot-owns-runtime process never spends on an unconnected/unselected

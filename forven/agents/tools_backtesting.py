@@ -180,21 +180,17 @@ def _persist_agent_backtest(
     )
 
     try:
-        from forven.vectordb import store_backtest_result
+        from forven.quant_skills_extractor import record_backtest_for_learning
 
-        store_backtest_result(
+        record_backtest_for_learning(
             strategy_id=strategy_id,
             asset=symbol,
             strategy_type=str(strategy_type or strategy_row.get("type") or "").strip(),
             params=params if isinstance(params, dict) else {},
             metrics=merged_metrics,
             fitness=float(fitness),
-            result_id=result_id,
-            job_id=job_id,
             strategy_name=strategy_name,
-            lifecycle_strategy_id=strategy_id,
             config=config_payload,
-            result_type="backtest",
         )
     except Exception:
         pass
@@ -213,12 +209,6 @@ def _persist_agent_backtest(
         merged_metrics,
         promotion_reason="Agent backtest completed",
     )
-
-    # Guardrail #2: Verify ChromaDB persistence
-    from forven.db import verify_chroma_persistence
-    persisted, error_msg = verify_chroma_persistence(result_id)
-    if not persisted:
-        log.warning(f"ChromaDB persistence check failed: {error_msg}")
 
     return True, result_id
 
@@ -607,7 +597,7 @@ def _check_backtesting_available() -> bool:
 
 _BACKTESTING_FALLBACK_MSG = (
     "Forven Backtesting is not reachable. Do NOT debug connectivity — "
-    "use your local tools instead: run_backtest, optimize_strategy, search_chroma, "
+    "use your local tools instead: run_backtest, optimize_strategy, "
     "list_local_datasets. These provide equivalent backtesting capabilities."
 )
 

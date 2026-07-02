@@ -160,37 +160,6 @@ def test_no_context_keeps_legacy_behavior(synthetic_registry) -> None:
     assert {"get_status", "research_news", "archive_strategy"}.issubset(names)
 
 
-# --- ChromaDB-backed memory tools gated on vector-layer availability ------
-
-def test_chroma_memory_tools_hidden_when_vector_layer_disabled(synthetic_registry, monkeypatch) -> None:
-    """When in-process ChromaDB is disabled, the no-op memory tools must be gated
-    OUT of the advertised toolset (they returned empty / false success), and must
-    auto-return when the vector layer is available again."""
-    test_registry = synthetic_registry
-    test_registry["search_memory"] = ToolDef(
-        name="search_memory", description="t", input_schema={"type": "object", "properties": {}},
-        handler=test_registry["get_status"].handler, permissions=frozenset({"*"}), category="general",
-    )
-    test_registry["store_chroma"] = ToolDef(
-        name="store_chroma", description="t", input_schema={"type": "object", "properties": {}},
-        handler=test_registry["get_status"].handler, permissions=frozenset({"*"}), category="general",
-    )
-
-    monkeypatch.setattr(tr, "_chroma_memory_unavailable", lambda: True)
-    hidden = {t["name"] for t in get_tools_for_agent("agent-x", context=None)}
-    assert "search_memory" not in hidden
-    assert "store_chroma" not in hidden
-    assert "get_status" in hidden  # unrelated tools unaffected
-    # filter_tools_for_context drops them too (the brain static-union path).
-    union = [{"name": "search_memory"}, {"name": "store_chroma"}, {"name": "get_status"}]
-    filtered = {t["name"] for t in filter_tools_for_context(union, "agent-x", None)}
-    assert filtered == {"get_status"}
-
-    monkeypatch.setattr(tr, "_chroma_memory_unavailable", lambda: False)
-    shown = {t["name"] for t in get_tools_for_agent("agent-x", context=None)}
-    assert {"search_memory", "store_chroma"}.issubset(shown)
-
-
 def test_scheduled_context_default_denies_research(synthetic_registry) -> None:
     """Scheduled context's default-deny set covers research-class tools."""
     names = {t["name"] for t in get_tools_for_agent("agent-x", context="scheduled")}

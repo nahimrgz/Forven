@@ -8,8 +8,7 @@
 
 	// Decisions re-linked (2026-07-02): the live brain worker now records a
 	// brain_decisions row per autonomous cycle (agent-overhaul), so the ledger
-	// populates again. Recall / Lessons stay unlinked — brain_lessons still has
-	// no writer (BrainRecallTab / BrainLessonsTab remain in the codebase).
+	// populates again. brain_lessons was removed entirely (never gained a writer).
 	type Tab = 'overview' | 'decisions' | 'memory';
 
 	const TABS: { id: Tab; label: string; description: string }[] = [
@@ -26,7 +25,7 @@
 		{
 			id: 'memory',
 			label: 'Working Notes',
-			description: 'Short-term operational notes the Brain carries between cycles (distinct from the long-term Memory Bank store).'
+			description: 'Short-term operational notes the Brain carries between cycles.'
 		}
 	];
 

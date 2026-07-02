@@ -1110,8 +1110,8 @@ def _queue_failure_post_mortem(
         "- Corrective Action:\n"
         "- Preventive Guardrails:\n\n"
         "After analysis:\n"
-        "- store_chroma(collection='trade_post_mortems', ...)\n"
-        "- store_memory(...) with concise lessons to avoid recurrence."
+        "- write_file the full post-mortem under post_mortems/ in the workspace\n"
+        "- append concise lessons to LESSONS.md to avoid recurrence."
     )
     input_data = {
         "strategy_id": strategy_id,
@@ -1944,28 +1944,6 @@ def transition_stage(
     if force_activity_message:
         log_activity("warning", "brain", force_activity_message)
 
-    # Store failures as agent narratives so agents learn from past mistakes
-    if normalized_target in ("archived", "rejected") and event_reason:
-        try:
-            strat_type = row["type"] or "unknown"
-        except (KeyError, IndexError):
-            strat_type = "unknown"
-        try:
-            current_symbol = row["symbol"] or "unknown"
-        except (KeyError, IndexError):
-            current_symbol = "unknown"
-        try:
-            from forven.vectordb import store_post_mortem
-            store_post_mortem(
-                trade_id=f"{strategy_id}-{normalized_target}-{now}",
-                strategy=strategy_id,
-                asset=current_symbol,
-                pnl_pct=0.0,
-                analysis=f"Strategy {strategy_id} ({strat_type}) archived from {current_stage}: {event_reason}",
-            )
-        except Exception:
-            pass
-
     post_mortem_task_id: int | None = None
     post_mortem_task_display_id: str | None = None
     if failure_transition and _should_queue_failure_post_mortem(
@@ -2521,7 +2499,7 @@ async def invoke(
 ) -> str:
     """Invoke the Brain ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ the core decision loop.
 
-    1. Build context from workspace + SQLite + ChromaDB
+    1. Build context from workspace + SQLite
     2. Call AI with the assembled context
     3. Parse response for actions (task assignments, strategy changes, etc.)
     4. Execute actions and store results
@@ -2532,19 +2510,6 @@ async def invoke(
 
     # Build context
     context = build_brain_context(session_type)
-
-    # Inject the Brain's institutional memory (ChromaDB recall + brain_lessons),
-    # keyed on the strategy types/symbols currently in flight, so the cycle's
-    # promote/research decisions are informed by prior research and past judgment
-    # errors instead of starting from a blank slate each time. Best-effort.
-    try:
-        from forven.context import get_brain_learning_injection
-
-        learning = get_brain_learning_injection(_brain_inflight_query())
-        if learning:
-            context += "\n\n---\n\n" + learning
-    except Exception:
-        pass
 
     # Add pending agent task results
     completed_tasks = _get_completed_agent_tasks()
@@ -2684,38 +2649,6 @@ def _build_cycle_prompt() -> str:
         "}\n"
         "Do not include markdown fences or any extra keys."
     )
-
-
-def _brain_inflight_query() -> str:
-    """Build a recall/lessons query from the strategy types + symbols in flight.
-
-    Keys the Brain's institutional-memory injection on what it's actually
-    deciding about right now (strategies in gauntlet/paper/deployed), so recall
-    and lessons surface prior research on those types rather than a generic dump.
-    Best-effort: returns "" on any error (the injector falls back to a generic
-    query). Distinct values only, capped to keep the FTS query small.
-    """
-    try:
-        with get_db() as conn:
-            rows = conn.execute(
-                """
-                SELECT DISTINCT type, symbol FROM strategies
-                WHERE LOWER(COALESCE(stage, status, '')) IN
-                    ('gauntlet', 'paper', 'paper_trading', 'deployed', 'live_graduated', 'backtesting')
-                ORDER BY updated_at DESC
-                LIMIT 12
-                """
-            ).fetchall()
-    except Exception:
-        return ""
-    terms: list[str] = []
-    for r in rows:
-        row = dict(r)
-        for key in ("type", "symbol"):
-            val = str(row.get(key) or "").strip()
-            if val and val not in terms:
-                terms.append(val)
-    return " ".join(terms[:12])
 
 
 def _get_completed_agent_tasks() -> list[dict]:

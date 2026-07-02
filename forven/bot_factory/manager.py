@@ -73,8 +73,13 @@ def _build_isolated_env(bot_config: dict) -> dict[str, str]:
     }
 
     # ISO-4: the subprocess does NOT inherit the parent's os.environ, so it
-    # would miss the in-process ChromaDB segfault guard. Forward it (and related
-    # flags) so bot memory honors the same guard on affected hosts.
+    # would miss the in-process ChromaDB segfault guard for BotMemory's own
+    # chroma store (FORVEN_HOME/chroma/bots — separate from the removed main
+    # vector layer). The API process no longer sets the guard globally, so
+    # default it ON for spawned bots on Windows, where the ONNX crash lives;
+    # an operator can export FORVEN_DISABLE_CHROMA_IN_PROCESS=0 to override.
+    if sys.platform.startswith("win"):
+        env.setdefault("FORVEN_DISABLE_CHROMA_IN_PROCESS", "1")
     for guard_var in (
         "FORVEN_DISABLE_CHROMA_IN_PROCESS",
         "FORVEN_DISABLE_CHROMA",

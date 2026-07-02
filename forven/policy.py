@@ -1992,11 +1992,9 @@ def _verdict_payload_failed(payload: object) -> bool:
 
 
 def verify_backtest_persisted(strategy_id: str) -> tuple[bool, str, dict]:
-    """Verify that backtest results exist in SQLite or ChromaDB before allowing lifecycle transitions."""
-    from forven.vectordb import search_backtest_results
+    """Verify that backtest results exist in SQLite before allowing lifecycle transitions."""
     from forven.db import get_db
-    
-    # First check SQLite
+
     with get_db() as conn:
         sqla_result = conn.execute(
             "SELECT result_id, created_at, metrics_json FROM backtest_results WHERE strategy_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -2005,20 +2003,8 @@ def verify_backtest_persisted(strategy_id: str) -> tuple[bool, str, dict]:
 
     if sqla_result and sqla_result["metrics_json"]:
         return True, "Found SQLite backtest results", {"source": "sqlite", "result_id": sqla_result["result_id"]}
-    
-    # Also check ChromaDB
-    # P1-7: search_backtest_results returns list[dict], not raw chroma result.
-    try:
-        chroma_results = search_backtest_results(
-            query=f"strategy_id:{strategy_id}",
-            n_results=1,
-        )
-        if chroma_results and len(chroma_results) > 0:
-            return True, "Found ChromaDB backtest results", {"source": "chromadb"}
-    except Exception as exc:
-        log.warning("ChromaDB backtest verification failed for %s: %s", strategy_id, exc)
-    
-    return False, "No backtest results found in SQLite or ChromaDB", {}
+
+    return False, "No backtest results found in SQLite", {}
 
 
 def verify_backtest_exists_for_stage_transition(strategy_id: str, target_stage: str) -> tuple[bool, str]:
@@ -2050,7 +2036,7 @@ def verify_backtest_exists_for_stage_transition(strategy_id: str, target_stage: 
         except (_json.JSONDecodeError, KeyError):
             pass
 
-    # Fall back to checking the backtest_results table and ChromaDB
+    # Fall back to checking the backtest_results table
     has_data, message, _ = verify_backtest_persisted(strategy_id)
 
     if not has_data:

@@ -127,7 +127,7 @@
 				<span>Memory</span>
 				<strong>{overview.memory.char_count}/{overview.memory.cap}</strong>
 			</a>
-			<a class="stat" href="/tasks">
+			<a class="stat" href="/agents?tab=tasks">
 				<span>Active Work</span>
 				<strong>{overview.stats.active_tasks}</strong>
 			</a>
@@ -138,10 +138,6 @@
 			<a class="stat" href="/brain?tab=decisions">
 				<span>Decisions</span>
 				<strong>{overview.stats.decisions}</strong>
-			</a>
-			<a class="stat" href="/brain?tab=lessons">
-				<span>Lessons</span>
-				<strong>{overview.stats.lessons}</strong>
 			</a>
 		</section>
 
@@ -188,7 +184,7 @@
 		<section class="panel">
 			<header>
 				<h3>Active Brain-Assigned Work</h3>
-				<a href="/tasks">Open Tasks</a>
+				<a href="/agents?tab=tasks">Open Tasks</a>
 			</header>
 			{#if overview.active_tasks.length === 0}
 				<p class="empty-inline">No pending, running, blocked, or failed Brain-assigned tasks.</p>

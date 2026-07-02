@@ -2193,8 +2193,7 @@ def _run_testing_step_impl(code_first: bool = True) -> dict:
             f"   Use run_backtest with strategy_type={strat_type} and pick the best symbol/timeframe context by robustness + fitness.\n"
             f"2. If baseline Sharpe > 0.5, you MUST run Walk-Forward Analysis (WFA) via the `optimize_strategy` tool.\n"
             "3. If WFA passes without severe degradation, you MUST run the full robustness gauntlet and persist the actual artifacts for walk_forward, monte_carlo, param_jitter, cost_stress, and regime_split. Do not treat synthetic verdict summaries as promotion evidence.\n"
-            "4. Record all baseline results and robustness artifacts in ChromaDB via store_chroma.\n"
-            "5. Summarize: PASS (promote to paper) or FAIL (archive).\n\n"
+            "4. Summarize: PASS (promote to paper) or FAIL (archive).\n\n"
             f"Quick Screen floor: Return >= {min_return_pct}%, Sharpe >= {min_sharpe}, MaxDD <= {max_dd_pct}%.\n"
             f"Gauntlet floor: Composite robustness >= {min_robustness}/100 plus persisted robustness artifacts for every required test."
         )
@@ -2649,11 +2648,11 @@ def run_weekly_review():
                 description=(
                     f"WEEKLY REVIEW — Post-mortem analysis for retired strategies: {', '.join(retired)}\n\n"
                     "For each retired strategy:\n"
-                    "1. Use search_chroma to review its backtest history\n"
+                    "1. Use forven_get_results to review its backtest history\n"
                     "2. Identify why it failed (regime change? parameter drift? fundamental flaw?)\n"
                     "3. Extract lessons learned\n"
-                    "4. Store post-mortem in ChromaDB via store_chroma (trade_post_mortems collection)\n"
-                    "5. Store key insights in narrative memory via store_memory\n\n"
+                    "4. write_file the post-mortem under post_mortems/ in the workspace\n"
+                    "5. Append key insights to LESSONS.md\n\n"
                     "These lessons should inform future ideation cycles."
                 ),
                 strategy_id=retired[0],
