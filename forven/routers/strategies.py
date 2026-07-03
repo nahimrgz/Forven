@@ -648,9 +648,9 @@ def post_backtest_preview(body: core.BacktestPreviewBody):
 
 
 @router.post("/api/backtests/preview-chart")
-def post_backtest_preview_chart(body: core.PreviewChartBody):
+async def post_backtest_preview_chart(body: core.PreviewChartBody):
     """Live chart context (bars + overlays + signal markers) for a visual spec."""
-    return core.post_backtest_preview_chart(body)
+    return await asyncio.to_thread(core.post_backtest_preview_chart, body)
 
 
 @router.post("/api/backtests/nl-to-spec")
@@ -669,8 +669,10 @@ def post_send_to_forge(body: core.SendToForgeBody):
     return core.send_manual_strategy_to_forge(body)
 
 @router.post("/api/backtests")
-def post_backtest_submit(body: core.BacktestSubmitBody):
-    return core.post_backtest_submit(body)
+async def post_backtest_submit(body: core.BacktestSubmitBody):
+    # Heavy: runs the full backtest pipeline including chart-bar serialisation.
+    # Offload to a thread so the event loop stays free for WebSocket keepalives.
+    return await asyncio.to_thread(core.post_backtest_submit, body)
 
 @router.post("/api/optimizations")
 def post_optimization_submit(body: core.OptimizationSubmitBody):
