@@ -1124,6 +1124,62 @@ def _workflow_has_running_step(conn, workflow_id: str) -> bool:
     return row is not None
 
 
+def _strategy_reproducibly_crashes(strategy_id: str) -> str | None:
+    """Return a reason if the strategy raises on a clean synthetic run, else None.
+
+    Revival safety net: an engine-version bump revives gauntlet-archived
+    strategies to re-validate. A strategy that crashes on execution (canonically
+    a per-bar ``self.position`` read) would error on every re-run — and an errored
+    verdict "can't merit-fail", so it would sit in quick_screen limbo instead of
+    re-archiving. Probing at revival keeps a reproducible crasher archived.
+
+    Fail-OPEN: any resolution/probe fault returns ``None`` so this can never block
+    a legitimate revival on its own bug. Untrusted-origin (imported) types are
+    never resolved in this trusted process — their probe already ran in the
+    sandbox worker at import time.
+    """
+    try:
+        import json as _json
+
+        from forven.db import get_db
+        from forven.strategies.registry import IMPORTED_TYPE_PREFIX
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT type, params FROM strategies WHERE id = ?", (strategy_id,)
+            ).fetchone()
+        if not row:
+            return None
+        stype = str(row["type"] or "").strip()
+        if not stype or stype.startswith(IMPORTED_TYPE_PREFIX):
+            return None
+
+        # Canonical resolver — resolves archived-style custom modules too (the
+        # revival target is, by definition, archived), unlike a bare _TYPE_MAP
+        # lookup, which discover() never populates for archived modules.
+        from forven.strategies.backtest import _resolve_strategy_class
+
+        cls = _resolve_strategy_class(stype)
+        if cls is None:
+            return None
+
+        params = row["params"]
+        if isinstance(params, (str, bytes, bytearray)):
+            try:
+                params = _json.loads(params)
+            except Exception:
+                params = {}
+        if not isinstance(params, dict):
+            params = {}
+
+        from forven.strategies.lookahead_probe import detect_execution_crash
+
+        return detect_execution_crash(cls(strategy_id, params))
+    except Exception:  # never block a revival on a probe-infrastructure fault
+        log.debug("Revival crash-probe inconclusive for %s", strategy_id, exc_info=True)
+        return None
+
+
 def requeue_stale_engine_artifacts(*, limit: int = 20, revive_limit: int = _ENGINE_SWEEP_REVIVE_LIMIT) -> dict[str, int]:
     """Auto-flag artifacts produced by a previous BACKTEST_ENGINE_VERSION and
     re-queue the affected strategies for validation.
@@ -1221,6 +1277,20 @@ def requeue_stale_engine_artifacts(*, limit: int = 20, revive_limit: int = _ENGI
                     # leave it to the operator; mark so we don't rescan every tick.
                     kv_set(marker_key, {"at": now, "action": "skipped_not_gauntlet_archive"})
                     continue
+
+                # Revival safety net: a strategy that reproducibly CRASHES on
+                # execution (e.g. a per-bar self.position read) would error on every
+                # re-run, and an errored verdict can't merit-fail — so reviving it to
+                # quick_screen only parks it in limbo. Keep it archived instead.
+                crash_reason = _strategy_reproducibly_crashes(strategy_id)
+                if crash_reason:
+                    log.warning(
+                        "Engine re-baseline: NOT reviving %s — reproducible execution crash: %s",
+                        strategy_id, crash_reason,
+                    )
+                    kv_set(marker_key, {"at": now, "action": "skipped_execution_crash", "reason": crash_reason})
+                    continue
+
                 from forven.brain import transition_stage
 
                 # archived -> quick_screen is the standard (ungated) revival

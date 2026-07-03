@@ -254,6 +254,30 @@ def _kill_executor_processes(executor):
         pass
 
 
+def _describe_signal_walk_error(exc: Exception) -> str:
+    """Human-actionable one-liner for a signal-walk crash.
+
+    A common AI-authored bug is a per-bar ``generate_signal`` that reads
+    ``self.position`` / ``self.entry_price`` / ``self.position_size`` etc. — state
+    the engine OWNS and never injects — so the read raises ``AttributeError`` on
+    the first fall-through bar and kills the whole backtest. The raw
+    ``'X' object has no attribute 'position'`` message reads like an engine wiring
+    fault (it has misled bug-triage before); name the real cause instead.
+    """
+    msg = str(exc)
+    if isinstance(exc, (AttributeError, NameError)) and (
+        "has no attribute" in msg or "is not defined" in msg
+    ):
+        return (
+            f"{msg} — the strategy read engine-owned state that generate_signal "
+            "is not given. generate_signal must be STATELESS: the engine tracks "
+            "position/entry externally, so do NOT read self.position / "
+            "self.entry_price / self.position_size. Gate exits on indicator "
+            "conditions only."
+        )
+    return msg
+
+
 def _resolve_worker_strategy_class(original_strategy_type: str, family_strategy_type: str):
     """Resolve a strategy class inside an isolated worker, importing the MINIMUM
     registry slice needed.
@@ -344,7 +368,7 @@ def _isolated_backtest_worker(
             asset=asset, resolved_timeframe=resolved_timeframe,
         )
     except Exception as e:
-        return {"error": f"Indicator execution failed during in-sample: {e}"}
+        return {"error": f"Indicator execution failed during in-sample: {_describe_signal_walk_error(e)}"}
 
     if include_funding:
         is_trades, _ = _apply_funding_to_trades(is_trades, is_df, leverage, resolved_timeframe)
@@ -368,7 +392,7 @@ def _isolated_backtest_worker(
             oos_start_timestamp,
         )
     except Exception as e:
-        return {"error": f"Indicator execution failed during out-of-sample: {e}"}
+        return {"error": f"Indicator execution failed during out-of-sample: {_describe_signal_walk_error(e)}"}
 
     if include_funding:
         # entry_bar indexes into oos_context_df (the warmup-padded slice the walk
