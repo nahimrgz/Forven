@@ -38,7 +38,7 @@ class CheckResult:
     detail: dict[str, Any] = field(default_factory=dict)
     # ISO-8601 UTC timestamp of when this individual check ran. Defaults to
     # None for backward compatibility; ``run_all_checks`` stamps each result
-    # so the UI can show per-check freshness under a 30s auto-refresh.
+    # so the UI can show per-check freshness under a 60s auto-refresh.
     checked_at: str | None = None
 
 
@@ -112,9 +112,9 @@ def check_auth_providers() -> CheckResult:
 
 
 def check_scheduler_freshness() -> CheckResult:
-    """Most-recent scheduler tick < 5 minutes ago when app is open.
+    """Most-recent scheduler tick < 15 minutes ago when app is open.
 
-    Uses a short-timeout best-effort connection so a 30s auto-refresh can't
+    Uses a short-timeout best-effort connection so a 60s auto-refresh can't
     contend on the WAL write lock against live scheduler/agent writes.
     """
     try:
@@ -193,7 +193,7 @@ def check_resumable_tasks() -> CheckResult:
 def check_recent_costs(window_hours: int = 24) -> CheckResult:
     """Sum of cost_usd across agent_tasks in the last N hours.
 
-    Best-effort/short-timeout read so the 30s auto-refresh stays off the WAL
+    Best-effort/short-timeout read so the 60s auto-refresh stays off the WAL
     write lock.
     """
     try:
@@ -356,7 +356,7 @@ def run_all_checks() -> list[CheckResult]:
 
     Each result is stamped with ``checked_at`` (ISO-8601 UTC) so the UI can
     show per-check freshness even when the surrounding snapshot is served
-    from a 30s auto-refresh cycle.
+    from a 60s auto-refresh cycle.
     """
     results: list[CheckResult] = []
     for fn in ALL_CHECKS:
