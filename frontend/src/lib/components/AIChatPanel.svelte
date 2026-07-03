@@ -318,10 +318,8 @@
 </script>
 
 {#if open}
-	<!-- Backdrop -->
-	<div class="fixed inset-0 bg-black/80 z-[9998] pointer-events-none"></div>
-
-	<!-- Panel -->
+	<!-- Panel: no backdrop — the layout pushes the page content over (padding-right
+	     in +layout.svelte) so the app stays fully usable alongside the chat. -->
 	<div
 		class="fixed top-0 right-0 h-full w-[440px] max-w-[92vw] bg-[#050505] border-l border-[#222] z-[9999] flex flex-col"
 		transition:fly={{ x: 440, duration: 250 }}

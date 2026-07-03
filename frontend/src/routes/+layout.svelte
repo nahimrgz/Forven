@@ -255,7 +255,14 @@
 	<meta name="description" content={pageDescription} />
 </svelte:head>
 
-<div class="flex h-screen bg-black text-white font-mono overflow-hidden selection:bg-white selection:text-black">
+<!-- When the assistant is open, the app shell pads right by the panel width so
+     the page pushes over and stays usable next to the chat (no dimming overlay).
+     min(440px, 92vw) mirrors the panel's w-[440px] max-w-[92vw]. -->
+<div
+	class="flex h-screen bg-black text-white font-mono overflow-hidden selection:bg-white selection:text-black"
+	style="transition: padding-right 250ms ease;"
+	style:padding-right={$assistantUI.open ? 'min(440px, 92vw)' : '0px'}
+>
 	<Sidebar {connectionStatus} />
 
 	<!-- Main Content -->
@@ -272,17 +279,22 @@
 	</main>
 </div>
 
-<!-- Shared bottom-right notification stack: children must render plain flex items (no fixed positioning) so alerts and toasts stack instead of overlapping. -->
-<div class="fixed bottom-4 right-4 z-[9999] flex flex-col items-end gap-2 pointer-events-none">
+<!-- Shared bottom-right notification stack: children must render plain flex items (no fixed positioning) so alerts and toasts stack instead of overlapping. Shifts left of the assistant panel when it's open. -->
+<div
+	class="fixed bottom-4 z-[9999] flex flex-col items-end gap-2 pointer-events-none"
+	style="transition: right 250ms ease;"
+	style:right={$assistantUI.open ? 'calc(1rem + min(440px, 92vw))' : '1rem'}
+>
 	<PositionAlertWidget />
 	<Toast />
 </div>
 
-<!-- Floating Chat Button -->
+<!-- Floating Chat Button: slides left of the panel when it's open so it stays a toggle. -->
 <button
 	on:click={toggleAssistant}
-	class="fixed z-50 w-14 h-14 border border-[#333] bg-black text-white hover:bg-white hover:text-black flex items-center justify-center transition-colors relative"
-	style="position: fixed; right: 1.5rem; bottom: 1.5rem; left: auto; top: auto;"
+	class="fixed z-50 w-14 h-14 border border-[#333] bg-black text-white hover:bg-white hover:text-black flex items-center justify-center relative"
+	style="position: fixed; bottom: 1.5rem; left: auto; top: auto; transition: right 250ms ease, background-color 150ms ease, color 150ms ease;"
+	style:right={$assistantUI.open ? 'calc(1.5rem + min(440px, 92vw))' : '1.5rem'}
 	aria-label="Open assistant"
 >
 	{#if $assistantUI.open}
