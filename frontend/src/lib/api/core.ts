@@ -70,17 +70,34 @@ let preferredCandidates: string[] = [];
 if (typeof window !== 'undefined' && window.location) {
 	const protocol = window.location.protocol || 'http:';
 	const host = window.location.hostname || '127.0.0.1';
+	const isLocalBrowserHost = host === '127.0.0.1' || host === 'localhost' || host === '::1';
 	const originApi = `${window.location.origin.replace(/\/$/, '')}/api`;
 	const directBackendApi = `${protocol}//${host}:8003/api`;
-	preferredCandidates = [
-		trimTrailingSlash(API_BASE),
-		directBackendApi,
-		`${DEFAULT_API_ORIGIN}/api`,
-		originApi,
-		`${protocol}//${host}/api`,
-		`${protocol}//${host}:8000/api`,
-		'/api',
-	];
+
+	if (isLocalBrowserHost) {
+		// Local dev: try direct backend port first (no proxy overhead).
+		preferredCandidates = [
+			trimTrailingSlash(API_BASE),
+			directBackendApi,
+			`${DEFAULT_API_ORIGIN}/api`,
+			originApi,
+			`${protocol}//${host}/api`,
+			`${protocol}//${host}:8000/api`,
+			'/api',
+		];
+	} else {
+		// Remote / tunnel access: the browser host is not localhost, so
+		// hitting remotehost:8003 is cross-origin and will be blocked by the
+		// CSP.  Prioritise same-origin paths that go through the Vite proxy.
+		preferredCandidates = [
+			'/api',
+			originApi,
+			trimTrailingSlash(API_BASE),
+			directBackendApi,
+			`${DEFAULT_API_ORIGIN}/api`,
+			`${protocol}//${host}:8000/api`,
+		];
+	}
 } else {
 	preferredCandidates = [
 		trimTrailingSlash(API_BASE),

@@ -1493,38 +1493,51 @@ function toLiveWsUrl(base: string): string {
 }
 
 export function getForvenLiveWebSocketUrls(): string[] {
-	const candidates = new Set<string>();
 	const active = (ACTIVE_API_BASE || '').trim();
 	const primary = (API_BASE || '').trim();
-	const preferredAbsoluteBases = [primary, active].filter(
-		(base) => Boolean(base) && !String(base).startsWith('/')
-	);
-
-	// Prefer direct backend origins over dev-proxy `/api` and avoid speculative
-	// fallbacks that can bounce the client onto an invalid WS endpoint.
-	for (const base of preferredAbsoluteBases) {
-		candidates.add(base);
-	}
 
 	if (typeof window !== 'undefined' && window.location) {
 		const protocol = window.location.protocol || 'http:';
 		const host = window.location.hostname || '127.0.0.1';
-		candidates.add(`${protocol}//${host}:8003/api`);
-		if (preferredAbsoluteBases.length === 0) {
-			candidates.add(`${window.location.origin.replace(/\/$/, '')}/api`);
+		const isLocalBrowserHost = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+		const originApi = `${window.location.origin.replace(/\/$/, '')}/api`;
+		const directBackendApi = `${protocol}//${host}:8003/api`;
+
+		let orderedBases: string[];
+		if (isLocalBrowserHost) {
+			// Local dev: try direct backend port first (fastest, no proxy).
+			orderedBases = [
+				primary,
+				active,
+				directBackendApi,
+				originApi,
+				'/api',
+			];
+		} else {
+			// Remote / tunnel: remotehost:8003 is cross-origin and CSP-blocked.
+			// Use same-origin paths so the Vite proxy forwards to the backend.
+			// toLiveWsUrl('/api') expands to wss://remotehost/api/ws/live using
+			// window.location.host, which stays same-origin.
+			orderedBases = [
+				'/api',
+				originApi,
+				primary,
+				active,
+				directBackendApi,
+			];
 		}
+
+		return Array.from(new Set(orderedBases.filter(Boolean)))
+			.map((base) => toLiveWsUrl(base));
 	}
 
-	if (preferredAbsoluteBases.length === 0) {
-		if (primary) candidates.add(primary);
-		if (active) candidates.add(active);
-		candidates.add('/api');
-	}
+	// SSR / no window: fall back to absolute bases only.
+	const absoluteBases = [primary, active].filter((b) => Boolean(b) && !String(b).startsWith('/'));
+	if (absoluteBases.length === 0 && primary) absoluteBases.push(primary);
+	if (absoluteBases.length === 0 && active) absoluteBases.push(active);
+	if (absoluteBases.length === 0) absoluteBases.push('/api');
 
-	return Array.from(candidates)
-		.map((base) => String(base || '').trim())
-		.filter(Boolean)
-		.map((base) => toLiveWsUrl(base));
+	return Array.from(new Set(absoluteBases)).map((base) => toLiveWsUrl(base));
 }
 
 export function getForvenLiveWebSocketUrl(): string {
