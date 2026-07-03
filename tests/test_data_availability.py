@@ -101,6 +101,74 @@ def test_fail_open_when_class_unresolved(monkeypatch):
     assert res.ok and not res.blocked
 
 
+# --- funding/OI live-source probe -------------------------------------------
+# Regression cover for GAP-1878e01612d8 / GAP-27bbe19a01a3: the backtest frame
+# gets funding_rate/open_interest from the live market-data fetch
+# (_enrich_with_market_data), NOT from the DataManager collector lake — so the
+# gate must probe that source, or it blocks runs that would succeed.
+def test_funding_oi_presence_uses_live_probe_not_lake(monkeypatch):
+    import forven.dataeng.hub as hub
+    import forven.strategies.backtest as backtest_mod
+
+    monkeypatch.setattr(backtest_mod, "_resolve_strategy_class", lambda _t: _DummyStrategy)
+    monkeypatch.setattr(
+        da, "infer_required_columns", lambda _c, _s: frozenset({"funding_rate", "open_interest"})
+    )
+    monkeypatch.setattr(da, "_AVAIL_CACHE", {})
+    # Lake has no funding/oi parquet at all…
+    monkeypatch.setattr(hub, "_available_enrichment_specs", lambda *a, **k: [])
+    # …but the live source (the backtest's actual provider) has data.
+    monkeypatch.setattr(
+        backtest_mod,
+        "_resolve_market_data_series",
+        lambda _asset, _s, _e: ([(1, 0.0001)], [(1, 123.0)]),
+    )
+
+    res = da.evaluate_data_availability("funding_oi_fade_v2", "BTC/USDT", "4h")
+    assert res.ok and not res.blocked
+    assert res.present == ["funding_rate", "open_interest"]
+
+
+def test_lake_lookup_excludes_funding_oi_streams(monkeypatch):
+    import forven.dataeng.hub as hub
+
+    captured = {}
+
+    def _spy(_symbol, _timeframe, *, include_macro, exclude_streams):
+        captured["exclude_streams"] = set(exclude_streams)
+        return []
+
+    monkeypatch.setattr(hub, "_available_enrichment_specs", _spy)
+    monkeypatch.setattr(da, "_probe_market_data_columns", lambda _s: frozenset())
+    monkeypatch.setattr(da, "_AVAIL_CACHE", {})
+
+    da._present_columns("ETH/USDT", "1h")
+    assert captured["exclude_streams"] == {"funding", "oi"}
+
+
+def test_probe_market_data_columns_reflects_series(monkeypatch):
+    import forven.strategies.backtest as backtest_mod
+
+    monkeypatch.setattr(
+        backtest_mod,
+        "_resolve_market_data_series",
+        lambda _asset, _s, _e: ([(1, 0.0001)], []),  # funding yes, OI no
+    )
+    assert da._probe_market_data_columns("BTC/USDT") == frozenset({"funding_rate"})
+
+
+def test_probe_market_data_columns_fails_open(monkeypatch):
+    import forven.strategies.backtest as backtest_mod
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(backtest_mod, "_resolve_market_data_series", _boom)
+    assert da._probe_market_data_columns("BTC/USDT") == frozenset(
+        {"funding_rate", "open_interest"}
+    )
+
+
 # --- detection ------------------------------------------------------------
 def test_declared_columns_detected(monkeypatch):
     # Isolate the declared path (source-scan reads the whole test module).

@@ -213,6 +213,31 @@ _FETCH_ATTEMPTED: set[tuple[str, str]] = set()
 _FETCH_LOCK = threading.Lock()
 
 
+def _probe_market_data_columns(symbol: str) -> frozenset[str]:
+    """Lazy-probe live market-data series to see if funding rate/OI are available.
+
+    Uses a 3-day window. Fails open (returns both columns) on any exception.
+    """
+    try:
+        from forven.strategies.backtest import _resolve_market_data_series
+
+        normalized_asset = str(symbol or "").strip().upper().replace("/USDT", "").replace("/USD", "")
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - 3 * 24 * 60 * 60 * 1000
+
+        funding_data, oi_data = _resolve_market_data_series(normalized_asset, start_ms, end_ms)
+
+        present = set()
+        if funding_data:
+            present.add("funding_rate")
+        if oi_data:
+            present.add("open_interest")
+        return frozenset(present)
+    except Exception as exc:
+        log.debug("probe of market data columns failed: %s", exc)
+        return frozenset({"funding_rate", "open_interest"})
+
+
 def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
     """Enrichment columns actually available for (symbol, timeframe).
 
@@ -229,17 +254,22 @@ def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
     try:
         from forven.dataeng.hub import _available_enrichment_specs
 
-        specs = _available_enrichment_specs(symbol, timeframe, include_macro=False, exclude_streams=set())
+        specs = _available_enrichment_specs(symbol, timeframe, include_macro=False, exclude_streams={"funding", "oi"})
         for spec in specs:
             present.update(spec.output_columns)
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("enrichment-spec probe failed for %s/%s: %s", symbol, timeframe, exc)
         # Fail open: an unknown availability set must not block.
         return frozenset(_KNOWN_COLUMNS)
+
+    # Merge live probe columns
+    present.update(_probe_market_data_columns(symbol))
+
     result = frozenset(present)
     with _AVAIL_LOCK:
         _AVAIL_CACHE[key] = (now, result)
     return result
+
 
 
 def _invalidate_availability(symbol: str, timeframe: str) -> None:
