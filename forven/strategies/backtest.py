@@ -776,62 +776,47 @@ def _is_backtest_risk_control_enabled(value: object) -> bool:
 
 
 def validate_backtest_risk_controls(
-
-
     params: dict | None,
-
-
     *,
-
-
     extra_controls: dict | None = None,
-
-
 ) -> str | None:
-
-
     controls: dict[str, object] = {}
-
-
     if isinstance(params, dict):
-
-
         controls.update(params)
-
-
     if isinstance(extra_controls, dict):
-
-
         for key, value in extra_controls.items():
-
-
             if key not in controls or controls.get(key) is None:
-
-
                 controls[key] = value
 
+    ignored_fields = set()
+    profile = {}
+    if isinstance(params, dict) and isinstance(params.get("execution_profile"), dict):
+        profile = params["execution_profile"]
 
-
-
+    for key in (
+        "sizing_mode",
+        "fixed_size",
+        "risk_per_trade",
+        "atr_stop_multiplier",
+        "kelly_multiplier",
+        "kelly_lookback",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "trailing_stop_pct",
+        "time_stop_bars",
+    ):
+        if (extra_controls and extra_controls.get(key) is not None) or (profile and profile.get(key) is not None):
+            ignored_fields.add(key)
+            if key == "risk_per_trade":
+                ignored_fields.add("risk_pct")
 
     enabled_fields = [
-
-
         field_name
-
-
         for field_name in _UNSUPPORTED_BACKTEST_RISK_FIELDS.values()
-
-
-        if _is_backtest_risk_control_enabled(controls.get(field_name))
-
-
+        if field_name not in ignored_fields and _is_backtest_risk_control_enabled(controls.get(field_name))
     ]
 
-
     if not enabled_fields:
-
-
         return None
 
 
@@ -997,68 +982,27 @@ def expand_strategy_trade_modes(
 
 
 def _validate_backtest_execution_parity(
-
-
     strategy_type: str | None,
-
-
     params: dict | None,
-
-
     *,
-
-
     allow_uncertified: bool = False,
-
-
+    extra_controls: dict | None = None,
 ) -> tuple[dict, str | None, str | None]:
-
-
     """Returns (canonical_params, blocking_error, risk_warning)."""
-
-
     from forven.strategies.certification import EXECUTION_CERTIFIED_FAMILIES
 
-
-
-
-
     certification = certify_execution_strategy(strategy_type, params)
-
-
     certification_error = certification.format_error(context="backtest")
-
-
     if certification_error and allow_uncertified:
-
-
         normalized = str(strategy_type or "").strip().lower()
-
-
         family_unknown = normalized and normalized not in EXECUTION_CERTIFIED_FAMILIES
-
-
         if family_unknown and not certification.unsupported_rule_blobs and not certification.param_validation_errors:
-
-
             passthrough_params = dict(params) if isinstance(params, dict) else dict(certification.canonical_params)
-
-
-            risk_warning = validate_backtest_risk_controls(passthrough_params)
-
-
+            risk_warning = validate_backtest_risk_controls(passthrough_params, extra_controls=extra_controls)
             return passthrough_params, None, risk_warning
-
-
     if certification_error:
-
-
         return certification.canonical_params, certification_error, None
-
-
-    risk_warning = validate_backtest_risk_controls(certification.canonical_params)
-
-
+    risk_warning = validate_backtest_risk_controls(certification.canonical_params, extra_controls=extra_controls)
     return certification.canonical_params, None, risk_warning
 
 
@@ -7989,17 +7933,10 @@ def backtest_strategy(
 
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
-
         original_strategy_type,
-
-
         params,
-
-
         allow_uncertified=True,
-
-
+        extra_controls=execution_controls,
     )
 
 
@@ -10366,17 +10303,10 @@ def walk_forward(
 
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
-
         original_strategy_type,
-
-
         params,
-
-
         allow_uncertified=True,
-
-
+        extra_controls=execution_controls,
     )
 
 

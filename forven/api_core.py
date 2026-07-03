@@ -1,4 +1,4 @@
-﻿import json
+import json
 import math
 import os
 import re
@@ -11652,13 +11652,25 @@ def post_backtesting_run(body: dict):
                 # Use certified params (canonicalized) instead of raw merged_params
                 merged_params = certified_params
                 
+                manual_execution_controls = _collect_honored_backtest_execution_controls(body)
+                # Promote honored sizing/execution fields present in merged_params
+                for field_name in (
+                    "sizing_mode", "fixed_size", "risk_per_trade", "atr_stop_multiplier",
+                    "kelly_multiplier", "kelly_lookback", "stop_loss_pct", "take_profit_pct",
+                    "trailing_stop_pct", "time_stop_bars"
+                ):
+                    val = merged_params.get(field_name)
+                    if val is not None:
+                        manual_execution_controls[field_name] = val
+                    if field_name == "risk_per_trade" and "risk_pct" in merged_params and merged_params["risk_pct"] is not None:
+                        manual_execution_controls["risk_per_trade"] = merged_params["risk_pct"]
+
                 # Strategy-param risk controls are still inert and must be
                 # guarded, but body-level execution controls are now honoured
                 # below through execution_controls just like POST /api/backtests.
-                risk_control_error = _validate_local_backtest_risk_controls(merged_params)
+                risk_control_error = _validate_local_backtest_risk_controls(merged_params, extra_controls=manual_execution_controls)
                 if risk_control_error:
-                    return {"ok": False, "error": risk_control_error}
-                manual_execution_controls = _collect_honored_backtest_execution_controls(body)
+                    log.warning("Local risk controls validation: %s", risk_control_error)
 
                 # Bracket the synchronous backtest in an agent_tasks row so the
                 # Now Working panel surfaces API/tool backtests with provenance.
