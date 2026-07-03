@@ -571,6 +571,23 @@ def _tool_get_ops_overview() -> str:
     except Exception as exc:
         out["notifications_error"] = str(exc)
 
+    try:
+        from forven.notifications import list_notifications
+
+        bugs = list_notifications(event_type="bug_report", limit=50) or []
+        out["bug_reports"] = [
+            {
+                "id": b.get("id"),
+                "title": b.get("title"),
+                "severity": b.get("severity"),
+                "created_at": b.get("created_at"),
+            }
+            for b in bugs
+            if str(b.get("status") or "").strip().lower() != "acknowledged"
+        ]
+    except Exception as exc:
+        out["bug_reports_error"] = str(exc)
+
     return _json.dumps(out, indent=2, default=str)
 
 

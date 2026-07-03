@@ -1,4 +1,4 @@
-﻿"""Brain orchestrator ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ the hub-and-spoke boss.
+"""Brain orchestrator ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ the hub-and-spoke boss.
 
 The Brain is the ONLY orchestrator. All agent output returns to the Brain.
 Agents NEVER task other agents. Everything goes through the Brain.
@@ -2178,7 +2178,7 @@ def escalate_to_engineer(
         "Bug reported to triage queue: %s [severity=%s, from=%s]",
         title, severity, requesting_agent,
     )
-    return {"status": "reported", "queue": "operator_triage", "approval_id": 0}
+    return {"status": "reported", "queue": "operator_triage"}
 
 
 # Default models for different tasks come from shared routing policy.
