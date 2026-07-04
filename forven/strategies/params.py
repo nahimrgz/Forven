@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("forven.strategies.params")
 _EMITTED_UNKNOWN_PARAM_WARNINGS: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
+_NOVEL_FAMILY_LOGGED: set[str] = set()
 
 
 __all__ = [
@@ -661,7 +662,17 @@ def canonicalize_params(family_type: str, params: dict) -> CanonicalParams:
 
     if resolved_family_type not in SUPPORTED_PARAM_FAMILIES:
 
-        log.info(f"Novel strategy family: {family_type} — accepting all params")
+        # Once per family per process: registry hydration canonicalizes every
+        # active row, so per-call INFO here was >100k log lines a day.
+        if family_type not in _NOVEL_FAMILY_LOGGED:
+
+            _NOVEL_FAMILY_LOGGED.add(family_type)
+
+            log.info(f"Novel strategy family: {family_type} — accepting all params")
+
+        else:
+
+            log.debug(f"Novel strategy family: {family_type} — accepting all params")
 
         return CanonicalParams(family_type, dict(params), [], [])
 

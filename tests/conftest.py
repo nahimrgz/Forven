@@ -139,4 +139,12 @@ def forven_db(tmp_path):
     except Exception:
         pass
 
+    # Drop the get_active() hydration cache: it is per-process and would
+    # otherwise serve strategies hydrated from a PREVIOUS test's database.
+    try:
+        import forven.strategies.registry as _registry_mod
+        _registry_mod.invalidate_active_cache()
+    except Exception:
+        pass
+
     return db_path
