@@ -122,3 +122,28 @@ class VectorSignalStrategy(BaseStrategy):
 
     assert result["valid"] is False
     assert "must be a scalar value" in result["execution_result"]["stdout"]
+
+
+def test_validate_strategy_code_rejects_non_signal_return_with_actionable_message():
+    """An agent returning an int (thinking Signal is a BUY/SELL/NONE enum) must get
+    the return contract + the correct import, not a bare 'invalid type: int'."""
+    result = selfheal_mod.validate_strategy_code(
+        """
+from forven.strategies.base import BaseStrategy
+
+class IntSignalStrategy(BaseStrategy):
+    name = "intsig"
+    asset = "BTC"
+    strategy_type = "intsig"
+    default_params = {}
+
+    def generate_signal(self, df):
+        return 1
+"""
+    )
+
+    assert result["valid"] is False
+    stdout = result["execution_result"]["stdout"]
+    assert "must return a Signal or a dict" in stdout
+    assert "from forven.strategies.base import Signal" in stdout
+    assert "NOT a BUY/SELL/NONE enum" in stdout

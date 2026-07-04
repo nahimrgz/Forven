@@ -208,7 +208,14 @@ for cls_name, cls in strategy_classes:
     elif isinstance(signal, dict):
         signal_payload = dict(signal)
     else:
-        print(f"ERROR: generate_signal returned invalid type for {{cls_name}}: {{type(signal).__name__}}")
+        print(
+            f"ERROR: generate_signal must return a Signal or a dict with "
+            f"entry_signal/exit_signal keys, got {{type(signal).__name__}} for {{cls_name}}. "
+            "Import it with 'from forven.strategies.base import Signal' and return e.g. "
+            "Signal(entry_signal=True, exit_signal=False, price=..., direction='long'). "
+            "Signal is NOT a BUY/SELL/NONE enum — entry_signal and exit_signal are booleans "
+            "and direction is 'long'/'short'."
+        )
         sys.exit(1)
 
     required_signal_keys = {{"entry_signal", "exit_signal"}}
