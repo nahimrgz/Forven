@@ -809,9 +809,16 @@ def _task_tool_output_shows_success(tool_call: dict) -> bool:
     summary = str(tool_call.get("output_summary") or "").strip().lower()
     if not summary:
         return False
+    # Explicit failure / rejection envelopes are never success, even if a later
+    # marker happens to appear in the text.
+    if summary.startswith("failed") or summary.startswith("rejected") or summary.startswith("error"):
+        return False
     if '"ok": true' in summary or '"persisted": true' in summary:
         return True
     if summary.startswith("strategy created:") or "registered successfully" in summary:
+        return True
+    # write_file success envelopes ("Appended to <path>" / "Wrote <path>").
+    if summary.startswith("appended to ") or summary.startswith("wrote "):
         return True
     return False
 
