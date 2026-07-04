@@ -65,6 +65,9 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
         "pandas",
         "numpy",
         "pandas_ta",
+        # Real module name behind the `pandas_ta` alias (see forven/__init__.py);
+        # allowed so a strategy written against the fork's own name also passes.
+        "pandas_ta_classic",
         "scipy",
         "sklearn",
         # Pure-computation stdlib — none of these expose a filesystem, network,

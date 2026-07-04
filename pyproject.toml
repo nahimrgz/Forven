@@ -34,6 +34,9 @@ dependencies = [
     # break the numpy/pandas backtest engine on a fresh `pip install -e .`.
     "pandas>=2.0,<4",
     "numpy>=1.26,<3",
+    # Maintained fork of the retired pandas-ta (module: pandas_ta_classic).
+    # `import pandas_ta` resolves to it via the alias in forven/__init__.py.
+    "pandas-ta-classic>=0.6.52",
     "scipy>=1.11,<2",
     "requests>=2.31",
     "psutil>=5.9",
