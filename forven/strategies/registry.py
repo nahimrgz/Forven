@@ -5,6 +5,8 @@ import inspect
 import json
 import logging
 import pkgutil
+import threading
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +40,22 @@ IMPORTED_TYPE_PREFIX = "imported__"
 _FAILED_CUSTOM_MODULES: set[str] = set()
 _FAILED_CUSTOM_LOGGED: set[str] = set()
 
+# get_active() hydration cache. Hydrating every deployed/paper row is seconds of
+# GIL-held work (JSON + type resolution + instantiation) and was historically
+# re-run PER STRATEGY per scan — dozens of concurrent full sweeps per minute that
+# starved the uvicorn event loop (the "event loop stalled" DEGRADED storms).
+# Entries: (hydrated_map, rows_signature, monotonic_stamp). Within the TTL the
+# cache is returned as-is; after it, a cheap COUNT/MAX(updated_at) signature
+# probe decides whether the hydrate actually needs to re-run.
+_ACTIVE_CACHE: tuple[dict, tuple | None, float] | None = None
+_ACTIVE_CACHE_LOCK = threading.Lock()
+_ACTIVE_CACHE_TTL_SECONDS = 10.0
+
+# Bad-row warnings deduped per (strategy_id, error) per process: the same broken
+# rows re-fail on every hydrate and were emitting thousands of identical
+# warnings a day.
+_BAD_ROW_LOGGED: set[tuple[str, str]] = set()
+
 _discovered = False
 _builtin_discovered = False
 _custom_discovered = False
@@ -56,6 +74,7 @@ _DISAMBIGUATION_MAP: dict[str, str] = {
 def register(strategy: BaseStrategy):
     """Register a strategy instance."""
     _registry[strategy.strategy_id] = strategy
+    invalidate_active_cache()
     log.debug("Registered strategy: %s (%s)", strategy.strategy_id, strategy.name)
 
 
@@ -105,11 +124,62 @@ def get_all() -> dict[str, BaseStrategy]:
     return dict(_registry)
 
 
+def invalidate_active_cache() -> None:
+    """Drop the get_active() hydration cache (next call re-hydrates)."""
+    global _ACTIVE_CACHE
+    _ACTIVE_CACHE = None
+
+
+def _active_rows_signature() -> tuple | None:
+    """Cheap change signature for the deployed/paper rows (None if unreadable)."""
+    try:
+        from forven.db import get_db
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM strategies "
+                "WHERE status IN ('deployed', 'paper')"
+            ).fetchone()
+        return (int(row[0]), str(row[1]))
+    except Exception:
+        return None
+
+
 def get_active() -> dict[str, BaseStrategy]:
-    """Get strategies eligible for scanning (registered + DB deployed/paper)."""
-    active = dict(_registry)
-    _load_db_strategies(active)
-    return active
+    """Get strategies eligible for scanning (registered + DB deployed/paper).
+
+    Hydration is cached: callers throughout a scan (including per-strategy
+    fallbacks) share one hydrate instead of each re-reading and re-instantiating
+    every row. Staleness is bounded by _ACTIVE_CACHE_TTL_SECONDS, after which a
+    signature probe re-hydrates only if the underlying rows actually changed.
+    """
+    global _ACTIVE_CACHE
+    cached = _ACTIVE_CACHE
+    now = time.monotonic()
+    if cached is not None and (now - cached[2]) < _ACTIVE_CACHE_TTL_SECONDS:
+        return dict(cached[0])
+
+    with _ACTIVE_CACHE_LOCK:
+        cached = _ACTIVE_CACHE
+        now = time.monotonic()
+        if cached is not None and (now - cached[2]) < _ACTIVE_CACHE_TTL_SECONDS:
+            return dict(cached[0])
+
+        sig = _active_rows_signature()
+        if cached is not None and sig is not None and sig == cached[1]:
+            _ACTIVE_CACHE = (cached[0], sig, now)
+            return dict(cached[0])
+        if cached is not None and sig is None:
+            # Signature probe failed (DB contention): serve the stale cache
+            # rather than pile a full hydrate onto a struggling database.
+            _ACTIVE_CACHE = (cached[0], cached[1], now)
+            return dict(cached[0])
+
+        active = dict(_registry)
+        _load_db_strategies(active)
+        # Signature AFTER the hydrate: it may backfill runtime_type (bumping
+        # updated_at), and the post-write state is what the cache now mirrors.
+        _ACTIVE_CACHE = (active, _active_rows_signature(), time.monotonic())
+        return dict(active)
 
 
 def build_strategy_from_row(row: Mapping[str, object]) -> BaseStrategy:
@@ -601,11 +671,16 @@ def _load_archived_custom_runtime_type(runtime_name: str) -> bool:
     module_name = _ARCHIVED_CUSTOM_MODULES.get(str(runtime_name or "").strip().lower())
     if not module_name:
         return False
+    if module_name in _FAILED_CUSTOM_MODULES:
+        return False
     try:
         _load_custom_strategy_module(module_name)
-    except RegistryTypeError:
-        # Broken archived module — don't let the contract error escape the
-        # runtime-type resolver; the type simply stays unresolved.
+    except (RegistryTypeError, ImportError):
+        # Broken/guard-rejected archived module — don't let the error escape the
+        # runtime-type resolver (the type simply stays unresolved), and remember
+        # the failure so every later hydrate doesn't re-read and re-execute the
+        # same broken file.
+        _FAILED_CUSTOM_MODULES.add(module_name)
         return False
     return str(runtime_name or "").strip() in _TYPE_MAP
 
@@ -712,7 +787,12 @@ def _load_db_strategies(target: dict):
                     _inject_regime_metadata(strategy, compatible_regimes, is_all_rounder)
                     target[sid] = strategy
                 except Exception as row_exc:
-                    log.warning("Skipping bad strategy row %s: %s", sid, row_exc)
+                    dedupe_key = (sid, str(row_exc))
+                    if dedupe_key in _BAD_ROW_LOGGED:
+                        log.debug("Skipping bad strategy row %s: %s", sid, row_exc)
+                    else:
+                        _BAD_ROW_LOGGED.add(dedupe_key)
+                        log.warning("Skipping bad strategy row %s: %s", sid, row_exc)
     except Exception as e:
         log.warning("Could not hydrate DB strategies: %s", e)
 
@@ -924,6 +1004,8 @@ def reset():
     _FAILED_CUSTOM_MODULES.clear()
     _FAILED_CUSTOM_LOGGED.clear()
     _SCAN_VERDICT_CACHE.clear()
+    _BAD_ROW_LOGGED.clear()
+    invalidate_active_cache()
     _builtin_discovered = False
     _custom_discovered = False
     _discovered = False

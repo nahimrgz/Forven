@@ -310,3 +310,119 @@ def test_prebuilt_catalog_includes_eth_15m_vwap_pullback_template_without_live_i
         getattr(strategy, "strategy_type", "") != "vwap_pullback_eth_15m"
         for strategy in registry_mod.get_all().values()
     )
+
+
+# ── get_active() hydration cache ─────────────────────────────────────────────
+# Hydration used to re-run per call (per strategy per scan) — the GIL-held
+# sweeps behind the "event loop stalled" DEGRADED storms.
+
+
+def test_get_active_caches_hydration_within_ttl(forven_db, monkeypatch):
+    registry_mod.reset()
+    registry_mod.register_type("macd", DummyStrategy)
+    _insert_strategy_row(
+        "S-CACHED",
+        strategy_type="macd",
+        params=json.dumps({"fast_period": 5}),
+    )
+
+    hydrations = []
+    real_load = registry_mod._load_db_strategies
+
+    def _counting_load(target):
+        hydrations.append(1)
+        real_load(target)
+
+    monkeypatch.setattr(registry_mod, "_load_db_strategies", _counting_load)
+
+    first = registry_mod.get_active()
+    second = registry_mod.get_active()
+
+    assert "S-CACHED" in first
+    assert "S-CACHED" in second
+    assert len(hydrations) == 1
+
+
+def test_get_active_rehydrates_when_rows_change_after_ttl(forven_db):
+    registry_mod.reset()
+    registry_mod.register_type("macd", DummyStrategy)
+    _insert_strategy_row("S-FIRST", strategy_type="macd", params=json.dumps({}))
+
+    assert "S-FIRST" in registry_mod.get_active()
+
+    _insert_strategy_row("S-SECOND", strategy_type="macd", params=json.dumps({}))
+    # Expire the TTL without sleeping: rewind the cache stamp.
+    hydrated, sig, stamp = registry_mod._ACTIVE_CACHE
+    registry_mod._ACTIVE_CACHE = (
+        hydrated,
+        sig,
+        stamp - registry_mod._ACTIVE_CACHE_TTL_SECONDS - 1,
+    )
+
+    active = registry_mod.get_active()
+
+    assert "S-FIRST" in active
+    assert "S-SECOND" in active
+
+
+def test_get_active_skips_rehydrate_when_signature_unchanged(forven_db, monkeypatch):
+    registry_mod.reset()
+    registry_mod.register_type("macd", DummyStrategy)
+    _insert_strategy_row("S-STABLE", strategy_type="macd", params=json.dumps({}))
+
+    assert "S-STABLE" in registry_mod.get_active()
+
+    hydrated, sig, stamp = registry_mod._ACTIVE_CACHE
+    registry_mod._ACTIVE_CACHE = (
+        hydrated,
+        sig,
+        stamp - registry_mod._ACTIVE_CACHE_TTL_SECONDS - 1,
+    )
+
+    def _fail_load(target):
+        raise AssertionError("unchanged rows must not re-hydrate")
+
+    monkeypatch.setattr(registry_mod, "_load_db_strategies", _fail_load)
+
+    assert "S-STABLE" in registry_mod.get_active()
+
+
+def test_get_active_serves_stale_cache_when_signature_probe_fails(forven_db, monkeypatch):
+    registry_mod.reset()
+    registry_mod.register_type("macd", DummyStrategy)
+    _insert_strategy_row("S-STALE-OK", strategy_type="macd", params=json.dumps({}))
+
+    assert "S-STALE-OK" in registry_mod.get_active()
+
+    hydrated, sig, stamp = registry_mod._ACTIVE_CACHE
+    registry_mod._ACTIVE_CACHE = (
+        hydrated,
+        sig,
+        stamp - registry_mod._ACTIVE_CACHE_TTL_SECONDS - 1,
+    )
+    monkeypatch.setattr(registry_mod, "_active_rows_signature", lambda: None)
+
+    def _fail_load(target):
+        raise AssertionError("probe failure must serve the stale cache, not hydrate")
+
+    monkeypatch.setattr(registry_mod, "_load_db_strategies", _fail_load)
+
+    assert "S-STALE-OK" in registry_mod.get_active()
+
+
+def test_load_archived_custom_runtime_type_negative_caches_broken_module(monkeypatch):
+    registry_mod.reset()
+    registry_mod._ARCHIVED_CUSTOM_MODULES["broken_type_s99999"] = "broken_type_s99999"
+
+    attempts = []
+
+    def _always_fails(modname):
+        attempts.append(modname)
+        raise ImportError("rejected by the AST security guard")
+
+    monkeypatch.setattr(registry_mod, "_load_custom_strategy_module", _always_fails)
+
+    assert registry_mod._load_archived_custom_runtime_type("broken_type_s99999") is False
+    assert registry_mod._load_archived_custom_runtime_type("broken_type_s99999") is False
+    assert len(attempts) == 1
+    assert "broken_type_s99999" in registry_mod._FAILED_CUSTOM_MODULES

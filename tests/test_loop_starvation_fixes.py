@@ -49,6 +49,24 @@ def test_loop_lag_issues_flag_ws_risk_only(monkeypatch):
     assert "WS drop risk" in issues[0]
 
 
+def test_loop_lag_issue_clears_once_stall_leaves_sample_window(monkeypatch):
+    monitor = lw.LoopLagMonitor()
+    monkeypatch.setattr(lw, "_MONITOR", monitor)
+    monitor.record(3.0)  # WS-drop-risk stall
+    assert len(lw.loop_lag_issues()) == 1
+
+    # A healthy stretch pushes the stall out of the rolling window: the health
+    # issue must clear (no DEGRADED-until-restart), lifetime counters must stay.
+    for _ in range(monitor.samples.maxlen):
+        monitor.record(0.0)
+
+    assert lw.loop_lag_issues() == []
+    snap = monitor.snapshot()
+    assert snap["stalls_over_ws_risk"] == 1
+    assert snap["recent_stalls_over_ws_risk"] == 0
+    assert snap["max_lag_ms"] == 3000.0
+
+
 def test_health_summary_includes_event_loop(forven_db, monkeypatch):
     monitor = lw.LoopLagMonitor()
     monitor.record(0.05)

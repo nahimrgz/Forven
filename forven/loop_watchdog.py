@@ -70,6 +70,7 @@ class LoopLagMonitor:
     def snapshot(self) -> dict:
         recent = sorted(self.samples)
         p95 = recent[int(len(recent) * 0.95)] if recent else 0.0
+        recent_max = recent[-1] if recent else 0.0
         return {
             "last_lag_ms": round(self.last_lag * 1000, 1),
             "p95_lag_ms": round(p95 * 1000, 1),
@@ -77,6 +78,12 @@ class LoopLagMonitor:
             "max_lag_at": self.max_lag_at,
             "stalls_over_warn": self.stall_count,
             "stalls_over_ws_risk": self.ws_risk_count,
+            # Recent = within the rolling sample window (~5 min of ticks). The
+            # health issue keys off these so DEGRADED clears once a storm passes;
+            # the lifetime counters above stay for telemetry/correlation.
+            "recent_max_lag_ms": round(recent_max * 1000, 1),
+            "recent_stalls_over_warn": sum(1 for s in recent if s >= WARN_LAG_SECONDS),
+            "recent_stalls_over_ws_risk": sum(1 for s in recent if s >= WS_RISK_LAG_SECONDS),
             "window_ticks": len(self.samples),
             "tick_seconds": TICK_SECONDS,
         }
@@ -91,13 +98,20 @@ def loop_lag_snapshot() -> dict:
 
 
 def loop_lag_issues() -> list[str]:
-    """Health-check issues derived from recent lag (empty when healthy)."""
+    """Health-check issues derived from recent lag (empty when healthy).
+
+    Keyed off the rolling sample window, NOT the lifetime counters: a stall
+    storm hours ago must not pin the dashboard on DEGRADED until restart.
+    """
     snap = _MONITOR.snapshot()
     issues: list[str] = []
-    if snap["stalls_over_ws_risk"] > 0:
+    if snap["recent_stalls_over_ws_risk"] > 0:
+        window_minutes = snap["window_ticks"] * snap["tick_seconds"] / 60
         issues.append(
             f"event loop stalled >= {WS_RISK_LAG_SECONDS:.1f}s "
-            f"{snap['stalls_over_ws_risk']}x (WS drop risk; max {snap['max_lag_ms']:.0f}ms "
+            f"{snap['recent_stalls_over_ws_risk']}x in the last ~{window_minutes:.0f}min "
+            f"(WS drop risk; recent max {snap['recent_max_lag_ms']:.0f}ms; "
+            f"{snap['stalls_over_ws_risk']}x since start, worst {snap['max_lag_ms']:.0f}ms "
             f"at {snap['max_lag_at']})"
         )
     return issues
