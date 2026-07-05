@@ -44,6 +44,9 @@ dependencies = [
     "hyperliquid-python-sdk>=0.22.0",
     "eth-account>=0.13.0",
     "scikit-learn>=1.5",
+    # HMM regime classifiers for novel-mechanism strategies (allowlisted in
+    # forven/sandbox/ast_guard.py). Prebuilt wheels; deps already satisfied.
+    "hmmlearn>=0.3",
     "discord.py>=2.3",
     "duckdb>=1.1.0",
     "feedparser>=6.0",
