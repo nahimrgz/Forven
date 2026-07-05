@@ -596,29 +596,49 @@ def _tool_get_ops_overview() -> str:
     description=(
         "List crucibles (trading-idea hypotheses) with status and strategy counts, "
         "optionally filtered by status or a search string. Use for 'any promising "
-        "ideas?', 'what ideas are under test?'."
+        "ideas?', 'what ideas are under test?'. By default only the ACTIVE pool is "
+        "shown; pass view='archived'/'graduated'/'trash' to see resolved crucibles "
+        "(archived includes disproven ones) — an archived/graduated hypothesis still "
+        "resolves by id, it just left the active pool."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "status": {"type": "string", "description": "Optional status filter."},
             "search": {"type": "string", "description": "Optional search string."},
+            "view": {
+                "type": "string",
+                "description": "Pool to list: active (default), archived, graduated, trash.",
+            },
             "limit": {"type": "integer", "description": "Max rows (default 20, max 50)."},
         },
         "required": [],
     },
     permissions={"brain", None},
 )
-def _tool_list_hypotheses(status: str = "", search: str = "", limit: int = 20) -> str:
+def _tool_list_hypotheses(status: str = "", search: str = "", view: str = "", limit: int = 20) -> str:
     from forven.api_domains.hypotheses import list_hypotheses_page
+
+    _ALLOWED_VIEWS = ("active", "archived", "graduated", "trash")
+    normalized_view = str(view or "").strip().lower() or None
+    if normalized_view is not None and normalized_view not in _ALLOWED_VIEWS:
+        return _json.dumps({
+            "error": f"unknown view '{normalized_view}'. Allowed: {', '.join(_ALLOWED_VIEWS)} (default active).",
+        })
+    # Disproven crucibles are filtered out of every view unless explicitly asked
+    # for. When the caller looks outside the active pool it wants the resolved
+    # ones (a disproven+archived hypothesis is the exact 'looks unregistered' case).
+    include_disproven = normalized_view not in (None, "active")
 
     try:
         cap = max(1, min(int(limit or 20), 50))
     except (TypeError, ValueError):
         cap = 20
     page = list_hypotheses_page(
+        view=normalized_view,
         status=(str(status or "").strip() or None),
         search=(str(search or "").strip() or None),
+        include_disproven=include_disproven,
         limit=cap,
         offset=0,
     )
@@ -629,6 +649,7 @@ def _tool_list_hypotheses(status: str = "", search: str = "", limit: int = 20) -
             "display_id": h.get("display_id"),
             "title": h.get("title"),
             "status": h.get("status"),
+            "manager_state": h.get("manager_state"),
             "lane": h.get("lane"),
             "source_type": h.get("source_type"),
             "strategy_count": h.get("strategy_count"),
