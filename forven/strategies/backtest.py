@@ -1582,7 +1582,14 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 new_sharpe = float(metrics.get("sharpe") or metrics.get("sharpe_ratio") or 0)
                 existing_degenerate = is_degenerate_backtest_metrics(existing_metrics)
                 new_degenerate = is_degenerate_backtest_metrics(metrics)
-                keep_existing = (
+                # The best-of rule only ever PROTECTS honest stored metrics from a
+                # worse/degenerate rerun. With no stored metrics there is nothing to
+                # protect, so always take the new run — otherwise a fresh strategy
+                # whose first backtest reports flat (no in_sample block) metrics gets
+                # classified "degenerate", keeps its empty {} blob, and can never
+                # promote out of quick_screen.
+                has_existing = bool(existing_metrics)
+                keep_existing = has_existing and (
                     (new_degenerate and not existing_degenerate)
                     or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
                 )
