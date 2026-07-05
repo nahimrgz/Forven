@@ -147,3 +147,31 @@ class IntSignalStrategy(BaseStrategy):
     assert "must return a Signal or a dict" in stdout
     assert "from forven.strategies.base import Signal" in stdout
     assert "NOT a BUY/SELL/NONE enum" in stdout
+
+
+def test_validate_strategy_code_rejects_bad_init_signature_with_actionable_message():
+    """An agent overriding __init__ with the wrong signature (params only) must be
+    told the required BaseStrategy constructor, not a bare TypeError (BUG id=248)."""
+    result = selfheal_mod.validate_strategy_code(
+        """
+from forven.strategies.base import BaseStrategy, Signal
+
+class BadInitStrategy(BaseStrategy):
+    name = "badinit"
+    asset = "BTC"
+    strategy_type = "badinit"
+    default_params = {}
+
+    def __init__(self, params=None):
+        super().__init__("badinit", params)
+
+    def generate_signal(self, df):
+        return Signal(price=float(df["close"].iloc[-1]))
+"""
+    )
+
+    assert result["valid"] is False
+    stdout = result["execution_result"]["stdout"]
+    assert "Could not instantiate" in stdout
+    assert "__init__(self, strategy_id, params)" in stdout
+    assert "default_params" in stdout
