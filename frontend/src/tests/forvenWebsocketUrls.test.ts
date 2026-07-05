@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../lib/api/core', () => ({
 	ACTIVE_API_BASE: 'http://127.0.0.1:8003/api',
 	API_BASE: 'http://127.0.0.1:8003/api',
+	isLocalHost: (hostname: string) =>
+		['localhost', '127.0.0.1', '::1', ''].includes((hostname || '').toLowerCase()),
 	fetchApi: vi.fn()
 }));
 

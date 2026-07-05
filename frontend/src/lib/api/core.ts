@@ -14,16 +14,40 @@ function trimTrailingSlash(value: string): string {
 	return value.endsWith('/') ? value.slice(0, -1) : value;
 }
 
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '']);
+
+export function isLocalHost(hostname: string): boolean {
+	return LOCAL_HOSTNAMES.has((hostname || '').toLowerCase());
+}
+
+// The backend is reachable at `${host}:8003` ONLY when the browser runs on the
+// same machine (localhost/127.0.0.1). For any remote host — a LAN IP, a VSCode
+// dev tunnel, a reverse proxy — that port is not routable (tunnels map each port
+// to its own hostname) and the CSP only allows same-origin connections. In those
+// cases route through the same-origin `/api` proxy (Vite `server.proxy` in dev,
+// the reverse proxy in prod) instead.
+export function preferredBrowserApiBase(location: {
+	protocol?: string;
+	hostname?: string;
+	origin?: string;
+}): string {
+	const protocol = location.protocol || 'http:';
+	const host = location.hostname || '127.0.0.1';
+	if (isLocalHost(host)) {
+		return `${protocol}//${host}:8003/api`;
+	}
+	const origin = (location.origin || `${protocol}//${host}`).replace(/\/$/, '');
+	return `${origin}/api`;
+}
+
 function resolveApiBase(): string {
 	const configuredBase = (import.meta.env.VITE_API_BASE ?? '').trim();
 	if (configuredBase) {
 		if (configuredBase.startsWith('/')) {
 			if (typeof window !== 'undefined' && window.location) {
-				// Prefer direct backend access from browser clients; Vite proxy `/api`
-				// can intermittently disconnect for remote/mobile clients.
-				const protocol = window.location.protocol || 'http:';
-				const host = window.location.hostname || '127.0.0.1';
-				return `${protocol}//${host}:8003/api`;
+				// Prefer direct backend access on local clients; fall back to the
+				// same-origin proxy on remote hosts where `:8003` is unreachable.
+				return preferredBrowserApiBase(window.location);
 			}
 			return `${DEFAULT_API_ORIGIN}${trimTrailingSlash(configuredBase)}`;
 		}
@@ -33,9 +57,7 @@ function resolveApiBase(): string {
 	}
 
 	if (typeof window !== 'undefined' && window.location) {
-		const protocol = window.location.protocol || 'http:';
-		const host = window.location.hostname || '127.0.0.1';
-		return `${protocol}//${host}:8003/api`;
+		return preferredBrowserApiBase(window.location);
 	}
 	return `${DEFAULT_API_ORIGIN}/api`;
 }
@@ -49,19 +71,21 @@ const BASE_CANDIDATES_RAW = new Set<string>([
 if (typeof window !== 'undefined' && window.location) {
 	const protocol = window.location.protocol || 'http:';
 	const host = window.location.hostname || '127.0.0.1';
-	const isLocalBrowserHost = host === '127.0.0.1' || host === 'localhost' || host === '::1';
 
 	BASE_CANDIDATES_RAW.add('/api');
+	BASE_CANDIDATES_RAW.add(`${window.location.origin.replace(/\/$/, '')}/api`);
 	BASE_CANDIDATES_RAW.add(`${protocol}//${host}/api`);
-	BASE_CANDIDATES_RAW.add(`${protocol}//${host}:8003/api`);
-	BASE_CANDIDATES_RAW.add(`${protocol}//${host}:8000/api`);
-	if (isLocalBrowserHost) {
+	// Direct `:8003`/`:8000` backend ports are only reachable — and only allowed
+	// by the CSP — when the browser is on the same machine as the backend. On a
+	// remote host they resolve nowhere and just spam CSP-violation errors.
+	if (isLocalHost(host)) {
+		BASE_CANDIDATES_RAW.add(`${protocol}//${host}:8003/api`);
+		BASE_CANDIDATES_RAW.add(`${protocol}//${host}:8000/api`);
 		for (const fallbackHost of FALLBACK_API_ORIGINS) {
 			BASE_CANDIDATES_RAW.add(`${protocol}//${fallbackHost}:8003/api`);
 			BASE_CANDIDATES_RAW.add(`${protocol}//${fallbackHost}:8000/api`);
 		}
 	}
-	BASE_CANDIDATES_RAW.add(`${window.location.origin.replace(/\/$/, '')}/api`);
 } else {
 	BASE_CANDIDATES_RAW.add(`${DEFAULT_API_ORIGIN}/api`);
 }
@@ -72,15 +96,23 @@ if (typeof window !== 'undefined' && window.location) {
 	const host = window.location.hostname || '127.0.0.1';
 	const originApi = `${window.location.origin.replace(/\/$/, '')}/api`;
 	const directBackendApi = `${protocol}//${host}:8003/api`;
-	preferredCandidates = [
-		trimTrailingSlash(API_BASE),
-		directBackendApi,
-		`${DEFAULT_API_ORIGIN}/api`,
-		originApi,
-		`${protocol}//${host}/api`,
-		`${protocol}//${host}:8000/api`,
-		'/api',
-	];
+	preferredCandidates = isLocalHost(host)
+		? [
+			trimTrailingSlash(API_BASE),
+			directBackendApi,
+			`${DEFAULT_API_ORIGIN}/api`,
+			originApi,
+			`${protocol}//${host}/api`,
+			`${protocol}//${host}:8000/api`,
+			'/api',
+		]
+		: [
+			// Remote host: only the same-origin proxy is reachable and CSP-allowed.
+			trimTrailingSlash(API_BASE),
+			originApi,
+			`${protocol}//${host}/api`,
+			'/api',
+		];
 } else {
 	preferredCandidates = [
 		trimTrailingSlash(API_BASE),

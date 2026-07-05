@@ -2,6 +2,7 @@ import {
 	ACTIVE_API_BASE,
 	API_BASE,
 	fetchApi,
+	isLocalHost,
 } from './core';
 import type { TaskAuditEvent, TaskContainer } from './lifecycle';
 import type { PendingSignal, SessionIndicatorsResponse, TradeMarkersResponse } from './paper';
@@ -1509,9 +1510,17 @@ export function getForvenLiveWebSocketUrls(): string[] {
 	if (typeof window !== 'undefined' && window.location) {
 		const protocol = window.location.protocol || 'http:';
 		const host = window.location.hostname || '127.0.0.1';
-		candidates.add(`${protocol}//${host}:8003/api`);
-		if (preferredAbsoluteBases.length === 0) {
-			candidates.add(`${window.location.origin.replace(/\/$/, '')}/api`);
+		const originApi = `${window.location.origin.replace(/\/$/, '')}/api`;
+		if (isLocalHost(host)) {
+			// Local client: the backend is directly reachable on :8003.
+			candidates.add(`${protocol}//${host}:8003/api`);
+			if (preferredAbsoluteBases.length === 0) {
+				candidates.add(originApi);
+			}
+		} else {
+			// Remote host (LAN/tunnel): `:8003` is unroutable and CSP-blocked — the
+			// WS must ride the same-origin `/api` proxy (Vite `ws:true`).
+			candidates.add(originApi);
 		}
 	}
 
