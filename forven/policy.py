@@ -2474,6 +2474,17 @@ def _extract_reason_code(reason_text: str) -> str:
         return "source_divergence_reject"
     if "overfit" in text:
         return "overfit_reject"
+    # WFA fold-DENSITY shortfalls are evidence-insufficiency, not merit: the
+    # window was too small for the strategy's trade cadence to produce >=2
+    # judgeable folds (S06127 2026-07-06: auto-archived on 5 background polls of
+    # one unchanged sparse-fold artifact, then PASSED 0.67 fold-pass-rate once
+    # the window was sized to its cadence). Matched before the generic "s00552"
+    # bucket so these never feed the repeated-failure archive counter. The fold
+    # PASS-RATE reject stays a genuine (counting) s00552_reject.
+    if "walk-forward window insufficient" in text or (
+        "walk-forward has" in text and "requires minimum" in text
+    ):
+        return "wfa_window_insufficient"
     if "s00552" in text:
         return "s00552_reject"
     if "s00152" in text:
@@ -2607,6 +2618,10 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",
+    # WFA produced too few judgeable (>= wfa_min_fold_trades) folds — the window
+    # was undersized for the strategy's trade cadence. Re-runnable, says nothing
+    # about edge quality (S06127 2026-07-06).
+    "wfa_window_insufficient",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -3821,7 +3836,14 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             wfa_pass_rate = 1.0 if wfa_pass_rate else 0.0
         wfa_pass_rate = float(wfa_pass_rate)
         if enforce_wfa and wfa_folds < wfa_thresholds["min_folds"]:
-            return False, f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum {wfa_thresholds['min_folds']}"
+            # Same evidence-density class as the insufficient_fold_evidence block
+            # above (only N-of-min judgeable folds instead of zero): actionable
+            # re-run, not a merit failure — taxonomy maps it to the counter-exempt
+            # wfa_window_insufficient code.
+            return False, (
+                f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum "
+                f"{wfa_thresholds['min_folds']}; re-run WFA on the trade-frequency-aware window"
+            )
         # Single source of truth for the WFA fold-pass-rate floor: the same
         # robustness_thresholds.wfa_fold_pass_rate_min the composite scorer uses
         # (_validation_row_passed), so the money gate and the rank score can't

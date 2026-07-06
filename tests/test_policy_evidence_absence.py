@@ -187,6 +187,46 @@ def test_insufficient_paper_evidence_rejections_never_auto_archive_or_dethrone(f
     assert int(approvals) == 0
 
 
+# --- WFA fold-density shortfalls (S06127 2026-07-06) -----------------------------
+# "Walk-forward has N folds, requires minimum M" and "walk-forward window
+# insufficient" mean the window was too small for the strategy's trade cadence to
+# produce judgeable folds — evidence-insufficiency, not merit. Five background
+# polls of one unchanged sparse-fold artifact auto-archived a strategy whose
+# retirement snapshot read robustness 100/100 and which PASSED once the window
+# was sized to its cadence. The fold PASS-RATE reject stays a counting failure.
+
+
+def test_extract_reason_code_classifies_wfa_fold_density_as_evidence_absence():
+    for text in (
+        "S00552 REJECT: Walk-forward has 1 folds, requires minimum 2; re-run WFA on the trade-frequency-aware window",
+        "S00552 REJECT: Walk-forward has 1 folds, requires minimum 2",
+        "S00552 BLOCK: walk-forward window insufficient — no OOS fold reached 5 trades; re-run WFA on the trade-frequency-aware window",
+    ):
+        assert policy._extract_reason_code(text) == "wfa_window_insufficient", text
+    assert "wfa_window_insufficient" in policy._EVIDENCE_ABSENCE_REASON_CODES
+    # The fold pass-rate reject is a genuine ran-and-failed outcome and keeps counting.
+    assert (
+        policy._extract_reason_code("S00552 REJECT: Walk-forward pass rate 20% below 40% minimum")
+        == "s00552_reject"
+    )
+
+
+def test_wfa_fold_density_rejections_never_auto_archive(forven_db):
+    strategy_id = "s-wfa-fold-density"
+    text = (
+        "S00552 REJECT: Walk-forward has 1 folds, requires minimum 2; "
+        "re-run WFA on the trade-frequency-aware window"
+    )
+    _insert_strategy(strategy_id)
+    _insert_rejections(strategy_id, "wfa_window_insufficient", text, count=8)
+
+    policy._check_repeated_failure_auto_archive(
+        strategy_id, "gauntlet", "wfa_window_insufficient", text
+    )
+
+    assert _stage(strategy_id) == "gauntlet"
+
+
 def test_paper_quality_failures_do_not_auto_queue_dethrone_for_operator_owned(forven_db):
     # Updated contract (paper param/metric lock): paper/live are operator-owned, so
     # background gate re-evaluations must NOT auto-queue a paper->gauntlet dethrone
