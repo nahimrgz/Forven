@@ -934,6 +934,23 @@ def resolve_backtest_trade_mode(
         params=params,
         strategy_obj=strategy_obj,
     )
+
+    # Honor a strategy's DECLARED bidirectional capability by default. A strategy
+    # that emits a symmetric 4-series/DirectionalSignals payload and declares
+    # 'both' support was silently degraded to long_only whenever the caller passed
+    # no explicit trade_mode, no allow_shorting and no params.trade_mode — dropping
+    # its short legs (a symmetric strategy could go from 20 trades to 0). Upgrade
+    # ONLY to 'both', which always preserves the long leg, so a strategy that is
+    # merely mirror-short-safe (declares short_only but not 'both') stays long_only.
+    if (
+        explicit_mode is None
+        and not allow_shorting
+        and resolved == "long_only"
+        and _normalize_trade_mode_value((params or {}).get("trade_mode")) is None
+        and "both" in supported
+    ):
+        resolved = "both"
+
     if resolved == "both" and "both" not in supported:
         if explicit_mode is None and allow_shorting and "short_only" in supported:
             resolved = "short_only"

@@ -270,6 +270,68 @@ def test_resolve_backtest_trade_mode_honors_imported_strategy_declared_mode():
     assert resolved_mode == "both"
 
 
+def test_resolve_backtest_trade_mode_defaults_to_both_for_declared_bidirectional_strategy():
+    """A strategy declaring 'both' support, invoked with no explicit trade_mode,
+    no allow_shorting and no params.trade_mode, must default to 'both' — not
+    silently long_only. Silent long_only dropped the short legs of a symmetric
+    4-series/DirectionalSignals payload (bug: 20 trades -> 0)."""
+    resolved_mode, error = backtest_mod.resolve_backtest_trade_mode(
+        None,
+        allow_shorting=None,
+        strategy_type="both_dummy",
+        params={},
+        strategy_obj=_BothSidesStrategy("S-BOTH", {}),
+    )
+
+    assert error is None
+    assert resolved_mode == "both"
+
+
+def test_resolve_backtest_trade_mode_keeps_long_only_default_for_mirror_safe_strategy():
+    """The default-widening must upgrade only to 'both' (which preserves the long
+    leg), never to short_only. A long strategy that is merely mirror-short-SAFE
+    (declares short_only but not 'both') must still default to long_only — its
+    natural direction is long."""
+    resolved_mode, error = backtest_mod.resolve_backtest_trade_mode(
+        None,
+        allow_shorting=None,
+        strategy_type="mirror_short_dummy",
+        params={},
+        strategy_obj=_MirrorShortStrategy("S-MIRROR", {}),
+    )
+
+    assert error is None
+    assert resolved_mode == "long_only"
+
+
+def test_backtest_strategy_defaults_to_both_for_declared_bidirectional_signals(forven_db, monkeypatch):
+    """Regression: a strategy emitting a 4-series/DirectionalSignals payload and
+    declaring 'both' support was silently run long_only when no trade_mode was
+    passed, dropping its short legs. It must default to 'both' and keep shorts."""
+    _patch_backtest_environment(monkeypatch)
+    monkeypatch.setattr(
+        backtest_mod,
+        "_resolve_strategy_class",
+        lambda strategy_type: _BothSidesStrategy if strategy_type == "both_dummy" else None,
+    )
+
+    result = backtest_mod.backtest_strategy(
+        strategy_id="S-BOTH-DEFAULT",
+        asset="BTC/USDT",
+        strategy_type="both_dummy",
+        params={},
+        bars=260,
+        candles_df=_price_frame(),
+        # no trade_mode passed — must not silently degrade to long_only
+        persist_legacy_run=False,
+    )
+
+    assert not result.get("error")
+    assert result["trade_mode"] == "both"
+    assert result["metrics"]["by_side"]["short"]["total_trades"] >= 1
+    assert {trade["direction"] for trade in result["trades"]} == {"long", "short"}
+
+
 def test_resolve_backtest_trade_mode_keeps_strict_guard_for_first_party_strategy():
     """The sandbox-only relaxation must NOT leak to first-party strategies the parent
     CAN introspect: forcing trade_mode='both' on a long-only type still errors."""
