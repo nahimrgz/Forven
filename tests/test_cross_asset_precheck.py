@@ -64,3 +64,15 @@ def test_source_detector_shapes():
     # Unquoted identifiers, own-frame columns, and English words never match.
     miss = "btc_close = compute(); close = df['close']; funding = df['funding_rate']"
     assert _cross_asset_columns_in_source(miss) == set()
+
+
+def test_single_declared_asset_differing_from_request_is_not_cross_asset():
+    # Builtins declare their OWN default asset in data_requirements(); a request
+    # for a different symbol is asset-pinning, not a cross-asset design.
+    from tests.xasset_fixture_clean import PinnedAsset
+
+    result = evaluate_data_availability(
+        "pinned_dummy", "BTC/USDT", "1h", auto_fetch=False,
+        strategy_cls=PinnedAsset,
+    )
+    assert not result.blocked

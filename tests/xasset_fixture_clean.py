@@ -22,3 +22,17 @@ class OwnAssetOnly:
 
     def generate_signals(self, df):
         return df["close"] > 0
+
+
+class PinnedAsset:
+    """Declares a single asset that differs from the request symbol —
+    asset-pinning (every builtin does this), NOT a cross-asset design."""
+
+    def __init__(self, strategy_id, params):
+        self.params = params
+
+    def data_requirements(self):
+        return [{"asset": "ETH"}]
+
+    def generate_signals(self, df):
+        return df["close"] > 0

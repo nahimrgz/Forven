@@ -252,10 +252,15 @@ def infer_cross_asset_columns(strategy_cls, asset: str) -> frozenset[str]:
         pass
     try:
         declared = _declared_assets(strategy_cls, asset)
-        primary = str(asset or "").strip().upper().split("/", 1)[0]
-        extra = {a for a in declared if a.split("/", 1)[0] != primary}
-        if declared and extra:
-            found |= {f"second_asset:{a}" for a in sorted(extra)}
+        bases = {a.split("/", 1)[0] for a in declared if a}
+        # Cross-asset means TWO OR MORE distinct assets declared (the import
+        # guard's rule). A single declared asset differing from the request
+        # symbol is mere asset-pinning (builtins declare their own default
+        # asset) — flagging that false-blocked every builtin backtest.
+        if len(bases) >= 2:
+            primary = str(asset or "").strip().upper().split("/", 1)[0]
+            extra = sorted(b for b in bases if b != primary) or sorted(bases)
+            found |= {f"second_asset:{b}" for b in extra}
     except Exception:
         pass
     return frozenset(found)
