@@ -2345,6 +2345,21 @@ def _extract_reason_code(reason_text: str) -> str:
     # them from feeding the repeated-failure counter that auto-archives losers.
     if "metrics available" in text:
         return "no_metrics_error"
+    # Data-availability precheck (forven.strategies.data_availability): the backtest
+    # was refused BEFORE it ran because a required OHLCV/funding/OI feed "could not
+    # be downloaded" or is "not available and cannot be auto-downloaded" — no verdict
+    # was ever computed. Without this branch the text fell through to the generic
+    # 'gate_reject' bucket, which IS counted by the repeated-failure auto-archive
+    # counter, silently archiving a strategy for a data outage it was never judged on.
+    if "could not be downloaded" in text or "not available and cannot be auto-downloaded" in text:
+        return "data_unavailable"
+    # Mirrors gauntlet.engine.drain_exhausted_blocked_steps' own reason_code
+    # ("retries_exhausted"): a transient infra/data block (db-lock, timeout,
+    # process-restart) burned its full retry budget and was drained to a terminal
+    # state to unstick the workflow -- explicitly stamped "NOT a merit verdict" at
+    # the step level. Same fall-through-to-gate_reject bug as data_unavailable above.
+    if "retries exhausted on a transient block" in text:
+        return "retries_exhausted"
     # Evidence-ABSENCE outcomes one stage later than no_metrics_error: the gauntlet
     # artifacts/tests have not been run or persisted YET (work queued, optimization in
     # flight, validation awaiting a re-run). These previously fell into wfa_reject via
@@ -2512,6 +2527,13 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",
+    # Required data feed could not be fetched -- the backtest was refused before
+    # it ran (2026-07-06 audit). No verdict exists to judge.
+    "data_unavailable",
+    # Transient infra/data block drained after exhausting its retry budget
+    # (gauntlet.engine.drain_exhausted_blocked_steps) -- explicitly not a merit
+    # verdict at the step level (2026-07-06 audit).
+    "retries_exhausted",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -3185,6 +3207,77 @@ def _implausible_metrics_reason(metrics: dict, config: dict) -> str | None:
     return None
 
 
+def _load_quick_screen_step_metrics(strategy_id: str) -> dict:
+    """Fallback metrics source for the quick-screen gate (2026-07-06 audit).
+
+    ``run_quick_screen_gate`` (forven/gauntlet/tasks.py) only persists the
+    winning backtest metrics onto ``strategies.metrics`` via
+    ``_persist_quick_screen_winner`` when its best-of-N timeframe lookup finds a
+    usable ``backtest_results`` row. When it does not (no row yet / all rows
+    degenerate / lookup raised and was swallowed), a merit-failing gate result
+    (``{"status": "failed_gate", "message": ..., "metrics": {...}}``) is recorded
+    ONLY in ``gauntlet_steps.error_json`` (via ``block_step``) — ``strategies.metrics``
+    stays empty. A later re-check of this same gate (e.g.
+    ``routers.robustness._reconcile_stage_after_validation``) then reads the empty
+    strategies row and reports "No quick-screen metrics available" even though the
+    strategy WAS judged and failed on merit. Reading the latest persisted
+    quick_screen/quick_screen_gate step's output lets the gate recover the real
+    verdict instead of mislabeling it as an evidence-absence outcome.
+
+    Read-only (no writes) and best-effort: any failure here must fall back to the
+    caller's existing "no metrics" behavior, never raise.
+    """
+    try:
+        with get_db() as conn:
+            # "Latest" relies on store.create_or_get_workflow REUSING one workflow
+            # per (strategy_id, definition_version) and touching updated_at on each
+            # step (re)run — so the newest row here is the current verdict, not a
+            # stale one from an abandoned parallel workflow. If workflow creation
+            # ever stops being idempotent per strategy, scope this to the active
+            # workflow explicitly.
+            row = conn.execute(
+                """
+                SELECT st.error_json, st.output_json
+                FROM gauntlet_steps st
+                JOIN gauntlet_workflows w ON w.id = st.workflow_id
+                WHERE w.strategy_id = ?
+                  AND st.step_key IN ('quick_screen_gate', 'quick_screen')
+                ORDER BY datetime(COALESCE(st.completed_at, st.updated_at)) DESC, st.rowid DESC
+                LIMIT 1
+                """,
+                (strategy_id,),
+            ).fetchone()
+    except Exception:
+        return {}
+    if not row:
+        return {}
+    # error_json first: a merit-failing gate result's metrics live there (see
+    # docstring above); output_json covers a "passed" step whose metrics were
+    # never promoted onto the strategy row for some other reason.
+    for blob_key in ("error_json", "output_json"):
+        raw = row[blob_key]
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        # Defense in depth: engine.drain_exhausted_blocked_steps stamps
+        # ``merit: False`` on drained transient blocks precisely so downstream
+        # consumers never mistake them for a judged verdict. Today those payloads
+        # carry no ``metrics`` key, but that is an unenforced invariant — honor
+        # the flag so a future diagnostic metrics blob on a blocked payload can
+        # never be resurrected as a real quick-screen verdict.
+        if payload.get("merit") is False:
+            continue
+        step_metrics = payload.get("metrics")
+        if isinstance(step_metrics, dict) and step_metrics:
+            return step_metrics
+    return {}
+
+
 def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     """Step 1 -> Step 2 gate: cheap triage on return/dd/sharpe with S00552 guardrails.
 
@@ -3202,6 +3295,13 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
         return False, "Strategy not found"
 
     metrics = _load_metrics_blob(row)
+    if not metrics:
+        # Evidence-of-record for this strategy's quick-screen run may exist in the
+        # gauntlet step history even though strategies.metrics was never updated
+        # (see _load_quick_screen_step_metrics docstring) — check before declaring
+        # "no metrics available", which mislabels a real merit failure AND exempts
+        # it from the repeated-failure auto-archive counter.
+        metrics = _load_quick_screen_step_metrics(strategy_id)
     if not metrics:
         return False, "No quick-screen metrics available"
 
