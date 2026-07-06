@@ -1231,7 +1231,30 @@ def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> t
             f"Missing passing persisted artifact rows for: {', '.join(missing)}. "
             f"Run or rerun these tests until the saved verdicts pass.",
         )
-    return True, f"All required artifact rows passed: {', '.join(sorted(passing))}"
+    # Two-tier transparency: a walk_forward row can pass the PAPER tier (fold
+    # pass-rate over judgeable folds) while its strict artifact verdict is FAIL
+    # (avg IS/OOS Sharpe, degradation — the paper->live bar). Without saying so,
+    # the report reads as a false green next to the artifact's FAIL verdict and
+    # operators either mistrust the gate or promote past evidence they meant to
+    # check (2026-07-06 session: an S06126 lean-pass was misread as the
+    # 2026-07-03 false-green bug).
+    notes: list[str] = []
+    for test_name in sorted(passing):
+        payload = payloads.get(test_name)
+        raw = (
+            str(payload.get("raw_verdict") or "").strip().upper()
+            if isinstance(payload, dict)
+            else ""
+        )
+        if raw == "FAIL":
+            notes.append(
+                f"{test_name} passed paper-tier criteria; its strict artifact verdict is "
+                "FAIL (enforced at the paper->live gate)"
+            )
+    detail = f"All required artifact rows passed: {', '.join(sorted(passing))}"
+    if notes:
+        detail += ". " + "; ".join(notes)
+    return True, detail
 
 
 def check_promotion_readiness(strategy_id: str) -> dict:
