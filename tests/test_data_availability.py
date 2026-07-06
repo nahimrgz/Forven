@@ -212,3 +212,127 @@ def test_columns_in_source_matches_quoted_literals_only():
     assert "funding_rate" in found
     assert "basis" not in found  # bare word / prose, not a quoted column literal
     assert "close" not in found  # OHLCV column, not in feed vocabulary
+
+
+# --- fetch-attempt guard: a single transient failure must not poison a
+# (symbol, stream) forever ---------------------------------------------------
+# Root cause of the H00012 funding family / #582 basis blocks: `_fetch_stream`
+# recorded a bare "attempted" flag on the very first call, before the fetch
+# even ran, and never revisited it. One transient BV/ccxt hiccup the first
+# time a strategy needed e.g. BTC basis therefore blocked EVERY strategy
+# needing BTC basis for the rest of the process's life -- even though
+# `dm.backfill(symbol="BTC/USDT", streams=("basis",))` demonstrably succeeds
+# (verified manually: 56879 rows fetched). These tests lock in retry-after-
+# cooldown semantics: a failed attempt is retried after `_FETCH_RETRY_COOLDOWN_
+# SECONDS`; a successful one is never redundantly retried.
+def _fake_clock(monkeypatch, start: float = 1_000_000.0):
+    state = {"now": start}
+
+    def _time():
+        return state["now"]
+
+    monkeypatch.setattr(da.time, "time", _time)
+    return state
+
+
+def _stub_data_manager(monkeypatch, *, side_effects):
+    """Replace get_data_manager() with a fake whose .backfill() pops from
+    ``side_effects`` (an exception instance raises; anything else returns it)."""
+    import forven.data_manager as data_manager_mod
+
+    calls = []
+
+    class _FakeDM:
+        def backfill(self, *, symbol, streams):
+            calls.append((symbol, streams))
+            outcome = side_effects.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(data_manager_mod, "get_data_manager", lambda: _FakeDM())
+    return calls
+
+
+def test_fetch_stream_retries_failed_fetch_after_cooldown(monkeypatch):
+    monkeypatch.setattr(da, "_FETCH_ATTEMPTED", {})
+    clock = _fake_clock(monkeypatch)
+    calls = _stub_data_manager(
+        monkeypatch, side_effects=[RuntimeError("BV endpoint 503"), {"BTC-USDT": {"basis": 100}}]
+    )
+
+    # First attempt: fails.
+    assert da._fetch_stream("BTC/USDT", "basis") is False
+    assert len(calls) == 1
+
+    # Immediately retrying (still inside the cooldown window) must NOT hammer
+    # the source again -- this is the rate-limiting behaviour the guard is
+    # meant to preserve.
+    assert da._fetch_stream("BTC/USDT", "basis") is False
+    assert len(calls) == 1
+
+    # Once the cooldown elapses, a fresh attempt is made and this time it
+    # succeeds -- the strategy is no longer poisoned forever by the first
+    # transient failure.
+    clock["now"] += da._FETCH_RETRY_COOLDOWN_SECONDS + 1
+    assert da._fetch_stream("BTC/USDT", "basis") is True
+    assert len(calls) == 2
+
+
+def test_fetch_stream_success_is_never_retried(monkeypatch):
+    monkeypatch.setattr(da, "_FETCH_ATTEMPTED", {})
+    clock = _fake_clock(monkeypatch)
+    calls = _stub_data_manager(monkeypatch, side_effects=[{"BTC-USDT": {"basis": 100}}])
+
+    assert da._fetch_stream("BTC/USDT", "basis") is True
+    assert len(calls) == 1
+
+    # Long after the cooldown window, a landed fetch is still not retried --
+    # there's nothing to gain from re-downloading data that's already there.
+    clock["now"] += da._FETCH_RETRY_COOLDOWN_SECONDS * 10
+    assert da._fetch_stream("BTC/USDT", "basis") is False
+    assert len(calls) == 1
+
+
+def test_evaluate_data_availability_unblocks_after_cooldown_once_fetchable(monkeypatch):
+    """End-to-end: a strategy blocked by a transient download failure must be
+    able to pass on a later evaluation once the feed is actually fetchable,
+    instead of being blocked forever by the stale attempt guard."""
+    import forven.strategies.backtest as backtest_mod
+
+    monkeypatch.setattr(da, "_FETCH_ATTEMPTED", {})
+    monkeypatch.setattr(da, "_AVAIL_CACHE", {})
+    monkeypatch.setattr(backtest_mod, "_resolve_strategy_class", lambda _t: _DummyStrategy)
+    monkeypatch.setattr(da, "infer_required_columns", lambda _cls, _sym: frozenset({"basis"}))
+    clock = _fake_clock(monkeypatch)
+
+    state = {"present": set()}
+    import forven.data_manager as data_manager_mod
+
+    calls = []
+
+    class _FakeDM:
+        def backfill(self, *, symbol, streams):
+            calls.append((symbol, streams))
+            if len(calls) == 1:
+                raise RuntimeError("BV endpoint 503")  # transient failure
+            state["present"] = {"basis"}  # 2nd attempt lands the feed for real
+            return {"BTC-USDT": {"basis": 100}}
+
+    monkeypatch.setattr(data_manager_mod, "get_data_manager", lambda: _FakeDM())
+    monkeypatch.setattr(da, "_present_columns", lambda _s, _t: frozenset(state["present"]))
+
+    # First evaluation: download fails, feed still absent -> BLOCKED.
+    res1 = da.evaluate_data_availability("basis_strat", "BTC/USDT", "1h", strategy_id="S_TEST")
+    assert res1.blocked and not res1.ok
+    assert "could not be downloaded" in res1.error
+    assert len(calls) == 1
+
+    # The transient outage clears up, but the OLD guard would still treat
+    # this (symbol, stream) as permanently "attempted" and never retry.
+    # Advancing past the cooldown must allow a second, successful attempt.
+    clock["now"] += da._FETCH_RETRY_COOLDOWN_SECONDS + 1
+
+    res2 = da.evaluate_data_availability("basis_strat", "BTC/USDT", "1h", strategy_id="S_TEST")
+    assert res2.ok and not res2.blocked
+    assert len(calls) == 2
