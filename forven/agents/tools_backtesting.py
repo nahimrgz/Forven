@@ -683,19 +683,27 @@ CERTIFIED_STRATEGY_FAMILIES = {
 
 
 def _is_certified_strategy_family(strategy_type: str, strategy_name: str = "") -> bool:
-    """Check if strategy type or name belongs to a certified family.
-    
+    """Check if the strategy TYPE resolves to a known param family.
+
     Certified families use built-in indicators and don't require rule-blob
     configuration (indicators, entry_conditions, exit_conditions, filters).
+
+    PARAMS-1: uses the server's canonical exact/longest-prefix family resolution
+    — the old SUBSTRING match against a hand list ('ema', 'bb', 'wr', ...)
+    misrouted novel composites whose name merely CONTAINED a token (e.g.
+    'taker_ema_cross_inflection_v2') into the certified branch, silently
+    dropping their rule-blob configuration. The strategy NAME is deliberately
+    no longer consulted: names embed asset/type/id fragments and were pure
+    false-positive surface.
     """
-    strategy_type_lower = str(strategy_type or "").lower().strip()
-    strategy_name_lower = str(strategy_name or "").lower().strip()
-    
-    # Check if type or name matches any certified family
-    for family in CERTIFIED_STRATEGY_FAMILIES:
-        if family in strategy_type_lower or family in strategy_name_lower:
-            return True
-    return False
+    try:
+        from forven.strategies.params import is_known_strategy_family
+
+        return is_known_strategy_family(strategy_type)
+    except Exception:
+        # Fallback: exact-token match only (never substring).
+        strategy_type_lower = str(strategy_type or "").lower().strip()
+        return strategy_type_lower in CERTIFIED_STRATEGY_FAMILIES
 
 def _tool_backtesting(tool_name: str, params: dict) -> str:
     """Execute a Forven Backtesting tool. Routes to the backtesting client."""

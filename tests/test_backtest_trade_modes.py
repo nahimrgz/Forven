@@ -282,3 +282,91 @@ def test_resolve_backtest_trade_mode_keeps_strict_guard_for_first_party_strategy
     assert resolved_mode == "both"
     assert error is not None
     assert "does not support trade_mode='both'" in error
+
+
+# --------------------------------------------------------------- TRADE-MODE-2
+# An explicit trade_mode in the strategy's OWN declared default_params is an
+# author declaration — honored even when the class omitted the
+# supported_trade_modes attribute (the template never mentioned it, so
+# CRUX-1-style dual-side classes were structurally unrunnable).
+
+
+class _DeclaredBothStrategy(BaseStrategy):
+    @property
+    def name(self) -> str:
+        return "Declared Both"
+
+    @property
+    def asset(self) -> str:
+        return "BTC"
+
+    @property
+    def strategy_type(self) -> str:
+        return "declared_both_dummy"
+
+    @property
+    def default_params(self) -> dict:
+        return {"trade_mode": "both", "lookback": 20}
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        return Signal(price=float(df["close"].iloc[-1]), direction="long")
+
+
+class _UndeclaredLongOnlyStrategy(BaseStrategy):
+    @property
+    def name(self) -> str:
+        return "Undeclared Long Only"
+
+    @property
+    def asset(self) -> str:
+        return "BTC"
+
+    @property
+    def strategy_type(self) -> str:
+        return "undeclared_long_only_dummy"
+
+    @property
+    def default_params(self) -> dict:
+        return {"lookback": 20}
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        return Signal(price=float(df["close"].iloc[-1]), direction="long")
+
+
+def test_declared_default_trade_mode_both_is_supported():
+    obj = _DeclaredBothStrategy("s-declared", {})
+    mode, err = backtest_mod.resolve_backtest_trade_mode(
+        "both", strategy_type="declared_both_dummy", params={"trade_mode": "both"}, strategy_obj=obj,
+    )
+    assert err is None, err
+    assert mode == "both"
+    # A dual-side author's sides are individually runnable (lane-split path).
+    mode, err = backtest_mod.resolve_backtest_trade_mode(
+        "short_only", strategy_type="declared_both_dummy", params={}, strategy_obj=obj,
+    )
+    assert err is None, err
+    assert mode == "short_only"
+
+
+def test_declared_default_resolves_via_registry_without_obj(monkeypatch):
+    from forven.strategies import registry
+
+    monkeypatch.setitem(registry._TYPE_MAP, "declared_both_dummy", _DeclaredBothStrategy)
+    monkeypatch.setattr(registry, "discover", lambda *a, **k: None)
+    mode, err = backtest_mod.resolve_backtest_trade_mode(
+        "both", strategy_type="declared_both_dummy", params={"trade_mode": "both"},
+    )
+    assert err is None, err
+    assert mode == "both"
+
+
+def test_request_override_on_undeclared_class_still_rejected():
+    # The strict guard is unchanged: a caller merely REQUESTING 'both' on a
+    # class that declares neither supported_trade_modes nor a default
+    # trade_mode is still refused.
+    obj = _UndeclaredLongOnlyStrategy("s-undeclared", {})
+    mode, err = backtest_mod.resolve_backtest_trade_mode(
+        "both", strategy_type="undeclared_long_only_dummy", params={"trade_mode": "both"}, strategy_obj=obj,
+    )
+    assert err is not None
+    assert "does not support trade_mode='both'" in err

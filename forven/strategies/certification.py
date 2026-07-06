@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from forven.strategies.params import (
-    SUPPORTED_PARAM_FAMILIES,
     ParamCanonicalizationMeta,
     canonicalize_params_with_metadata,
     is_known_runtime_type,
@@ -66,8 +65,9 @@ class StrategyExecutionCertification:
         if self.unregistered_runtime_type:
             return (
                 f"no runtime class registered for strategy type '{self.strategy_type}' "
-                f"(resolved family '{self.family_type}' is not in SUPPORTED_PARAM_FAMILIES "
-                "and no class with this TYPE_NAME exists in the registry)"
+                f"(resolved family '{self.family_type}'; no class with this TYPE_NAME "
+                "exists in the registry — register a strategy file that implements it, "
+                "or use a type backed by a registered class)"
             )
         if self.unsupported_rule_blobs:
             return "unsupported rule-blob params: " + ", ".join(self.unsupported_rule_blobs)
@@ -107,13 +107,18 @@ def certify_execution_strategy(
     # Only flag as unregistered when the caller actually supplied a type.
     # Empty strings arrive from intake/inference paths and are handled by
     # other error codes upstream.
+    #
+    # PHANTOM-1: certification requires a CONCRETE runtime class for the exact
+    # resolved type (require_runtime_class=True, fail-closed on registry
+    # errors). The old family-membership safety net is gone: it certified
+    # class-less families ('vwap', 'regime_filtered') and — combined with the
+    # fail-open registry probe — arbitrary made-up types (S05847
+    # soad_shock_reversal), minting phantom strategies that occupy quick_screen
+    # slots, burn gauntlet compute, and can never trade.
     unregistered = bool(normalized_type) and not is_known_runtime_type(
         normalized_type,
+        require_runtime_class=True,
     )
-    # Also allow known param-family matches as a safety net in case the
-    # registry lazy-discover path failed and `is_known_runtime_type` falsed.
-    if unregistered and canonical_meta.family_type in SUPPORTED_PARAM_FAMILIES:
-        unregistered = False
     return StrategyExecutionCertification(
         strategy_type=normalized_type,
         family_type=canonical_meta.family_type,

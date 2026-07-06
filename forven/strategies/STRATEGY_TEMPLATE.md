@@ -132,6 +132,14 @@ from forven.strategies.base import BaseStrategy, Signal
 
 Do NOT import from other strategy files. Keep each strategy self-contained.
 
+`forven.strategies.base` is the ONLY import path for `BaseStrategy` and `Signal` —
+there is no `forven.strategies.signal` module, and guessing one costs a rejected
+registration (AST allowlist). `Signal` is a **dataclass, not an enum**: there is no
+`Signal.NEUTRAL` / `Signal.BUY` / `Signal.SELL`. Its fields are
+`entry_signal: bool`, `exit_signal: bool`, `price: float`,
+`direction: "long" | "short"`, `confidence: float`, `indicators: dict`.
+"No trade" is simply `Signal(entry_signal=False)`.
+
 ### BANNED IMPORTS — do not use under any circumstances
 
 The following libraries are **forbidden** in strategy files. Ruff enforces this
@@ -401,6 +409,25 @@ STRATEGY_CLASS = RSIMomentum_S00700
 - Keep parameters in `default_params` — the system canonicalizes them during registration
 - Indicator periods should have sensible defaults (RSI: 14, EMA: 20/50/200, BB: 20)
 - You can define any parameters your strategy needs — the system stores them as-is for novel families
+
+### Trading short or both sides (REQUIRED declarations)
+
+The engine defaults every strategy to `long_only`. If your strategy shorts, declare BOTH:
+
+```python
+class MyDualSideStrategy(BaseStrategy):
+    # The subset of sides your signal logic actually implements:
+    supported_trade_modes = {"long_only", "short_only", "both"}
+
+    @property
+    def default_params(self) -> dict:
+        return {"trade_mode": "both", ...}   # the mode this strategy runs by default
+```
+
+An explicit `trade_mode` in YOUR `default_params` is honored even if you forget the
+`supported_trade_modes` attribute — but a `trade_mode` passed only as a backtest request
+override on an undeclared class is rejected with `does not support trade_mode='both'`,
+and every gauntlet test fails with it. Declare both, always.
 
 ### Parameter Naming — Best Practices
 

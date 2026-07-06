@@ -907,19 +907,30 @@ def is_known_strategy_family(strategy_type: str | None) -> bool:
     return False
 
 
-def is_known_runtime_type(strategy_type: str | None) -> bool:
+def is_known_runtime_type(
+    strategy_type: str | None,
+    *,
+    require_runtime_class: bool = False,
+) -> bool:
     """Return True iff `strategy_type` is recognizable to the execution engine.
 
-    A type is recognizable if either:
+    Default mode (orphan detection): a type is recognizable if either
     - it resolves to a known param family (`is_known_strategy_family`), OR
     - a class is registered with this TYPE_NAME in the registry `_TYPE_MAP`.
+    Fail-open on registry errors so a broken-registry scenario doesn't falsely
+    mark everything as orphaned.
 
-    This is the canonical orphan-detection predicate. Callers that want to
-    block execution of unregistered strategies should use this.
+    ``require_runtime_class=True`` (PHANTOM-1, the certification gate): a
+    concrete registry class must back the exact resolved type — family
+    membership alone is a param-vocabulary fact, not proof of implementation
+    ('vwap'/'regime_filtered' have param support but no runtime class, and
+    certifying on them minted phantom strategies like S05847 that occupy
+    pipeline slots and can never trade). Fails CLOSED on registry errors:
+    refusing a create during a registry hiccup beats certifying a phantom.
     """
     if not strategy_type:
         return False
-    if is_known_strategy_family(strategy_type):
+    if not require_runtime_class and is_known_strategy_family(strategy_type):
         return True
     try:
         # Lazy import to avoid circular deps (registry imports params).
@@ -933,6 +944,12 @@ def is_known_runtime_type(strategy_type: str | None) -> bool:
         if resolved and resolved in _TYPE_MAP:
             return True
     except Exception:
+        if require_runtime_class:
+            log.warning(
+                "is_known_runtime_type: registry probe failed for %r — failing "
+                "CLOSED (certification mode)", strategy_type, exc_info=True,
+            )
+            return False
         # Fail-open so broken-registry scenarios don't falsely mark everything
         # as orphaned. The certification gate and orphan scanner both log.
         return True

@@ -1823,6 +1823,31 @@ def transition_stage(
         # un-retireable trap. So: decay-driven retirement (actor='decay_tracker')
         # and explicit operator force may retire it (clearing the flag first);
         # all other automated actors stay blocked and must clear canonical=0 first.
+        # ARCH-1: a terminal strategy must not keep real-money exposure. Open LIVE
+        # positions block the transition outright — even under force — because the
+        # scanner only loads paper/live-stage strategies, so archiving would leave a
+        # real position with its exit management amputated. Flatten via the manual
+        # position controls first. Paper positions do NOT block: they are force-
+        # closed right after the transition commits (post-commit hook below), with
+        # the pipeline-hygiene sweep as the backstop.
+        if normalized_target in _TERMINAL_TASK_STAGES:
+            open_live_rows = conn.execute(
+                "SELECT id FROM trades "
+                "WHERE COALESCE(NULLIF(strategy_id, ''), strategy) = ? AND status = 'OPEN' "
+                "AND LOWER(COALESCE(execution_type, 'live')) NOT IN ('paper', 'paper_challenger', 'simulation')",
+                (strategy_id,),
+            ).fetchall()
+            if open_live_rows:
+                live_ids = ", ".join(str(r["id"]) for r in open_live_rows)
+                return _record_blocked_transition(
+                    block_reason=(
+                        f"Strategy holds {len(open_live_rows)} open LIVE position(s) "
+                        f"({live_ids}) — close them first; a terminal stage would "
+                        "orphan real-money exposure."
+                    ),
+                    motion="terminal_blocked_open_live_position",
+                )
+
         clear_canonical_on_commit = False
         if normalized_target in {"archived", "rejected"}:
             canonical_row = conn.execute(
@@ -2201,6 +2226,42 @@ def transition_stage(
             log.warning("Failed to queue post-mortem task for %s: %s", strategy_id, exc)
 
     log.info("Stage transition %s: %s -> %s", strategy_id, current_stage, normalized_target)
+
+    # ARCH-1: the terminal transition committed — flatten any open PAPER positions
+    # now, so a terminal strategy never keeps a position whose exit management the
+    # scanner just stopped running (open LIVE positions blocked the transition
+    # above). Done AFTER the write transaction closes (the close machinery opens
+    # its own connections and fetches a venue price — both would self-deadlock or
+    # stall the held WAL writer lock). Best-effort: a close skipped on a venue-read
+    # hiccup is retried by the pipeline-hygiene sweep backstop.
+    if normalized_target in _TERMINAL_TASK_STAGES:
+        try:
+            from forven.trade_state import close_open_paper_trades_for_strategy
+
+            closure = close_open_paper_trades_for_strategy(
+                strategy_id,
+                close_reason="terminal_stage_close",
+                note=(
+                    f"Auto-closed: strategy transitioned {current_stage} -> "
+                    f"{normalized_target} ({actor})"
+                ),
+            )
+            if closure.get("closed"):
+                log.info(
+                    "Closed %d open paper position(s) for terminal strategy %s: %s",
+                    len(closure["closed"]), strategy_id, ", ".join(closure["closed"]),
+                )
+            if closure.get("skipped"):
+                log.warning(
+                    "Could not close %d open paper position(s) for terminal strategy %s "
+                    "(hygiene sweep will retry): %s",
+                    len(closure["skipped"]), strategy_id, ", ".join(closure["skipped"]),
+                )
+        except Exception:
+            log.warning(
+                "Terminal paper-position close failed for %s (hygiene sweep will retry)",
+                strategy_id, exc_info=True,
+            )
 
     # Live go-live equity baseline: stamp the REAL Hyperliquid account equity at the
     # moment a strategy graduates to live, so its live "Capital" card reports a true

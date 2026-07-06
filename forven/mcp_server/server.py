@@ -455,6 +455,18 @@ def build_server(client: ForvenClient | None = None) -> FastMCP:
         next_actions: list[str] = []
         if ready:
             next_actions.append("All gates green — call forven_promote_strategy (force=false).")
+            # Passing steps can carry a two-tier caveat (e.g. walk_forward passed
+            # the paper-tier fold criteria while its strict artifact verdict is
+            # FAIL). Failed steps are already surfaced; without this, the caveat
+            # on a PASSED step is dropped and ready:true reads as a false green
+            # next to the artifact's FAIL verdict.
+            if isinstance(readiness, dict):
+                for step in readiness.get("steps") or []:
+                    if not isinstance(step, dict):
+                        continue
+                    detail = str(step.get("detail") or "")
+                    if str(step.get("status")).lower() == "passed" and "strict artifact verdict" in detail:
+                        next_actions.append(f"Note: {detail}")
         for gate in failed_gates:
             action = gate.get("actionable")
             if action in ("run_validation_suite", "re_run_validation_suite"):

@@ -810,8 +810,18 @@ def validate_backtest_risk_controls(
 
                 controls[key] = value
 
-
-
+    # RISK-PARITY-1: a field carried in the nested execution_profile IS enforced
+    # (backtest, paper, and live all read the profile channel), so its top-level
+    # twin is covered, not inert — flagging it was a false block (the lab pool and
+    # manual backtests refused strategies whose control was genuinely honored).
+    profile = controls.get("execution_profile")
+    profile_covered: set[str] = set()
+    if isinstance(profile, dict):
+        profile_covered = {
+            field
+            for field in HONORED_EXECUTION_CONTROL_FIELDS
+            if _is_backtest_risk_control_enabled(profile.get(field))
+        }
 
 
     enabled_fields = [
@@ -823,7 +833,8 @@ def validate_backtest_risk_controls(
         for field_name in _UNSUPPORTED_BACKTEST_RISK_FIELDS.values()
 
 
-        if _is_backtest_risk_control_enabled(controls.get(field_name))
+        if field_name not in profile_covered
+        and _is_backtest_risk_control_enabled(controls.get(field_name))
 
 
     ]
@@ -904,6 +915,45 @@ def get_strategy_supported_trade_modes(
     ).strip().lower()
     if side_hint == "short":
         supported.add("short_only")
+
+    # TRADE-MODE-2: an explicit trade_mode in the strategy's OWN declared
+    # default_params is an author declaration of the intended sides — honor it
+    # even when the class omitted the supported_trade_modes attribute. The
+    # strategy template never mentioned that attribute while CRUX-1-style
+    # directives bake trade_mode='both' into default_params, so dual-side
+    # registered classes (bb_rsi_div_oi, rvr_funding_fade, ...) were
+    # structurally unrunnable: every backtest failed with "does not support
+    # trade_mode='both'". Same rationale as the sandbox-only leniency below —
+    # an explicit, validated author declaration wins. Deliberately read from
+    # the CLASS's declared defaults, never the caller's request params, so the
+    # strict guard is unchanged for a caller merely REQUESTING an undeclared
+    # mode on a long-only strategy.
+    declared_defaults = getattr(strategy_obj, "default_params", None) if strategy_obj is not None else None
+    if declared_defaults is None and strategy_type:
+        try:
+            from forven.strategies.registry import _TYPE_MAP, discover
+
+            discover()
+            cls = _TYPE_MAP.get(str(strategy_type).strip())
+            declared_defaults = getattr(cls, "default_params", None) if cls is not None else None
+            if isinstance(declared_defaults, property):
+                # Property-form default_params needs an instance to read.
+                declared_defaults = getattr(cls("__trade_mode_probe__", {}), "default_params", None)
+        except Exception:
+            declared_defaults = None
+    if callable(declared_defaults):
+        try:
+            declared_defaults = declared_defaults()
+        except Exception:
+            declared_defaults = None
+    if isinstance(declared_defaults, dict):
+        declared_mode = _normalize_trade_mode_value(declared_defaults.get("trade_mode"))
+        if declared_mode is not None:
+            supported.add(declared_mode)
+            if declared_mode == "both":
+                # A dual-side author intends each side to be runnable alone too
+                # (the CRUX-1 lane-split path backtests short_only variants).
+                supported.add("short_only")
 
     # Untrusted-origin (sandbox-only / imported) strategies are never imported into the
     # trusted parent, so this process can't read the real class's declared

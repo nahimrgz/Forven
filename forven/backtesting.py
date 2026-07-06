@@ -285,7 +285,22 @@ class BacktestingClient:
         if hypothesis_id:
             payload["hypothesis_id"] = hypothesis_id
         if params is not None:
-            payload["params"] = params
+            # PARAMS-1: params and rule-blobs are no longer mutually exclusive —
+            # the old branch silently DROPPED indicators/entry/exit/filters
+            # whenever a params dict was also supplied, which is how custom
+            # strategies lost their configuration on the way to the API. Blobs
+            # are merged into params (the API persists blobs from inside params)
+            # without clobbering explicit keys.
+            merged = dict(params)
+            for key, value in (
+                ("indicators", indicators),
+                ("entry_conditions", entry_conditions),
+                ("exit_conditions", exit_conditions),
+                ("filters", filters),
+            ):
+                if value and key not in merged:
+                    merged[key] = value
+            payload["params"] = merged
             if notes:
                 payload["notes"] = notes
         else:

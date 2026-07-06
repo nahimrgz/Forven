@@ -1546,6 +1546,69 @@ def _sweep_unloadable_runtimes(now: datetime) -> int:
 _SWEEP_COOLDOWN_KEY = "pipeline:last_hygiene_sweep"
 _SWEEP_COOLDOWN_SECONDS = 300  # Don't sweep more than once per 5 min
 
+_TERMINAL_ORPHAN_STAGES = ("archived", "rejected", "backtest_failed", "trash")
+
+
+def _close_terminal_stage_orphan_positions() -> int:
+    """ARCH-1 backstop: flatten open PAPER positions still attached to a
+    terminal-stage strategy.
+
+    transition_stage force-closes paper positions at archive time; this sweep
+    reaps any that predate that hook or whose close was skipped on a venue-read
+    hiccup (the S03517/E0088 orphan class — position kept marking while the
+    scanner no longer ran its exits). Open LIVE positions on a terminal strategy
+    are never auto-closed here — they are logged loudly for the operator, since
+    a real-money close must be a deliberate action.
+    """
+    placeholders = ", ".join("?" for _ in _TERMINAL_ORPHAN_STAGES)
+    with get_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT COALESCE(NULLIF(t.strategy_id, ''), t.strategy) AS sid,
+                   LOWER(COALESCE(t.execution_type, 'live')) AS exec_type
+            FROM trades t
+            JOIN strategies s ON s.id = COALESCE(NULLIF(t.strategy_id, ''), t.strategy)
+            WHERE t.status = 'OPEN'
+              AND LOWER(TRIM(COALESCE(s.stage, ''))) IN ({placeholders})
+            """,
+            _TERMINAL_ORPHAN_STAGES,
+        ).fetchall()
+    paper_sids: set[str] = set()
+    live_sids: set[str] = set()
+    for row in rows:
+        sid = str(row["sid"] or "").strip()
+        if not sid:
+            continue
+        if str(row["exec_type"]) in ("paper", "paper_challenger"):
+            paper_sids.add(sid)
+        elif str(row["exec_type"]) != "simulation":
+            live_sids.add(sid)
+    if live_sids:
+        log.error(
+            "Terminal-stage strategies hold OPEN LIVE positions — close them manually: %s",
+            ", ".join(sorted(live_sids)),
+        )
+    closed_count = 0
+    if paper_sids:
+        from forven.trade_state import close_open_paper_trades_for_strategy
+
+        for sid in sorted(paper_sids):
+            try:
+                closure = close_open_paper_trades_for_strategy(
+                    sid,
+                    close_reason="terminal_stage_close",
+                    note="Auto-closed by pipeline-hygiene sweep: strategy is in a terminal stage",
+                )
+                closed_count += len(closure.get("closed") or [])
+                if closure.get("closed"):
+                    log.warning(
+                        "Hygiene sweep closed %d orphan paper position(s) on terminal strategy %s",
+                        len(closure["closed"]), sid,
+                    )
+            except Exception:
+                log.warning("Hygiene sweep orphan close failed for %s", sid, exc_info=True)
+    return closed_count
+
 
 def _sweep_pipeline_hygiene() -> dict[str, int]:
     """Archive obviously dead strategies in gauntlet and quick_screen.
@@ -1714,6 +1777,10 @@ def _sweep_pipeline_hygiene() -> dict[str, int]:
         runtime_archived = _sweep_unloadable_runtimes(now)
         if runtime_archived:
             archived["unloadable_runtime"] = runtime_archived
+
+        orphan_closed = _close_terminal_stage_orphan_positions()
+        if orphan_closed:
+            archived["orphan_positions_closed"] = orphan_closed
 
         total = sum(archived.values())
         if total:

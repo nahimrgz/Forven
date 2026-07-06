@@ -428,9 +428,120 @@ def _reconcile_bot_ledger_after_close(trade: dict) -> None:
         log.debug("bot ledger reconcile failed for trade %s", trade.get("id"), exc_info=True)
 
 
+def _fresh_mark_price(asset: str) -> float | None:
+    """Session-free venue mid for a forced paper close. Returns None when no
+    trustworthy price is available (caller should skip and retry later) —
+    closing at a stale or fabricated price would book a fictional PnL."""
+    normalized = str(asset or "").strip().upper()
+    if not normalized:
+        return None
+    try:
+        from forven.market_data import resolve_market_data_source
+
+        if resolve_market_data_source() == "binance":
+            from forven.market_data import fetch_binance_prices
+
+            prices = fetch_binance_prices([normalized])
+        else:
+            from forven.circuit_breaker import hl_price_breaker
+            from forven.exchange.hyperliquid import get_all_mids
+
+            # get_all_mids silently serves a cached mid when the breaker is
+            # open; treat that as unavailable rather than a fresh mark.
+            if not hl_price_breaker.can_execute():
+                return None
+            prices = get_all_mids()
+        price = _coerce_optional_float((prices or {}).get(normalized))
+        return float(price) if price and price > 0 else None
+    except Exception:
+        return None
+
+
+def close_open_paper_trades_for_strategy(
+    strategy_id: str,
+    *,
+    close_reason: str = "terminal_stage_close",
+    note: str | None = None,
+) -> dict:
+    """ARCH-1: flatten a strategy's open PAPER positions at the current mark.
+
+    A strategy in a terminal stage (archived/rejected/…) is no longer loaded by
+    the scanner, so its exit signals and time-stops never run again — an open
+    position it leaves behind is exposure with its management amputated (the
+    S03517/E0088 orphan). Called from brain.transition_stage right after a
+    terminal transition commits, and from the pipeline-hygiene sweep as the
+    backstop for closes that failed (venue read down) or predate the hook.
+
+    PAPER only — live positions must block the transition itself (real-money
+    closes are never fired as a lifecycle side effect). A trade with no fresh
+    venue mark is skipped, left OPEN, and picked up by the next sweep. Returns
+    ``{"closed": [ids], "skipped": [ids]}``.
+    """
+    sid = str(strategy_id or "").strip()
+    result: dict = {"closed": [], "skipped": []}
+    if not sid:
+        return result
+    with get_db_immediate() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades "
+            "WHERE COALESCE(NULLIF(strategy_id, ''), strategy) = ? AND status = 'OPEN' "
+            "AND LOWER(COALESCE(execution_type, 'live')) IN ('paper', 'paper_challenger')",
+            (sid,),
+        ).fetchall()
+    trades = [dict(r) for r in rows]
+    if not trades:
+        return result
+
+    for trade in trades:
+        trade_id = str(trade.get("id") or "").strip()
+        mark = _fresh_mark_price(trade.get("asset"))
+        if mark is None:
+            result["skipped"].append(trade_id)
+            log.warning(
+                "Terminal paper close: no fresh mark for %s (trade %s) — leaving OPEN for the sweep",
+                trade.get("asset"), trade_id,
+            )
+            continue
+        pnl_override, cost_signal_data = None, None
+        try:
+            # Kernel-managed rows book PnL in the kernel's own net cost
+            # convention; other rows fall back to close_trade_record's default.
+            from forven.api_domains.paper_control import _manual_paper_close_pnl_override
+
+            pnl_override, cost_signal_data = _manual_paper_close_pnl_override(trade, mark)
+        except Exception:
+            pnl_override, cost_signal_data = None, None
+        closed = close_trade_record(
+            trade_id,
+            signal_exit_price=mark,
+            exit_price=mark,
+            close_reason=close_reason,
+            close_price_source="terminal_auto_close",
+            closed_at=get_now().isoformat(),
+            extra_signal_data={
+                "source": "lifecycle",
+                "terminal_close_note": note,
+                **(cost_signal_data or {}),
+            },
+            pnl_override=pnl_override,
+        )
+        if closed and closed.get("updated"):
+            result["closed"].append(trade_id)
+            try:
+                from forven.exchange.risk import release
+
+                release(trade_id)
+            except Exception:
+                log.debug("Terminal paper close: release(%s) failed", trade_id, exc_info=True)
+        else:
+            result["skipped"].append(trade_id)
+    return result
+
+
 __all__ = [
     "_coerce_optional_float",
     "_normalize_trade_direction",
+    "close_open_paper_trades_for_strategy",
     "close_trade_record",
     "mark_trade_pending_close_reconcile",
     "parse_trade_signal_data",

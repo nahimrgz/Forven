@@ -674,10 +674,17 @@ def register_custom_strategy_file(
     existing_strategy = _find_existing_strategy_container(
         type_name=type_name,
         source_ref=source_ref,
+        ignore_terminal=True,
     )
     if existing_strategy:
         existing_id = str(existing_strategy.get("id") or "").strip() or "<unknown>"
-        raise ValueError(f"Strategy '{type_name}' is already registered as {existing_id}")
+        existing_stage = str(existing_strategy.get("stage") or "").strip() or "unknown"
+        raise ValueError(
+            f"Strategy '{type_name}' is already registered as {existing_id} "
+            f"(stage={existing_stage}, still active). A rejected/archived sibling "
+            "would not block this — archive the active holder first if you mean "
+            "to replace it."
+        )
 
     try:
         registry._load_custom_strategy_module(modname)
@@ -1049,7 +1056,16 @@ def _find_existing_strategy_container(
     *,
     type_name: str,
     source_ref: str | None = None,
+    ignore_terminal: bool = False,
 ) -> dict[str, object] | None:
+    """Find a strategy container already holding this carrier type name.
+
+    ``ignore_terminal=True`` (NAMESPACE-1, targeted registration): a
+    rejected/archived/trashed holder does NOT consume the name — one failed
+    sibling used to make a novel-composite carrier permanently single-slot
+    (S06020 blocked every microprice_drift_lead retry). The bulk discovery
+    sweep keeps the default (terminal holders count as known — it must not
+    re-mint containers for archived strategies)."""
     from forven.db import get_db
 
     normalized_type = str(type_name or "").strip().lower()
@@ -1072,9 +1088,16 @@ def _find_existing_strategy_container(
             clauses.append("LOWER(TRIM(COALESCE(source_ref, ''))) = ?")
             params.append(source_name)
 
+    terminal_filter = ""
+    if ignore_terminal:
+        terminal_filter = (
+            " AND LOWER(TRIM(COALESCE(stage, ''))) NOT IN "
+            "('rejected', 'archived', 'backtest_failed', 'trash')"
+        )
+
     query = (
         "SELECT id, type, runtime_type, source_ref, stage, created_at "
-        f"FROM strategies WHERE {' OR '.join(clauses)} "
+        f"FROM strategies WHERE ({' OR '.join(clauses)}){terminal_filter} "
         "ORDER BY created_at DESC LIMIT 1"
     )
 

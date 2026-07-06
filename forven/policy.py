@@ -1231,7 +1231,30 @@ def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> t
             f"Missing passing persisted artifact rows for: {', '.join(missing)}. "
             f"Run or rerun these tests until the saved verdicts pass.",
         )
-    return True, f"All required artifact rows passed: {', '.join(sorted(passing))}"
+    # Two-tier transparency: a walk_forward row can pass the PAPER tier (fold
+    # pass-rate over judgeable folds) while its strict artifact verdict is FAIL
+    # (avg IS/OOS Sharpe, degradation — the paper->live bar). Without saying so,
+    # the report reads as a false green next to the artifact's FAIL verdict and
+    # operators either mistrust the gate or promote past evidence they meant to
+    # check (2026-07-06 session: an S06126 lean-pass was misread as the
+    # 2026-07-03 false-green bug).
+    notes: list[str] = []
+    for test_name in sorted(passing):
+        payload = payloads.get(test_name)
+        raw = (
+            str(payload.get("raw_verdict") or "").strip().upper()
+            if isinstance(payload, dict)
+            else ""
+        )
+        if raw == "FAIL":
+            notes.append(
+                f"{test_name} passed paper-tier criteria; its strict artifact verdict is "
+                "FAIL (enforced at the paper->live gate)"
+            )
+    detail = f"All required artifact rows passed: {', '.join(sorted(passing))}"
+    if notes:
+        detail += ". " + "; ".join(notes)
+    return True, detail
 
 
 def check_promotion_readiness(strategy_id: str) -> dict:
@@ -2474,6 +2497,17 @@ def _extract_reason_code(reason_text: str) -> str:
         return "source_divergence_reject"
     if "overfit" in text:
         return "overfit_reject"
+    # WFA fold-DENSITY shortfalls are evidence-insufficiency, not merit: the
+    # window was too small for the strategy's trade cadence to produce >=2
+    # judgeable folds (S06127 2026-07-06: auto-archived on 5 background polls of
+    # one unchanged sparse-fold artifact, then PASSED 0.67 fold-pass-rate once
+    # the window was sized to its cadence). Matched before the generic "s00552"
+    # bucket so these never feed the repeated-failure archive counter. The fold
+    # PASS-RATE reject stays a genuine (counting) s00552_reject.
+    if "walk-forward window insufficient" in text or (
+        "walk-forward has" in text and "requires minimum" in text
+    ):
+        return "wfa_window_insufficient"
     if "s00552" in text:
         return "s00552_reject"
     if "s00152" in text:
@@ -2607,6 +2641,10 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",
+    # WFA produced too few judgeable (>= wfa_min_fold_trades) folds — the window
+    # was undersized for the strategy's trade cadence. Re-runnable, says nothing
+    # about edge quality (S06127 2026-07-06).
+    "wfa_window_insufficient",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -3821,7 +3859,14 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             wfa_pass_rate = 1.0 if wfa_pass_rate else 0.0
         wfa_pass_rate = float(wfa_pass_rate)
         if enforce_wfa and wfa_folds < wfa_thresholds["min_folds"]:
-            return False, f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum {wfa_thresholds['min_folds']}"
+            # Same evidence-density class as the insufficient_fold_evidence block
+            # above (only N-of-min judgeable folds instead of zero): actionable
+            # re-run, not a merit failure — taxonomy maps it to the counter-exempt
+            # wfa_window_insufficient code.
+            return False, (
+                f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum "
+                f"{wfa_thresholds['min_folds']}; re-run WFA on the trade-frequency-aware window"
+            )
         # Single source of truth for the WFA fold-pass-rate floor: the same
         # robustness_thresholds.wfa_fold_pass_rate_min the composite scorer uses
         # (_validation_row_passed), so the money gate and the rank score can't
