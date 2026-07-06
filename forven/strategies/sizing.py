@@ -95,6 +95,42 @@ def kelly_fraction(closed_gross: list[float] | None, lookback: int) -> float:
     return max(0.0, win_rate - (1.0 - win_rate) / payoff)
 
 
+def lift_unambiguous_risk_params(params: dict | None) -> dict:
+    """RISK-PARITY-1: copy unit-unambiguous top-level risk params into the honored
+    ``execution_profile`` channel at MINT time, so a strategy authoring them the
+    natural way gets real engine enforcement instead of silent inertness.
+
+    The engine deliberately never reads risk controls from the top level of params
+    (see extract_execution_profile — units there are inconsistent: a top-level
+    ``stop_loss_pct`` of 0.04 could mean 4% or 0.04%). ``time_stop_bars`` is the
+    exception: integer BARS has exactly one interpretation, so lifting it is safe.
+    Percent-unit fields are never lifted — they stay author-enforced (in
+    generate_signals) or explicitly profiled, and registration warns about them.
+
+    Called only on the CREATE/REGISTER path (create_strategy_container), never at
+    backtest-param resolution — retroactively mutating existing strategies would
+    silently drift their persisted verdicts. The top-level key is kept (strategy
+    code may read it); an explicit profile value is never clobbered. Returns a new
+    dict; the input is not modified.
+    """
+    if not isinstance(params, dict):
+        return {}
+    out = dict(params)
+    raw = out.get("time_stop_bars")
+    try:
+        time_stop = int(raw) if raw is not None and not isinstance(raw, bool) else None
+    except (TypeError, ValueError):
+        time_stop = None
+    if time_stop is None or time_stop <= 0:
+        return out
+    profile_raw = out.get("execution_profile")
+    profile = dict(profile_raw) if isinstance(profile_raw, dict) else {}
+    if profile.get("time_stop_bars") is None:
+        profile["time_stop_bars"] = time_stop
+        out["execution_profile"] = profile
+    return out
+
+
 def extract_execution_profile(params: dict | None) -> dict:
     """Pull a strategy's honored execution profile from its persisted ``params``.
 

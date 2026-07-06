@@ -4858,6 +4858,17 @@ def create_strategy_container(
                 params["trade_mode"] = "both" if "both" in modes else sorted(modes)[0]
         except Exception:
             pass
+    # RISK-PARITY-1: lift unit-unambiguous top-level risk params (time_stop_bars)
+    # into the honored execution_profile channel at mint, so the engine actually
+    # enforces them in backtest/paper/live instead of leaving them silently inert
+    # (S05276 held 95h past its declared 60h ceiling). Mint-time only — never
+    # applied at backtest resolution, so existing strategies' verdicts don't drift.
+    try:
+        from forven.strategies.sizing import lift_unambiguous_risk_params
+
+        params = lift_unambiguous_risk_params(params)
+    except Exception:
+        pass
     normalized_parent = str(parent_strategy_id or "").strip() or None
     if normalized_parent:
         parent_row = conn.execute(

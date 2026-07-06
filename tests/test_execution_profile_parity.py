@@ -35,7 +35,18 @@ def test_risk_above_per_trade_cap_warns(forven_db):
     assert any("per-trade cap" in m for m in msgs)
 
 
-def test_trailing_and_time_stops_have_no_live_equivalent(forven_db):
+def test_trailing_and_time_stops_silent_on_kernel_live_path(forven_db):
+    # The kernel execution path (the default) enforces trailing/time stops live
+    # from the same profile the backtest reads — warning would misinform.
+    assert not any("Trailing stop" in m for m in warn({"sizing_mode": "fraction", "risk_per_trade": 0.005, "trailing_stop_pct": 1.5}))
+    assert not any("Time-stop" in m for m in warn({"sizing_mode": "fraction", "risk_per_trade": 0.005, "time_stop_bars": 10}))
+
+
+def test_trailing_and_time_stops_warn_when_kernel_path_disabled(forven_db, monkeypatch):
+    # Only the LEGACY (non-kernel) live path ignores these controls.
+    import forven.scanner as scanner
+
+    monkeypatch.setattr(scanner, "_live_kernel_execution_enabled", lambda: False)
     assert any("Trailing stop" in m for m in warn({"sizing_mode": "fraction", "risk_per_trade": 0.005, "trailing_stop_pct": 1.5}))
     assert any("Time-stop" in m for m in warn({"sizing_mode": "fraction", "risk_per_trade": 0.005, "time_stop_bars": 10}))
 

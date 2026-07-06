@@ -10540,10 +10540,22 @@ def _execution_profile_parity_warnings(controls: dict | None, leverage: float | 
                 f"Backtest risk/trade (~{effective_risk:.1%}) exceeds the live per-trade cap ({per_trade_cap:.1%}) — "
                 f"live will reject or shrink it, understating drawdown and overstating returns."
             )
-    if controls.get("trailing_stop_pct") is not None:
-        warnings.append("Trailing stop has no live equivalent (the scanner takes its stop from the signal); the live edge may differ.")
-    if controls.get("time_stop_bars") is not None:
-        warnings.append("Time-stop (N-bar exit) has no live equivalent in the scanner; the live edge may differ.")
+    # Trailing stops and time-stops ARE enforced live on the kernel execution
+    # path (the default: execution_kernel reads the same profile the backtest
+    # does). Only the LEGACY non-kernel scanner path ignores them, so warn
+    # conditionally instead of claiming "no live equivalent" (stale pre-kernel
+    # text that told operators an enforced control was unenforced).
+    try:
+        from forven.scanner import _live_kernel_execution_enabled
+
+        _kernel_live = bool(_live_kernel_execution_enabled())
+    except Exception:
+        _kernel_live = True
+    if not _kernel_live:
+        if controls.get("trailing_stop_pct") is not None:
+            warnings.append("Trailing stop is only enforced live on the kernel execution path, which is disabled (live_kernel_execution=off); the live edge may differ.")
+        if controls.get("time_stop_bars") is not None:
+            warnings.append("Time-stop (N-bar exit) is only enforced live on the kernel execution path, which is disabled (live_kernel_execution=off); the live edge may differ.")
     try:
         lev = float(leverage) if leverage is not None else None
     except (TypeError, ValueError):

@@ -810,8 +810,18 @@ def validate_backtest_risk_controls(
 
                 controls[key] = value
 
-
-
+    # RISK-PARITY-1: a field carried in the nested execution_profile IS enforced
+    # (backtest, paper, and live all read the profile channel), so its top-level
+    # twin is covered, not inert — flagging it was a false block (the lab pool and
+    # manual backtests refused strategies whose control was genuinely honored).
+    profile = controls.get("execution_profile")
+    profile_covered: set[str] = set()
+    if isinstance(profile, dict):
+        profile_covered = {
+            field
+            for field in HONORED_EXECUTION_CONTROL_FIELDS
+            if _is_backtest_risk_control_enabled(profile.get(field))
+        }
 
 
     enabled_fields = [
@@ -823,7 +833,8 @@ def validate_backtest_risk_controls(
         for field_name in _UNSUPPORTED_BACKTEST_RISK_FIELDS.values()
 
 
-        if _is_backtest_risk_control_enabled(controls.get(field_name))
+        if field_name not in profile_covered
+        and _is_backtest_risk_control_enabled(controls.get(field_name))
 
 
     ]
