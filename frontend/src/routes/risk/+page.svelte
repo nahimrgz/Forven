@@ -31,12 +31,24 @@
 	$: dailyStartEquity = Number(risk?.daily_start_equity ?? dashboard?.daily_risk?.start_equity ?? 0);
 	$: currentDrawdown = highWaterMark > 0 ? Math.max(0, (highWaterMark - accountValue) / highWaterMark) : 0;
 	$: dailyLoss = dailyStartEquity > 0 ? Math.max(0, (dailyStartEquity - accountValue) / dailyStartEquity) : 0;
-	$: portfolioRisk = Number(portfolio?.total_net_risk ?? 0);
-	// Largest single-trade risk currently committed across open positions in the
-	// selected scope. Backed by the additive `current_per_trade_risk` /
-	// `current_per_trade_risk_paper` fields on get_risk_status (display-only).
-	$: perTradeRisk = Number(
-		(scope === 'paper' ? risk?.current_per_trade_risk_paper : risk?.current_per_trade_risk) ?? 0
+	// Gauges + Risk Limits bars ALWAYS grade the LIVE book against live risk
+	// policy, regardless of scope — paper positions are isolated $10k sandboxes
+	// with no shared budget, so grading their summed risk fractions against the
+	// live 2% budget would fabricate a red alarm (88% / 2%). The paper scope's
+	// exposure story lives in the Correlation Groups panel, informationally.
+	$: portfolioRisk = Number(risk?.portfolio?.total_net_risk ?? 0);
+	// Largest single-trade risk currently committed across open LIVE positions.
+	$: perTradeRisk = Number(risk?.current_per_trade_risk ?? 0);
+	// Largest paper-sandbox risk fraction, shown informationally in paper scope.
+	$: paperPerTradeRisk = Number(risk?.current_per_trade_risk_paper ?? 0);
+	$: paperNetRisk = Number(risk?.portfolio_paper?.total_net_risk ?? 0);
+	// Paper group bars scale relative to the busiest group (no budget exists to
+	// scale against); floor keeps getExposureWidth's ratio finite when empty.
+	$: paperScaleBase = Math.max(
+		0.0001,
+		...Object.values(groups).map(
+			(group) => Number(group.gross_long ?? 0) + Number(group.gross_short ?? 0)
+		)
 	);
 	$: tradingAllowed = dashboard?.trading_allowed ?? true;
 	$: tradingReason = dashboard?.trading_reason || 'OK';
@@ -474,7 +486,10 @@
 		</div>
 
 		<div class="border border-[#222] bg-[#050505] p-4 space-y-3">
-			<h2 class="text-sm font-bold uppercase tracking-wider text-white">Risk Limits</h2>
+			<h2 class="text-sm font-bold uppercase tracking-wider text-white">
+				Risk Limits
+				<span class="ml-2 border border-[#333] px-1.5 py-0.5 text-[9px] font-normal tracking-wider text-[#666]" title="These bars always grade the LIVE book against live risk policy — paper sandboxes have no shared budget to grade">LIVE POLICY</span>
+			</h2>
 			{#each limitBars as bar}
 				<div class="space-y-1">
 					<div class="flex items-center justify-between text-[11px]">
@@ -749,12 +764,19 @@
 			</h2>
 			<span class="text-[11px] text-[#666]">{scopedOpenPositions} open position{scopedOpenPositions === 1 ? '' : 's'}</span>
 		</div>
+		{#if scope === 'paper'}
+			<p class="text-[10px] text-[#555]">
+				Informational — values are risk fractions of each strategy's own $10k sandbox and are
+				never graded against the live budget. Paper net {formatPct(paperNetRisk)} · largest
+				single paper position {formatPct(paperPerTradeRisk)}.
+			</p>
+		{/if}
 		{#if Object.entries(groups).length === 0}
 			<div class="text-xs text-[#666]">No active position groups.</div>
 		{:else}
 			<div class="space-y-3">
 				{#each Object.entries(groups) as [name, group]}
-					{@const budget = Number(limits.portfolio_budget ?? 0.02)}
+					{@const budget = scope === 'paper' ? paperScaleBase : Number(limits.portfolio_budget ?? 0.02)}
 					{@const longValue = Number(group.gross_long ?? 0)}
 					{@const shortValue = Number(group.gross_short ?? 0)}
 					{@const netValue = Number(group.net ?? 0)}
