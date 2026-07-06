@@ -583,6 +583,12 @@ export interface AllocatorOverview {
 		directed_today: number;
 		share_pct: number;
 	};
+	data_quota?: {
+		target_pct: number;
+		develops_today: number;
+		directed_today: number;
+		share_pct: number;
+	};
 	pool: { total: number; by_status: Record<string, number>; with_survivors: number };
 	crucibles: AllocatorCrucible[];
 }

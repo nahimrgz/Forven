@@ -816,8 +816,10 @@ def run_crucible_planner_cycle(*, limit: int = 3) -> dict[str, Any]:
     # CRUX-1: hard DAILY develop budget shared with the promotion loop
     # (in-flight caps bound concurrency, not spend). Read once, track locally.
     from forven.crucible_allocator import (
+        DATA_DIRECTIVE_TEXT,
         SHORT_DIRECTIVE_TEXT,
         develop_budget_remaining,
+        next_data_directive,
         next_trade_mode_directive,
     )
 
@@ -849,6 +851,12 @@ def run_crucible_planner_cycle(*, limit: int = 3) -> dict[str, Any]:
                         input_data["trade_mode_directive"] = directive
                         description = description + SHORT_DIRECTIVE_TEXT
                         directives_stamped += 1
+                    # CRUX-1 orthogonal-data quota: a share of daily develops
+                    # must hypothesize over non-price enrichment columns.
+                    data_directive = next_data_directive()
+                    if data_directive:
+                        input_data["data_directive"] = data_directive
+                        description = description + DATA_DIRECTIVE_TEXT
                 develop_in_flight += 1
         task_id = assign_task(
             action.agent_id,

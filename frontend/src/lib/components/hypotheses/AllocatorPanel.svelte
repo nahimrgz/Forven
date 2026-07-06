@@ -43,10 +43,14 @@
 
 	$: budget = overview?.budget;
 	$: quota = overview?.short_quota;
+	$: dataQuota = overview?.data_quota;
 	$: pool = overview?.pool;
 	$: rows = overview?.crucibles ?? [];
 	$: visibleRows = showAll ? rows : rows.slice(0, COLLAPSED_ROWS);
 	$: quotaOnTrack = quota ? quota.develops_today === 0 || quota.share_pct >= quota.target_pct : true;
+	$: dataQuotaOnTrack = dataQuota
+		? dataQuota.develops_today === 0 || dataQuota.share_pct >= dataQuota.target_pct
+		: true;
 
 	function scoreTone(score: number): string {
 		if (score >= 6) return 'text-emerald-400';
@@ -85,6 +89,11 @@
 			<span class="text-[11px] {quotaOnTrack ? 'text-emerald-400' : 'text-yellow-500'}">
 				short {quota?.share_pct ?? 0}%<span class="text-[#555]">/{quota?.target_pct ?? 0}%</span>
 			</span>
+			{#if dataQuota}
+				<span class="text-[11px] {dataQuotaOnTrack ? 'text-emerald-400' : 'text-yellow-500'}">
+					data {dataQuota.share_pct ?? 0}%<span class="text-[#555]">/{dataQuota.target_pct ?? 0}%</span>
+				</span>
+			{/if}
 			<span class="text-[11px] text-[#666]">
 				{pool?.total ?? 0} active · {pool?.by_status?.['proven'] ?? 0} proven ·
 				<span class={(pool?.with_survivors ?? 0) > 0 ? 'text-emerald-400' : ''}>{pool?.with_survivors ?? 0} with survivors</span>

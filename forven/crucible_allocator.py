@@ -20,9 +20,16 @@ This module is the shared brain for both dispatchers:
 - trade-mode directive: a quota of daily develops carry an explicit
   short/both authoring requirement — the 2026-07-05 graveyard audit found
   shorts net-positive in EVERY regime bucket while generation ran 9:1 long.
+- orthogonal-data directive: a quota of daily develops must drive their
+  primary signal from a non-price enrichment column (funding/basis/OI/
+  positioning/IV) — OHLCV-only indicator space is the graveyard's most-mined
+  field, while these columns carry years of history and near-zero
+  exploration (the funding family was dark-starved by a symbol-path bug
+  until 2026-07-03).
 
 Knobs live in research settings under hypothesis_discipline
-(crucible_daily_develop_budget, crucible_short_mode_quota_pct).
+(crucible_daily_develop_budget, crucible_short_mode_quota_pct,
+crucible_orthogonal_data_quota_pct).
 """
 
 from __future__ import annotations
@@ -51,6 +58,22 @@ SHORT_DIRECTIVE_TEXT = (
     "unless explicitly set). Evidence: the 2026-07-05 graveyard audit found "
     "shorts net-positive in EVERY regime bucket while generation ran 9:1 long "
     "— the short side is the pipeline's most under-explored edge surface."
+)
+
+DATA_DIRECTIVE_TEXT = (
+    "\n\nORTHOGONAL-DATA QUOTA (CRUX-1): drive THIS candidate's PRIMARY entry "
+    "signal from at least one non-price enrichment column — funding_rate, "
+    "basis, open_interest, ls_ratio / long_pct / short_pct, "
+    "taker_buy_sell_ratio, or iv_btc / iv_eth (DATA_SCHEMA.md has availability "
+    "windows and NaN semantics; guard for column presence). Price/volume "
+    "indicators may filter or time the entry, but must not BE the thesis. "
+    "State the economic rationale in the strategy docstring: who is on the "
+    "other side of this edge and why they keep paying. Evidence: OHLCV-only "
+    "indicator space is the graveyard's most-mined field, while these columns "
+    "carry 4-6 years of history and near-zero surviving exploration. "
+    "Liquidation columns (long_liq_usd/short_liq_usd/liq_imbalance) exist but "
+    "capture only started 2026-07-06 — do not build a backtest thesis on them "
+    "yet."
 )
 
 
@@ -202,13 +225,13 @@ def develop_budget_remaining() -> int:
 
 # ── short/both trade-mode directive quota ────────────────────────────────────
 
-def _directive_counts_today() -> tuple[int, int]:
-    """(develops_today, directive_carrying_develops_today)."""
+def _directive_counts_today(key: str = "trade_mode_directive") -> tuple[int, int]:
+    """(develops_today, directive_carrying_develops_today) for one input_data key."""
     try:
         with get_db() as conn:
             row = conn.execute(
-                """SELECT COUNT(*) AS total,
-                          SUM(CASE WHEN json_extract(input_data, '$.trade_mode_directive')
+                f"""SELECT COUNT(*) AS total,
+                          SUM(CASE WHEN json_extract(input_data, '$.{key}')
                                    IS NOT NULL THEN 1 ELSE 0 END) AS directed
                    FROM agent_tasks
                    WHERE type = 'develop_candidate'
@@ -282,6 +305,7 @@ def allocator_overview(limit: int = 40) -> dict[str, Any]:
     budget = develop_daily_budget()
     used = develop_budget_used_today()
     total_today, directed_today = _directive_counts_today()
+    _, data_directed_today = _directive_counts_today("data_directive")
     quota_pct = float(_discipline()["crucible_short_mode_quota_pct"])
     return {
         "budget": {
@@ -294,6 +318,12 @@ def allocator_overview(limit: int = 40) -> dict[str, Any]:
             "develops_today": total_today,
             "directed_today": directed_today,
             "share_pct": round((directed_today / total_today) * 100.0, 1) if total_today else 0.0,
+        },
+        "data_quota": {
+            "target_pct": float(_discipline()["crucible_orthogonal_data_quota_pct"]),
+            "develops_today": total_today,
+            "directed_today": data_directed_today,
+            "share_pct": round((data_directed_today / total_today) * 100.0, 1) if total_today else 0.0,
         },
         "pool": {
             "total": len(crucibles),
@@ -317,3 +347,19 @@ def next_trade_mode_directive() -> str | None:
     if total == 0:
         return "short_or_both"
     return "short_or_both" if (directed / total) * 100.0 < quota_pct else None
+
+
+def next_data_directive() -> str | None:
+    """'orthogonal_data' when today's data-directive share is under quota, else None.
+
+    Callers stamp it into input_data as ``data_directive`` (the counter's
+    source of truth) and append DATA_DIRECTIVE_TEXT to the task description.
+    Independent of the trade-mode quota — one develop can carry both.
+    """
+    quota_pct = float(_discipline()["crucible_orthogonal_data_quota_pct"])
+    if quota_pct <= 0:
+        return None
+    total, directed = _directive_counts_today("data_directive")
+    if total == 0:
+        return "orthogonal_data"
+    return "orthogonal_data" if (directed / total) * 100.0 < quota_pct else None

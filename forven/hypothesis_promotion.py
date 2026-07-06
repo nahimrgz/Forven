@@ -201,12 +201,23 @@ def _dispatch_task(hypothesis: dict[str, Any]) -> int | None:
     # CRUX-1 direction quota: a share of daily develops must explore the
     # short/both side (graveyard audit: shorts net-positive in every regime).
     try:
-        from forven.crucible_allocator import SHORT_DIRECTIVE_TEXT, next_trade_mode_directive
+        from forven.crucible_allocator import (
+            DATA_DIRECTIVE_TEXT,
+            SHORT_DIRECTIVE_TEXT,
+            next_data_directive,
+            next_trade_mode_directive,
+        )
 
         directive = next_trade_mode_directive()
         if directive:
             input_data["trade_mode_directive"] = directive
             description = description + SHORT_DIRECTIVE_TEXT
+        # CRUX-1 orthogonal-data quota: a share of daily develops must
+        # hypothesize over non-price enrichment columns.
+        data_directive = next_data_directive()
+        if data_directive:
+            input_data["data_directive"] = data_directive
+            description = description + DATA_DIRECTIVE_TEXT
     except Exception:
         log.exception("trade-mode directive stamp failed for %s", hypothesis_id)
     try:
