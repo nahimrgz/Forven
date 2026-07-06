@@ -231,6 +231,86 @@ def test_isolated_backtest_matches_in_process(monkeypatch):
     )
 
 
+def _pick_isolatable_mismatch_type(df):
+    """Find a registered CUSTOM strategy that is pure/isolatable (its worker output
+    matches in-process when addressed by its REGISTRY KEY) AND whose registry key
+    differs from its class-declared ``strategy_type``. This is the exact shape that
+    broke isolated execution: the worker resolves by the key it was registered under,
+    but run_strategy_execution sent the class's semantic strategy_type instead."""
+    from forven.strategies import registry
+    from forven.strategies.backtest import _normalize_directional_signal_payload as _norm
+
+    registry.discover()
+    tried = 0
+    for key, cls in sorted(registry._TYPE_MAP.items()):
+        if not isinstance(key, str) or ".custom." not in str(getattr(cls, "__module__", "")):
+            continue
+        try:
+            declared = cls("probe", {}).strategy_type
+        except Exception:  # noqa: BLE001
+            continue
+        if not (isinstance(declared, str) and declared and declared != key):
+            continue
+        try:
+            payload = cls("probe", {}).generate_signals(df)
+        except Exception:  # noqa: BLE001
+            continue
+        if payload is None:
+            continue
+        tried += 1
+        if tried > 40:
+            break
+        try:
+            inproc = _norm(payload, df.index, trade_mode="long_only", default_direction="long")
+            iso = compute_directional_signals_isolated(
+                df, key, dict(cls("probe", {}).params), trade_mode="long_only", default_direction="long"
+            )
+        except Exception:  # noqa: BLE001 — data-dependent strategy errors in the DB-less worker
+            continue
+        if iso is not None and _as_lists(inproc) == _as_lists(iso):
+            return key, cls
+    return None, None
+
+
+def test_isolated_exec_addresses_worker_by_registry_key_not_class_strategy_type(monkeypatch):
+    """Regression: run_strategy_execution sent the class's semantic ``strategy_type`` to
+    the worker instead of the registry key the strategy was registered under. A custom
+    strategy whose key differs from its class strategy_type (e.g. adx_regime_composite,
+    registered as 'adx_regime_composite' but declaring strategy_type='composite') then
+    failed isolated execution with 'unknown strategy type'. Sandbox-only proxies, whose
+    strategy_type IS the namespaced runtime key, must stay unaffected."""
+    import forven.strategies.execution_kernel as ek
+    from forven.strategies import backtest as bt
+
+    monkeypatch.delenv("FORVEN_IN_STRATEGY_WORKER", raising=False)
+    df = _gbm_frame()
+    key, cls = _pick_isolatable_mismatch_type(df)
+    if key is None:
+        pytest.skip("no isolatable custom strategy with a key/class-strategy_type mismatch")
+
+    strat = cls("iso-mismatch", {})
+    assert strat.strategy_type != key  # the mismatch that triggered the bug
+
+    kw = dict(
+        params=strat.params, warmup=50, leverage=2.0, fee_bps=4.5, slippage_bps=2.0,
+        regime_gate=True, trade_mode="long_only", execution_controls=None,
+        initial_capital=10000.0, strategy_type=key,
+    )
+    monkeypatch.delenv("FORVEN_ISOLATED_STRATEGY_EXEC", raising=False)  # OFF → in-process
+    res_off = bt.run_strategy_execution(df, strat, **kw)
+    monkeypatch.setenv("FORVEN_ISOLATED_STRATEGY_EXEC", "1")  # ON → worker must resolve the key
+    res_on = bt.run_strategy_execution(df, strat, **kw)
+
+    assert res_off is not None and res_on is not None, f"[{key}] unexpected None KernelResult"
+    drag = ek.round_trip_drag(4.5, 2.0, 2.0)
+    trades_off = ek.force_close(res_off, df, leverage=2.0, round_trip_drag=drag, trade_mode="long_only")
+    trades_on = ek.force_close(res_on, df, leverage=2.0, round_trip_drag=drag, trade_mode="long_only")
+    assert trades_on == trades_off, (
+        f"[{key}] isolated backtest diverged from in-process: "
+        f"off={len(trades_off)} trades, on={len(trades_on)}"
+    )
+
+
 def test_isolated_validation_matches_in_process(monkeypatch):
     """validate_custom_module_isolated runs import + __init__ (probe) + certification
     + lookahead-scan in the locked-down child and must return the SAME verdict as the

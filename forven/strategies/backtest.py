@@ -7287,7 +7287,18 @@ def run_strategy_execution(
         # in this process). runtime_params (from the params ARG) is used, so a proxy
         # object with no real params attr still ships the right params.
         from forven.sandbox.strategy_worker import compute_directional_signals_isolated
-        _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        # The worker resolves the class by the key it was REGISTERED under (module
+        # TYPE_NAME / archived name / class strategy_type), not by the class's semantic
+        # ``strategy_type`` label — which can differ from its registration key (e.g.
+        # AdxRegimeComposite registers as 'adx_regime_composite' but declares
+        # strategy_type='composite'). Sending the semantic label failed isolated
+        # execution with "unknown strategy type". Prefer the caller-provided runtime
+        # key; only a sandbox-only proxy (whose class is never in this process) carries
+        # the resolvable namespaced runtime type on ``strategy_type`` itself.
+        if getattr(strategy_obj, "sandbox_only", False):
+            _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        else:
+            _iso_type = strategy_type or getattr(strategy_obj, "strategy_type", None)
         vectorized = compute_directional_signals_isolated(
             df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
             trade_mode=trade_mode, default_direction=default_direction,
