@@ -1619,6 +1619,19 @@ def _estimate_limit_window_start(limit: int, timeframe: str) -> int:
     return max(0, now_ms - int(bars * tf_ms * 1.2))
 
 
+# Venues whose public OHLC endpoint only ever serves the most-recent N candles.
+# Kraken returns at most ~720 of the LATEST bars regardless of `since`, and — the
+# part that actually crashes downloads — rejects any `since` older than that
+# window outright with {"error":["EGeneral:Invalid arguments"]}. Every other
+# venue pages backward from since=0, so this map is deliberately sparse: absence
+# means "no cap, normal deep-history paging".
+_VENUE_OHLCV_MAX_BARS: dict[str, int] = {"kraken": 720}
+
+
+def _venue_ohlcv_max_bars(exchange_id: str) -> int | None:
+    return _VENUE_OHLCV_MAX_BARS.get(str(exchange_id or "").strip().lower())
+
+
 _ingestion_runs = {}
 _ingestion_runs_lock = threading.Lock()
 
@@ -1739,6 +1752,36 @@ def fetch_ohlcv_chunked(
 
     end_ms_to_use = until_ms if until_ms is not None else (now_ms + tf_ms)
 
+    # Kraken-class venues can only serve the most-recent N candles and error on
+    # an out-of-window `since` (that's the EGeneral:Invalid arguments the user
+    # sees on an "all available" download). When the request reaches past that
+    # window, rewrite it to the single recent window the venue CAN return and
+    # remember we clamped, so the caller is told the span is capped instead of
+    # silently believing it got full history.
+    capped_note: str | None = None
+    venue_cap = _venue_ohlcv_max_bars(exchange_id)
+    if venue_cap is not None:
+        reachable_start = now_ms - venue_cap * tf_ms
+        wanted_start: int | None = None
+        if all_available:
+            wanted_start = 0
+        elif since_ms is not None:
+            wanted_start = int(since_ms)
+        elif limit is not None and int(limit) > venue_cap:
+            wanted_start = _estimate_limit_window_start(int(limit), timeframe)
+        if wanted_start is not None and wanted_start < reachable_start:
+            capped_note = (
+                f"{exchange_id} serves only the most recent ~{venue_cap} {timeframe} "
+                f"candles; older history is unavailable from this venue. Use Binance, "
+                f"OKX or Bybit for a full backfill."
+            )
+            # Collapse to the recent window Kraken accepts: since=None makes it
+            # return its latest bars, and routing through the limit branch (not
+            # the since/append fast-path) merges them into the lake correctly.
+            all_available = False
+            since_ms = None
+            limit = venue_cap
+
     try:
         if all_available:
             if snapshot is not None and not snapshot.empty:
@@ -1817,6 +1860,9 @@ def fetch_ohlcv_chunked(
     base = _build_dataset_record(fs_symbol, timeframe, exchange_id, merged)
     base["bars_fetched"] = int(len(fetched))
     base["bars_new"] = int(max(0, len(merged) - (len(current) if current is not None else 0)))
+    if capped_note is not None:
+        base["capped"] = True
+        base["warning"] = capped_note
     return base
 
 # Ingestion runs survive a backend restart via a compact KV snapshot: runs
@@ -1958,6 +2004,12 @@ def submit_ingestion(
                 _ingestion_runs[run_id]["status"] = "completed"
                 _ingestion_runs[run_id]["bars_fetched"] = res.get("bars_fetched", 0)
                 _ingestion_runs[run_id]["bars_new"] = res.get("bars_new", 0)
+                # Carry a venue-cap warning (e.g. Kraken's recent-720 ceiling) so
+                # the background path surfaces it instead of silently reporting a
+                # full-history success. Absent on uncapped fetches.
+                if res.get("warning"):
+                    _ingestion_runs[run_id]["warning"] = res.get("warning")
+                    _ingestion_runs[run_id]["capped"] = bool(res.get("capped"))
                 _ingestion_runs[run_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
                 _persist_ingestion_runs_locked()
         except Exception as e:

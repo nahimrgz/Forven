@@ -955,12 +955,17 @@
 			</div>
 		</div>
 	{:else if $dataFetchState.status === 'success' && $dataFetchState.message}
-		<div class="flex items-start justify-between gap-3 border border-green-800 bg-green-950/30 text-green-200 text-xs px-3 py-2 rounded">
-			<div class="min-w-0 font-mono break-words">{$dataFetchState.message}</div>
+		<div class="flex items-start justify-between gap-3 border {$dataFetchState.warning ? 'border-amber-800 bg-amber-950/30 text-amber-200' : 'border-green-800 bg-green-950/30 text-green-200'} text-xs px-3 py-2 rounded">
+			<div class="min-w-0">
+				<div class="font-mono break-words">{$dataFetchState.message}</div>
+				{#if $dataFetchState.warning}
+					<div class="mt-1 break-words text-amber-300">⚠ {$dataFetchState.warning}</div>
+				{/if}
+			</div>
 			<button
 				type="button"
 				on:click={clearDataFetchTask}
-				class="shrink-0 text-green-400 hover:text-white transition-colors"
+				class="shrink-0 {$dataFetchState.warning ? 'text-amber-400' : 'text-green-400'} hover:text-white transition-colors"
 				aria-label="Dismiss download status"
 			>
 				Dismiss

@@ -110,6 +110,91 @@ class TestPerpResolution:
 
 
 # ---------------------------------------------------------------------------
+# Venue OHLC ceiling (Kraken) — an "all available" / deep-history request must
+# not send an out-of-window `since` (Kraken 400s it with EGeneral:Invalid
+# arguments); it is clamped to the recent window and flagged capped instead.
+# ---------------------------------------------------------------------------
+
+
+class TestVenueOhlcvCap:
+    @pytest.fixture(autouse=True)
+    def _reset_breakers(self):
+        with data_mod._candle_breakers_lock:
+            data_mod._candle_breakers.clear()
+        yield
+        with data_mod._candle_breakers_lock:
+            data_mod._candle_breakers.clear()
+
+    def _wire(self, monkeypatch, seen: dict):
+        # Kraken returns its recent window; capture the `since` / `start_ms`
+        # each fetch path was actually handed so we can assert it was never 0.
+        recent = _bars(_closed_start(30), 10)
+
+        def _once(exchange, symbol, timeframe, since, limit):
+            seen["once_since"] = since
+            return [
+                [data_mod._to_ms(ts), r.open, r.high, r.low, r.close, r.volume]
+                for ts, r in zip(recent["timestamp"], recent.itertuples(index=False))
+            ]
+
+        def _range(exchange, sym, tf, start_ms, end_ms, *a, **k):
+            seen["range_start"] = start_ms
+            return data_mod._normalize_ohlcv_frame(recent)
+
+        monkeypatch.setattr(data_mod, "_fetch_ohlcv_once", _once)
+        monkeypatch.setattr(data_mod, "_fetch_range", _range)
+        monkeypatch.setattr(data_mod, "get_exchange", lambda ex: object())
+        monkeypatch.setattr(data_mod, "_cached_markets", lambda ex: {})
+
+    def test_all_available_kraken_clamps_and_warns(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", all_available=True)
+
+        # Never sent the since=0 that Kraken rejects.
+        assert seen.get("once_since") is None
+        assert seen.get("range_start") is None  # deep-history range path not taken
+        assert rec["capped"] is True
+        assert "kraken" in rec["warning"].lower()
+        assert "720" in rec["warning"]
+
+    def test_far_past_since_kraken_clamps_and_warns(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+
+        old = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=old)
+
+        assert seen.get("once_since") is None  # collapsed to recent-window fetch
+        assert rec["capped"] is True
+        assert rec.get("warning")
+
+    def test_in_window_since_kraken_not_clamped(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+
+        recent_since = int(datetime.now(timezone.utc).timestamp() * 1000) - 50 * 3600 * 1000
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", since_ms=recent_since)
+
+        # A satisfiable request is honoured as-is, no cap flag.
+        assert seen.get("range_start") == recent_since
+        assert not rec.get("capped")
+        assert not rec.get("warning")
+
+    def test_binance_all_available_unaffected(self, lake, monkeypatch):
+        seen: dict = {}
+        self._wire(monkeypatch, seen)
+
+        rec = data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="binance", all_available=True)
+
+        # Deep-history paging from 0 is preserved for uncapped venues.
+        assert seen.get("range_start") == 0
+        assert not rec.get("capped")
+        assert not rec.get("warning")
+
+
+# ---------------------------------------------------------------------------
 # Phase 3: candle-path circuit breaker
 # ---------------------------------------------------------------------------
 
