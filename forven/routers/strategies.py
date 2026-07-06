@@ -724,6 +724,17 @@ def get_backtesting_prompt_packs():
 
     return core.get_backtesting_prompt_packs()
 
+@router.get("/api/backtesting/results/{result_id}")
+def get_backtesting_result(result_id: str, remote_skip: bool = False):
+    """Backtesting-namespaced alias of GET /api/results/{result_id}.
+
+    The BacktestingClient (forven_get_results agent tool) addresses every endpoint
+    under /api/backtesting/*; the results endpoint only existed at /api/results/*,
+    so forven_get_results 404'd for valid, locally-persisted result IDs. Delegate to
+    the same core handler so both the UI route and the agent-client route resolve.
+    """
+    return core.get_backtest_result(result_id, remote_skip=remote_skip)
+
 @router.post("/api/backtesting/run")
 async def post_backtesting_run(request: core.Request):
     body = await request.json()
