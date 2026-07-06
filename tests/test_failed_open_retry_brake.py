@@ -12,8 +12,6 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-import pytest
-
 from forven.db import get_db, kv_set
 from forven.exchange import risk
 from forven.sim.clock import get_now
