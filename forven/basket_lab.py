@@ -78,6 +78,35 @@ def deep_universe_symbols(min_bars: int = 17520, timeframe: str = "1h") -> list[
     return out
 
 
+DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+
+
+def _funding_interval_hours(symbol: str) -> float:
+    """Observed settlement interval of a symbol's stored funding history.
+
+    Binance's fundingRate is the PER-SETTLEMENT rate (8h for most perps, 4h
+    for some) stamped on the settlement grid; the enrichment forward-fills it
+    onto hourly bars unchanged. The panel contract is a PER-HOUR column, so
+    the raw rate must be divided by its interval. Derive the interval from
+    the raw history's median row spacing; fail conservative to 8h.
+    """
+    try:
+        from forven.data import symbol_to_fs
+        from forven.data_manager import FUNDING_DIR
+
+        path = FUNDING_DIR / symbol_to_fs(symbol) / "history.parquet"
+        if not path.exists():
+            return DEFAULT_FUNDING_INTERVAL_HOURS
+        ts = pd.to_datetime(pd.read_parquet(path, columns=["timestamp"])["timestamp"], utc=True)
+        gaps = ts.sort_values().diff().dropna()
+        if gaps.empty:
+            return DEFAULT_FUNDING_INTERVAL_HOURS
+        hours = round(float(gaps.median().total_seconds()) / 3600.0)
+        return float(hours) if 1 <= hours <= 24 else DEFAULT_FUNDING_INTERVAL_HOURS
+    except Exception:
+        return DEFAULT_FUNDING_INTERVAL_HOURS
+
+
 def build_panel(
     symbols: list[str],
     timeframe: str = "1h",
@@ -135,7 +164,9 @@ def build_panel(
             continue
         opens[sym] = enriched["open"]
         closes[sym] = enriched["close"]
-        fundings[sym] = enriched["funding_rate"]
+        # Stored Binance funding is the per-SETTLEMENT rate ffilled hourly;
+        # the panel contract (and every accrual downstream) is per-hour.
+        fundings[sym] = enriched["funding_rate"] / _funding_interval_hours(sym)
         for col in extra_columns:
             if col in enriched.columns:
                 extras[col][sym] = enriched[col]

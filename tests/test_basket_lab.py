@@ -96,3 +96,28 @@ def test_nan_prices_are_ineligible():
     result = run_basket(panel, _carry(), fee_bps=0.0, slippage_bps=0.0, min_history_bars=10)
     w = result.weights
     assert w.loc[panel.index[:100], "BBB"].abs().sum() == 0.0
+
+
+# ------------------------------------------------- funding interval normalization
+
+
+def test_funding_interval_hours_from_observed_grid(tmp_path, monkeypatch):
+    # Binance stores the per-SETTLEMENT rate on the settlement grid (8h for
+    # most perps, 4h for some); the panel contract is per-hour. The interval
+    # must come from the observed spacing, defaulting conservative to 8h.
+    import forven.basket_lab as basket_lab
+    import forven.data_manager as data_manager
+
+    monkeypatch.setattr(data_manager, "FUNDING_DIR", tmp_path)
+
+    def _write(sym, freq, n=30):
+        d = tmp_path / sym
+        d.mkdir()
+        idx = pd.date_range("2026-01-01", periods=n, freq=freq, tz="UTC")
+        pd.DataFrame({"timestamp": idx, "funding_rate": [0.0001] * n}).to_parquet(d / "history.parquet")
+
+    _write("AAA-USDT", "8h")
+    _write("BBB-USDT", "4h")
+    assert basket_lab._funding_interval_hours("AAA-USDT") == 8.0
+    assert basket_lab._funding_interval_hours("BBB-USDT") == 4.0
+    assert basket_lab._funding_interval_hours("ZZZ-USDT") == 8.0  # no history -> default
