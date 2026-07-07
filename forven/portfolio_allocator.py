@@ -396,6 +396,7 @@ def compute_portfolio_allocation(settings: dict | None = None) -> dict[str, Any]
         "scaled_annualized_vol": round(scaled_book_vol, 6) if scaled_book_vol else None,
         "correlation_sources": corr_sources,
         "virtual": virtual,
+        "forward": _forward_book(measured),
     }
     return result
 
@@ -469,6 +470,106 @@ def _virtual_book(measured: list[dict], multipliers: dict[str, float], lookback_
     }
 
 
+# ------------------------------------------------------- walk-forward book
+
+
+WEIGHTS_HISTORY_KV_KEY = "forven:portfolio:allocation:weights_history"
+MAX_WEIGHT_HISTORY = 2000
+
+
+def _append_weights_history(computed_at: str, multipliers: dict[str, float]) -> None:
+    """Record the multipliers each refresh actually published (bounded log).
+
+    This is what makes the forward book honest: each day's return is weighted
+    by the multipliers that were PUBLISHED BEFORE that day began — genuine
+    walk-forward, unlike the retrospective virtual book above."""
+    try:
+        history = kv_get(WEIGHTS_HISTORY_KV_KEY, None)
+        if not isinstance(history, list):
+            history = []
+        history.append({
+            "t": computed_at,
+            "multipliers": {k: round(float(v), 4) for k, v in multipliers.items()},
+        })
+        if len(history) > MAX_WEIGHT_HISTORY:
+            history = history[-MAX_WEIGHT_HISTORY:]
+        kv_set_best_effort(WEIGHTS_HISTORY_KV_KEY, history)
+    except Exception:
+        log.warning("weights history append failed", exc_info=True)
+
+
+def _forward_book(measured: list[dict]) -> dict[str, Any]:
+    """Walk-forward combined-book stats: each day's realized parity returns
+    weighted by the multipliers PUBLISHED before that day (out-of-sample by
+    construction). Empty until at least one full day has elapsed since the
+    first published snapshot."""
+    try:
+        history = kv_get(WEIGHTS_HISTORY_KV_KEY, None)
+    except Exception:
+        history = None
+    if not isinstance(history, list) or not history or not measured:
+        return {}
+
+    # As-of lookup: entries sorted by time; a day D uses the last entry whose
+    # timestamp is strictly before D's start.
+    entries = sorted(
+        (e for e in history if isinstance(e, dict) and e.get("t")),
+        key=lambda e: str(e["t"]),
+    )
+    if not entries:
+        return {}
+    first_day_covered = str(entries[0]["t"])[:10]
+
+    all_days = sorted({d for m in measured for d in m["daily"]})
+    daily_returns: list[tuple[str, float]] = []
+    n = len(measured)
+    for day in all_days:
+        if day <= first_day_covered:
+            continue  # no published weights existed before this day began
+        as_of = None
+        for entry in entries:
+            if str(entry["t"])[:10] < day:
+                as_of = entry
+            else:
+                break
+        if as_of is None:
+            continue
+        mults = as_of.get("multipliers") or {}
+        r = sum(
+            m["daily"].get(day, 0.0) * float(mults.get(m["strategy_id"], 1.0)) / n
+            for m in measured
+        )
+        daily_returns.append((day, r))
+
+    if not daily_returns:
+        return {"note": "accumulating — needs a full day after the first published weights"}
+
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    curve = []
+    for day, r in daily_returns:
+        equity *= (1.0 + r)
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = max(max_dd, 1.0 - equity / peak)
+        curve.append({"t": day, "equity": round(equity, 8)})
+    values = [r for _, r in daily_returns]
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / max(len(values) - 1, 1)
+    std = math.sqrt(max(var, 0.0))
+    sharpe = (mean / std * math.sqrt(ANNUALIZATION_DAYS)) if std > 0 else None
+    return {
+        "total_return": round(equity - 1.0, 6),
+        "max_drawdown": round(max_dd, 6),
+        "sharpe": round(sharpe, 4) if sharpe is not None else None,
+        "active_days": len(daily_returns),
+        "since": daily_returns[0][0],
+        "curve": curve[-400:],
+        "note": "walk-forward: each day weighted by the multipliers published before it — out-of-sample",
+    }
+
+
 # -------------------------------------------------------------- persistence
 
 
@@ -485,6 +586,15 @@ def refresh_portfolio_allocation(force: bool = False) -> dict[str, Any] | None:
     try:
         snapshot = compute_portfolio_allocation(settings)
         kv_set_best_effort(ALLOCATION_KV_KEY, snapshot)
+        # Log the published multipliers so the forward book can weight future
+        # days by them (walk-forward evidence).
+        published = {
+            sid: entry["risk_multiplier"]
+            for sid, entry in (snapshot.get("strategies") or {}).items()
+            if entry.get("measured")
+        }
+        if published:
+            _append_weights_history(snapshot["computed_at"], published)
         log.info(
             "Portfolio allocation refreshed: %d strategies (%d measured), book vol %s",
             snapshot.get("cohort_size", 0),

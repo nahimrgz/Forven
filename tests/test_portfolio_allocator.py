@@ -339,3 +339,53 @@ def test_master_gate_controls_job_seeding(forven_db):
     kv_set("forven:settings", {"portfolio_layer_enabled": True})
     assert "forven-portfolio-allocation" in sched._default_job_ids()
     assert "forven-basket-funding-carry" in sched._default_job_ids()
+
+
+# --------------------------------------------------------- walk-forward book
+
+
+def test_forward_book_uses_as_of_weights(forven_db):
+    from datetime import timedelta as _td
+
+    from forven.db import kv_set as _kv_set
+    from forven.portfolio_allocator import (
+        WEIGHTS_HISTORY_KV_KEY,
+        compute_portfolio_allocation,
+    )
+    from forven.sim.clock import get_now as _now
+
+    _insert_strategy("S-A", symbol="ETH/USDT")
+    _seed_history("S-A", days=20, pnl=0.01)
+    # Weights were published 10 days ago: days after that are out-of-sample.
+    published_at = (_now() - _td(days=10)).isoformat()
+    _kv_set(WEIGHTS_HISTORY_KV_KEY, [{"t": published_at, "multipliers": {"S-A": 2.0}}])
+
+    snap = compute_portfolio_allocation({})
+    forward = snap["book"]["forward"]
+    assert forward.get("active_days", 0) > 0
+    # Only days AFTER the publish date count.
+    assert forward["since"] > published_at[:10]
+    assert "out-of-sample" in forward["note"]
+    assert forward["curve"]
+
+
+def test_forward_book_empty_without_history(forven_db):
+    from forven.portfolio_allocator import compute_portfolio_allocation
+
+    _insert_strategy("S-A", symbol="ETH/USDT")
+    _seed_history("S-A", days=20, pnl=0.01)
+    snap = compute_portfolio_allocation({})
+    assert snap["book"]["forward"] == {}
+
+
+def test_refresh_appends_weight_history(forven_db):
+    from forven.db import kv_get as _kv_get
+    from forven.portfolio_allocator import WEIGHTS_HISTORY_KV_KEY
+
+    _enable()
+    _insert_strategy("S-A", symbol="ETH/USDT")
+    _seed_history("S-A", days=20, pnl=0.01)
+    refresh_portfolio_allocation()
+    history = _kv_get(WEIGHTS_HISTORY_KV_KEY, None)
+    assert isinstance(history, list) and len(history) == 1
+    assert "S-A" in history[0]["multipliers"]

@@ -38,6 +38,15 @@ export interface PortfolioAllocationSnapshot {
 			flat_baseline?: PortfolioVirtualBookStats;
 			note?: string;
 		};
+		forward?: {
+			total_return?: number;
+			max_drawdown?: number;
+			sharpe?: number | null;
+			active_days?: number;
+			since?: string;
+			curve?: Array<{ t: string; equity: number }>;
+			note?: string;
+		};
 	};
 }
 

@@ -147,6 +147,10 @@
 	);
 	$: measuredCount = snapshot?.book?.measured_strategies ?? 0;
 	$: virtualBook = snapshot?.book?.virtual ?? null;
+	$: forwardBook = snapshot?.book?.forward ?? null;
+	$: forwardCurve = ((forwardBook?.curve ?? []) as Array<{ t: string; equity: number }>).map(
+		(pnt): EquityPoint => ({ timestamp: pnt.t, equity: pnt.equity })
+	);
 
 	const fmtPct = (v: number | null | undefined, digits = 2) =>
 		v === null || v === undefined || Number.isNaN(v) ? '—' : `${(v * 100).toFixed(digits)}%`;
@@ -596,6 +600,36 @@
 						closes before they earn a measured multiplier. Everything sizes at the neutral 1.0
 						until then.
 					</div>
+				{/if}
+
+				{#if forwardBook && (forwardBook.active_days ?? 0) > 0}
+					<div class="space-y-1">
+						<div class="text-[10px] uppercase tracking-wider text-emerald-600">
+							Walk-forward book — the honest track record
+							<span class="normal-case text-[#557]">(each day weighted by multipliers published BEFORE it — out-of-sample since {forwardBook.since})</span>
+						</div>
+						<div class="grid grid-cols-3 gap-2 text-[11px] text-center">
+							<div class="border border-[#1c2b1c] bg-[#050805] p-2">
+								<div class="text-[#666]">Return</div>
+								<div class={(forwardBook.total_return ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+									{fmtUsd(forwardBook.total_return)} <span class="text-[#666]">({fmtPct(forwardBook.total_return)})</span>
+								</div>
+							</div>
+							<div class="border border-[#1c2b1c] bg-[#050805] p-2">
+								<div class="text-[#666]">Sharpe</div>
+								<div class="text-[#aaa]">{fmtNum(forwardBook.sharpe)}</div>
+							</div>
+							<div class="border border-[#1c2b1c] bg-[#050805] p-2">
+								<div class="text-[#666]">Max drawdown</div>
+								<div class="text-red-300">{fmtPct(forwardBook.max_drawdown)}</div>
+							</div>
+						</div>
+						{#if forwardCurve.length > 2}
+							<EquityChart data={forwardCurve} height={160} showDrawdown={false} />
+						{/if}
+					</div>
+				{:else if forwardBook?.note}
+					<div class="text-[11px] text-[#556]">{forwardBook.note}</div>
 				{/if}
 
 				{#if virtualBook?.weighted}
