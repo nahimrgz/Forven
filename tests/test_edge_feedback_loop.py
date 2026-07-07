@@ -311,19 +311,20 @@ def _insert_rejection_with_metrics(
 def test_query_near_miss_rejections_flat_and_nested_shapes(forven_db):
     from forven.db import query_near_miss_rejections
 
-    # Nested OOS leg clears the bar.
+    # Nested OOS leg clears the bar — died on a STRUCTURAL gate (min-trades
+    # floor / capital), so its IS leg already cleared the overfit gate upstream.
     _insert_rejection_with_metrics(
-        "S0201", "quick_screen", "overfit_reject", "keltner",
+        "S0201", "quick_screen", "gate_reject", "keltner",
         {"out_of_sample": {"sharpe": 2.8, "profit_factor": 2.96, "total_trades": 19, "max_drawdown_pct": 0.02}},
     )
-    # Flat shape clears the bar too.
+    # Flat shape clears the bar too — died on the robustness catch-22.
     _insert_rejection_with_metrics(
-        "S0202", "quick_screen", "overfit_reject", "rsi",
+        "S0202", "quick_screen", "s00552_reject", "rsi",
         {"sharpe": 1.5, "profit_factor": 1.4, "total_trades": 20, "max_drawdown_pct": 0.1},
     )
     # Genuinely weak — must be excluded.
     _insert_rejection_with_metrics(
-        "S0203", "quick_screen", "overfit_reject", "keltner",
+        "S0203", "quick_screen", "gate_reject", "keltner",
         {"sharpe": -1.6, "profit_factor": 0.45, "total_trades": 15, "max_drawdown_pct": 0.07},
     )
 
@@ -334,6 +335,34 @@ def test_query_near_miss_rejections_flat_and_nested_shapes(forven_db):
     assert "S0203" not in ids
 
 
+def test_query_near_miss_excludes_performance_rejections(forven_db):
+    """S00201 post-mortem: the flat metrics_snapshot stores the flattering OOS
+    leg (Sharpe 2.8) while the strategy was overfit-rejected on a NEGATIVE IS leg
+    (Sharpe -0.64, 19 trades). Surfacing it told the generator to 'explore near'
+    an overfit small-sample fluke. A performance-verdict rejection (overfit /
+    divergence / sharpe / PF) is the OPPOSITE of a near-miss and must NOT appear,
+    even when the OOS snapshot clears the bar. A STRUCTURAL death with identical
+    metrics is a real near-miss (its IS leg already cleared the overfit gate,
+    which runs first) and MUST appear."""
+    from forven.db import query_near_miss_rejections
+
+    good_oos = {"sharpe": 2.8, "profit_factor": 2.9, "total_trades": 19, "max_drawdown_pct": 0.02}
+    # The S00201 shape — deceptive OOS number, killed on the overfit gate.
+    _insert_rejection_with_metrics("S_OVERFIT", "quick_screen", "overfit_reject", "keltner", dict(good_oos))
+    # Same overfitting family under a different code.
+    _insert_rejection_with_metrics("S_DIVERGE", "quick_screen", "source_divergence_reject", "rsi", dict(good_oos))
+    # A metric-threshold verdict is also not a structural near-miss.
+    _insert_rejection_with_metrics("S_SHARPE", "quick_screen", "sharpe_reject", "rsi", dict(good_oos))
+    # A genuine structural death with the same metrics IS a near-miss.
+    _insert_rejection_with_metrics("S_STRUCT", "quick_screen", "gate_reject", "keltner", dict(good_oos))
+
+    ids = {row["strategy_id"] for row in query_near_miss_rejections(days=90, limit=20)}
+    assert "S_OVERFIT" not in ids
+    assert "S_DIVERGE" not in ids
+    assert "S_SHARPE" not in ids
+    assert "S_STRUCT" in ids
+
+
 def test_query_near_miss_rejections_survives_malformed_json_row(forven_db):
     """One malformed metrics_snapshot row must only lose ITSELF, never zero the
     whole digest: json_extract RAISES on invalid JSON (it does not return NULL),
@@ -341,9 +370,9 @@ def test_query_near_miss_rejections_survives_malformed_json_row(forven_db):
     json_valid CASE guard in the query keeps extraction off invalid rows."""
     from forven.db import query_near_miss_rejections
 
-    # A genuine near-miss...
+    # A genuine near-miss (structural death, IS leg already cleared upstream)...
     _insert_rejection_with_metrics(
-        "S0210", "quick_screen", "overfit_reject", "keltner",
+        "S0210", "quick_screen", "gate_reject", "keltner",
         {"sharpe": 2.1, "profit_factor": 2.0, "total_trades": 25, "max_drawdown_pct": 0.05},
     )
     # ...next to a row whose snapshot is NOT valid JSON (bypass json.dumps).
@@ -351,7 +380,7 @@ def test_query_near_miss_rejections_survives_malformed_json_row(forven_db):
         conn.execute(
             "INSERT INTO gate_rejections (strategy_id, gate, reason_code, reason_text, "
             "strategy_type, metrics_snapshot) VALUES (?, ?, ?, ?, ?, ?)",
-            ("S0211", "quick_screen", "overfit_reject", "corrupt row", "rsi", "not valid json{{{"),
+            ("S0211", "quick_screen", "gate_reject", "corrupt row", "rsi", "not valid json{{{"),
         )
 
     rows = query_near_miss_rejections(days=90, limit=6)
@@ -373,7 +402,7 @@ def test_query_near_miss_rejections_fails_soft_without_db(monkeypatch):
 
 def test_render_near_miss_digest_includes_strategy_and_reason(forven_db):
     _insert_rejection_with_metrics(
-        "S0201", "quick_screen", "overfit_reject", "keltner",
+        "S0201", "quick_screen", "gate_reject", "keltner",
         {"out_of_sample": {"sharpe": 2.8, "profit_factor": 2.96, "total_trades": 19, "max_drawdown_pct": 0.02}},
     )
 
@@ -381,12 +410,12 @@ def test_render_near_miss_digest_includes_strategy_and_reason(forven_db):
 
     assert block.startswith("# NEAR-MISS DIGEST")
     assert "S0201" in block
-    assert "overfit_reject" in block
+    assert "gate_reject" in block
 
 
 def test_render_near_miss_digest_excludes_weak_rejections(forven_db):
     _insert_rejection_with_metrics(
-        "S0203", "quick_screen", "overfit_reject", "keltner",
+        "S0203", "quick_screen", "gate_reject", "keltner",
         {"sharpe": -1.6, "profit_factor": 0.45, "total_trades": 15, "max_drawdown_pct": 0.07},
     )
 

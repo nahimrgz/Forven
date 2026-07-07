@@ -417,11 +417,18 @@ def render_near_miss_digest(
     """Render gate-rejected strategies whose metrics cleared the 'Promising' bar.
 
     `render_failure_taxonomy` tells generation "this region is disproven" — but
-    some rejections (overfit_reject on the IS leg, a sample-size floor) fire on
-    strategies whose actual performance looked genuinely good. Without this,
-    those get lumped in with true dead ends and the generator never learns to
-    explore NEAR them instead of away from them. Best-effort: any failure
-    (missing table, malformed JSON) yields "".
+    some rejections fire on strategies that cleared the performance bar and died
+    on a STRUCTURAL/procedural gate (a sample-size floor, the robustness catch-22,
+    a capital gate) we may be too strict on. Without this, those get lumped in
+    with true dead ends and the generator never learns to explore NEAR them
+    instead of away from them.
+
+    NOTE: performance-VERDICT rejections (overfit/divergence/metric-threshold) are
+    deliberately EXCLUDED upstream in query_near_miss_rejections. Their flat
+    metrics_snapshot stores the flattering OOS leg while the reject fired on a
+    negative IS leg (S00201: IS Sharpe -0.64, OOS 2.8) — surfacing them would
+    point the generator AT an overfit fluke, the opposite of the intent.
+    Best-effort: any failure (missing table, malformed JSON) yields "".
     """
     try:
         from forven.db import query_near_miss_rejections

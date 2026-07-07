@@ -3618,6 +3618,23 @@ def query_near_miss_rejections(days: int = 90, limit: int = 6) -> list[dict]:
                   AND eff_sharpe >= 1.0
                   AND eff_profit_factor >= 1.3
                   AND eff_total_trades >= 15
+                  -- A near-miss is a strategy that cleared the performance bar but
+                  -- died on a STRUCTURAL/procedural gate we may be too strict on.
+                  -- Exclude performance-VERDICT rejections: the flat metrics_snapshot
+                  -- stores the flattering OOS leg (see _load_metrics_snapshot_for_rejection),
+                  -- so an overfit/divergence/metric-threshold reject fires on the IS
+                  -- leg (or a gap) while eff_sharpe reads the OOS number. S00201
+                  -- post-mortem: IS Sharpe -0.64, OOS Sharpe 2.8, 19 trades — surfacing
+                  -- it told the generator to 'explore near' an overfit small-sample
+                  -- fluke. The overfit/IS gate runs FIRST at quick_screen, so any
+                  -- strategy that reached a structural gate already cleared IS Sharpe,
+                  -- making a structural-death near-miss trustworthy. (Empirically:
+                  -- 0/235 overfit_reject rows had IS Sharpe > 0.1.)
+                  AND COALESCE(reason_code, '') NOT IN (
+                      'overfit_reject', 'source_divergence_reject', 'sharpe_reject',
+                      'profit_factor_reject', 'win_rate_reject', 'drawdown_reject',
+                      'return_reject'
+                  )
                 ORDER BY datetime(created_at) DESC
                 LIMIT ?
                 """,
