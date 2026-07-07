@@ -391,13 +391,32 @@ def _tool_write_file(path: str, content: str, append: bool = True) -> str:
             "memory/, agents/, narratives/, post_mortems/, lessons/, notes/ "
             "with extension .md/.txt/.json."
         )
+    # Post-write verification via the SAME read path agents use: the tool's
+    # return value is ground truth, not an assumption. Agents spent a week
+    # cross-checking unreliable success/FAILED signals against re-reads
+    # (2026-07-06 reports: appends that "succeeded" but never showed up on
+    # re-read because the divergent-roots resolution hid them).
+    from forven.workspace import read_workspace
+
     if append:
         append_workspace(path, content)
-        return f"Appended to {path}"
+        after = read_workspace(path, optional=True) or ""
+        if content and content.strip() and content.strip() not in after:
+            return (
+                f"Error: append to {path} did not persist "
+                "(post-write verification could not find the content on re-read)"
+            )
+        return f"Appended {len(content)} chars to {path} (file now {len(after)} chars, verified)"
     else:
         from forven.workspace import write_workspace
         write_workspace(path, content)
-        return f"Wrote {path}"
+        after = read_workspace(path, optional=True) or ""
+        if after != content:
+            return (
+                f"Error: write to {path} did not persist "
+                f"(post-write verification read {len(after)} chars, expected {len(content)})"
+            )
+        return f"Wrote {len(content)} chars to {path} (verified)"
 
 @register_tool(
     name="list_local_datasets",
