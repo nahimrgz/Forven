@@ -1990,7 +1990,7 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT result_type, metrics_json, config_json
+            SELECT result_type, metrics_json, config_json, symbol, timeframe
             FROM backtest_results
             WHERE strategy_id = ?
               AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
@@ -2023,6 +2023,26 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
         if is_stale_engine_artifact(config_blob):
             stale_engine_types.add(normalized_type)
             continue
+        # Same rule for DATA semantics: a verdict scored while a stream carried
+        # a different print cadence / value scale describes numbers the current
+        # lake would never produce (the 2026-07-07 funding-interval incident:
+        # +54%/yr "validated" on mid-rewrite files, -14%/yr on the settled
+        # ones). Stale-data rows claim their type and contribute no payload —
+        # the test re-runs through the normal missing-artifact flow. Unstamped
+        # rows are grandfathered (forven/data_provenance.py).
+        try:
+            from forven.data_provenance import is_stale_data_artifact
+
+            if is_stale_data_artifact(
+                config_blob,
+                str(result_row["symbol"] or ""),
+                str(result_row["timeframe"] or "1h"),
+            ):
+                stale_engine_types.add(normalized_type)
+                continue
+        except Exception:
+            # Provenance faults must never block verdict reads.
+            pass
         status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
         if status in {"pending", "queued", "running", "started", "submitted"}:
             continue
@@ -2483,6 +2503,10 @@ def _extract_reason_code(reason_text: str) -> str:
     # specific code wins.
     if "engine version" in text or "stale-engine" in text:
         return "stale_engine_artifacts"
+    # Data-semantics staleness (data_provenance): the stream cadence/scale a
+    # verdict was scored on has changed — awaiting re-validation, not merit.
+    if "data fingerprint" in text or "stale-data" in text or "data semantics" in text:
+        return "stale_data_artifacts"
     if "stale validation tests" in text or "ordering violation" in text:
         return "stale_validation"
     if "zero trades" in text or "produces no signals" in text:
@@ -2638,6 +2662,9 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # Artifacts from a previous BACKTEST_ENGINE_VERSION awaiting automatic
     # re-validation (engine_provenance) — says nothing about edge quality.
     "stale_engine_artifacts",
+    # Artifacts scored on different DATA semantics (data_provenance) awaiting
+    # re-validation — same class as an engine bump, from the data side.
+    "stale_data_artifacts",
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",

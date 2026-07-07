@@ -1784,6 +1784,20 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             flagged = int(result.get("flagged_count") or 0) if isinstance(result, dict) else 0
             return "ok", (f"{flagged} strategy bucket(s) over cost budget" if flagged else None)
 
+        # Live-graduation recommender — daily paper→live candidate scan; queues
+        # operator approvals only (arming stays in the typed GO-LIVE flow) and
+        # no-ops unless live_graduation_recommender_enabled is set
+        if kind == "live_graduation_scan":
+            from forven.live_graduation import run_live_graduation_scan
+            result = await _run_sync_job(run_live_graduation_scan)
+            if not isinstance(result, dict):
+                return "ok", "recommender disabled"
+            queued = len(result.get("queued") or [])
+            return "ok", (
+                f"{queued} graduation recommendation(s) queued" if queued
+                else f"{result.get('eligible', 0)} eligible of {result.get('scanned', 0)} scanned"
+            )
+
         if kind == "recalibrate":
             try:
                 from forven.recalibrator import check_and_recalibrate
@@ -3282,6 +3296,19 @@ def seed_forven_jobs():
             "lookback_days": 30,
             "min_trades": 5,
         },
+    )
+
+    # 5.5c. Live-Graduation Recommender — daily paper→live candidate scan.
+    # Recommendation-only (operator approval + typed GO-LIVE arming stay in
+    # charge); the job no-ops unless live_graduation_recommender_enabled is set.
+    add_job(
+        job_id="forven-live-graduation-scan",
+        name="Live Graduation Recommender",
+        schedule_type="cron",
+        schedule_expr="45 6 * * *",
+        command="live-graduation-scan",
+        timezone_str="UTC",
+        payload={"kind": "live_graduation_scan"},
     )
 
     # 5.6. Adaptive regime recalibration — Every 30 minutes

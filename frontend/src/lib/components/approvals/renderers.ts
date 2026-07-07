@@ -23,6 +23,7 @@ export const APPROVAL_TYPE_TITLES: Record<string, string> = {
 	routine_create: 'New Routine Proposal',
 	crucible_dethrone: 'Crucible Dethrone',
 	regime_champion_promotion: 'Regime Champion Promotion',
+	strategy_live_graduation_recommendation: 'Live Graduation Recommendation',
 };
 
 export function friendlyTitle(approvalType: string | null | undefined): string {

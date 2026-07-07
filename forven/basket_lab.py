@@ -89,6 +89,14 @@ def _funding_interval_hours(symbol: str) -> float:
     onto hourly bars unchanged. The panel contract is a PER-HOUR column, so
     the raw rate must be divided by its interval. Derive the interval from
     the raw history's median row spacing; fail conservative to 8h.
+
+    NOTE: this whole-file median is only the FALLBACK path — a single divisor
+    is silently wrong on files with mixed cadences (2026-07-07 incident: a
+    keepalive backfill flipped the measured cadence mid-day and per-8h rates
+    were accrued hourly, ~8x funding inflation plus a corrupted
+    cross-sectional ranking). build_panel now converts PER PRINT via
+    _per_hour_funding_series and only falls back here when the raw file is
+    unusable.
     """
     try:
         from forven.data import symbol_to_fs
@@ -105,6 +113,51 @@ def _funding_interval_hours(symbol: str) -> float:
         return float(hours) if 1 <= hours <= 24 else DEFAULT_FUNDING_INTERVAL_HOURS
     except Exception:
         return DEFAULT_FUNDING_INTERVAL_HOURS
+
+
+def _per_hour_funding_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series | None:
+    """Per-hour funding aligned to ``index``, converted PER PRINT.
+
+    A print at t is the rate for the interval ENDING at the next print, so
+    each rate is divided by ITS OWN interval (gap to the following print,
+    clamped to [1h, 24h]; the last print uses the file median). This stays
+    correct when a file carries mixed cadences — the failure mode a single
+    whole-file divisor cannot survive.
+    """
+    try:
+        from forven.data import symbol_to_fs
+        from forven.data_manager import FUNDING_DIR
+
+        path = FUNDING_DIR / symbol_to_fs(symbol) / "history.parquet"
+        if not path.exists():
+            return None
+        raw = pd.read_parquet(path)
+        if raw.empty or "timestamp" not in raw.columns or "funding_rate" not in raw.columns:
+            return None
+        frame = pd.DataFrame(
+            {
+                "ts": pd.to_datetime(raw["timestamp"], utc=True, errors="coerce"),
+                "rate": pd.to_numeric(raw["funding_rate"], errors="coerce"),
+            }
+        ).dropna()
+        if frame.empty:
+            return None
+        frame = frame.sort_values("ts").drop_duplicates("ts", keep="last")
+        hours = (frame["ts"].shift(-1) - frame["ts"]).dt.total_seconds() / 3600.0
+        median = float(hours.median()) if hours.notna().any() else DEFAULT_FUNDING_INTERVAL_HOURS
+        if not (1.0 <= median <= 24.0):
+            median = DEFAULT_FUNDING_INTERVAL_HOURS
+        hours = hours.fillna(median).clip(1.0, 24.0)
+        # Keep the tz-aware index (``.values`` would strip UTC and make the
+        # reindex against the tz-aware panel index raise).
+        per_hour = pd.Series(
+            (frame["rate"] / hours).values,
+            index=pd.DatetimeIndex(frame["ts"]).as_unit("ns"),
+        )
+        return per_hour.reindex(pd.DatetimeIndex(index).as_unit("ns"), method="ffill")
+    except Exception:
+        log.debug("per-print funding conversion failed for %s", symbol, exc_info=True)
+        return None
 
 
 def build_panel(
@@ -166,7 +219,12 @@ def build_panel(
         closes[sym] = enriched["close"]
         # Stored Binance funding is the per-SETTLEMENT rate ffilled hourly;
         # the panel contract (and every accrual downstream) is per-hour.
-        fundings[sym] = enriched["funding_rate"] / _funding_interval_hours(sym)
+        # Convert PER PRINT (each rate over its own interval) — a single
+        # whole-file divisor mis-scales every mixed-cadence file (2026-07-07).
+        per_hour = _per_hour_funding_series(sym, enriched.index)
+        if per_hour is None or per_hour.notna().sum() == 0:
+            per_hour = enriched["funding_rate"] / _funding_interval_hours(sym)
+        fundings[sym] = per_hour
         for col in extra_columns:
             if col in enriched.columns:
                 extras[col][sym] = enriched[col]
@@ -193,15 +251,61 @@ def build_panel(
 
 class BasketStrategy:
     """Rank-and-hold basket contract. The engine SHORTS the top-``n_legs``
-    scores and LONGS the bottom-``n_legs``; use only panel data at/before t."""
+    scores and LONGS the bottom-``n_legs``; use only panel data at/before t.
+
+    ``rank_buffer``: incumbency buffer — a held leg keeps its slot while it
+    stays inside the top/bottom (n_legs + rank_buffer) ranks. Cuts the churn
+    where ranks flicker at the margin: the clean-data 2026-07-07 re-validation
+    showed daily full re-ranking pays ~26%/yr in costs against ~10-20%/yr of
+    gross carry. 0 restores the pre-buffer behavior.
+    """
 
     name = "basket"
     rebalance_hours: int = 8
     n_legs: int = 5
     gross_leverage: float = 1.0
+    rank_buffer: int = 3
 
     def score(self, panel: BasketPanel, t: int) -> pd.Series:  # pragma: no cover
         raise NotImplementedError
+
+
+def select_buffered_legs(
+    ranked_symbols: list,
+    n_legs: int,
+    rank_buffer: int,
+    prev_long: set,
+    prev_short: set,
+) -> tuple[list, list]:
+    """Leg selection with an incumbency buffer, shared by the research
+    simulator (run_basket) and the forward paper book (basket_runtime) so the
+    two stay convention-identical.
+
+    ``ranked_symbols`` is ascending by score (lowest first = LONG side).
+    Incumbents keep their slot while inside the top/bottom (n_legs +
+    rank_buffer) zone; open slots fill with the best non-incumbents. The
+    buffer shrinks on small universes so the two zones never overlap.
+    """
+    symbols = list(ranked_symbols)
+    n = len(symbols)
+    legs = min(int(n_legs), n // 2)
+    if legs <= 0:
+        return [], []
+    buffer = max(int(rank_buffer), 0)
+    buffer = min(buffer, max((n - 2 * legs) // 2, 0))
+
+    long_zone = set(symbols[: legs + buffer])
+    short_zone = set(symbols[n - legs - buffer:])
+    keep_long = [s for s in symbols[: legs + buffer] if s in prev_long and s in long_zone][:legs]
+    keep_short = [
+        s for s in reversed(symbols[n - legs - buffer:]) if s in prev_short and s in short_zone
+    ][:legs]
+
+    used = set(keep_long) | set(keep_short)
+    fill_long = [s for s in symbols if s not in used][: legs - len(keep_long)]
+    used |= set(fill_long)
+    fill_short = [s for s in reversed(symbols) if s not in used][: legs - len(keep_short)]
+    return keep_long + fill_long, keep_short + fill_short
 
 
 class FundingCarryBasket(BasketStrategy):
@@ -260,6 +364,8 @@ def run_basket(
     # Sparse rows at fill bars, forward-filled: weights only change at fills.
     w_sparse = pd.DataFrame(np.nan, index=panel.index, columns=symbols)
     rebalances = 0
+    prev_long: set = set()
+    prev_short: set = set()
     for b in range(0, n_bars - 1, rebalance_every):
         scores = strategy.score(panel, b)
         eligible = (
@@ -275,8 +381,16 @@ def run_basket(
         target = pd.Series(0.0, index=symbols)
         if legs > 0:
             ranked = scores.sort_values()
-            target[ranked.index[:legs]] = per_leg  # lowest scores: LONG
-            target[ranked.index[-legs:]] = -per_leg  # highest scores: SHORT
+            long_side, short_side = select_buffered_legs(
+                list(ranked.index),
+                strategy.n_legs,
+                getattr(strategy, "rank_buffer", 0),
+                prev_long,
+                prev_short,
+            )
+            target[long_side] = per_leg  # lowest scores: LONG
+            target[short_side] = -per_leg  # highest scores: SHORT
+            prev_long, prev_short = set(long_side), set(short_side)
             rebalances += 1
         w_sparse.iloc[b + 1] = target
 
@@ -325,6 +439,7 @@ def run_basket(
         "n_legs": strategy.n_legs,
         "rebalance_hours": strategy.rebalance_hours,
         "gross_leverage": strategy.gross_leverage,
+        "rank_buffer": int(getattr(strategy, "rank_buffer", 0)),
     }
     return BasketResult(name=strategy.name, equity=eq, weights=w_matrix, metrics=metrics)
 
