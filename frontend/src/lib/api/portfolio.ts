@@ -48,6 +48,23 @@ export interface PortfolioAllocationResponse {
 	snapshot: PortfolioAllocationSnapshot | null;
 }
 
+export interface BasketLeg {
+	symbol: string;
+	weight: number;
+	funding_rate_hourly: number | null;
+	carry_annualized: number | null;
+}
+
+export interface BasketTick {
+	t: string;
+	equity: number;
+	price_pnl: number;
+	funding_pnl: number;
+	cost: number;
+	rebalanced: boolean;
+	positions: number;
+}
+
 export interface BasketSummary {
 	ok: boolean;
 	exists: boolean;
@@ -55,12 +72,25 @@ export interface BasketSummary {
 	name?: string;
 	created_at?: string;
 	last_tick_at?: string | null;
+	tick_age_hours?: number | null;
 	last_rebalance_at?: string | null;
+	next_rebalance_at?: string | null;
 	rebalances?: number;
 	equity?: number;
 	total_return_pct?: number;
+	expected_carry_annualized?: number | null;
 	pnl_decomposition?: { price: number; funding: number; cost: number };
 	positions?: { count: number; weights: Record<string, number> };
+	legs?: BasketLeg[];
+	universe?: { total: number; eligible: number } | null;
+	config?: {
+		rebalance_hours: number;
+		n_legs: number;
+		gross_leverage: number;
+		fee_bps: number;
+		slippage_bps: number;
+	};
+	recent_ticks?: BasketTick[];
 	equity_curve?: Array<{ t: string; equity: number }>;
 }
 

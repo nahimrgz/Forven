@@ -242,6 +242,31 @@ def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, 
         report["rebalanced"] = True
         report["turnover"] = round(turnover, 6)
 
+    # Operator telemetry, captured AT TICK TIME so the GET/summary path never
+    # touches the lake: per-leg current funding (why each leg is held, and the
+    # basis of the expected-carry readout), universe eligibility (the "why only
+    # N legs" answer), and the config the tick actually ran with.
+    funding_now = _latest_within(
+        panel.funding, now, config.get("funding_stale_hours", DEFAULT_FUNDING_STALE_HOURS)
+    )
+    eligible = 0
+    leg_funding: dict[str, float] = {}
+    if funding_now is not None:
+        eligible = int((funding_now.notna() & closes.notna()).sum())
+        for sym in state["weights"]:
+            try:
+                value = funding_now.get(sym)
+                if value is not None and math.isfinite(float(value)):
+                    leg_funding[sym] = float(value)
+            except (TypeError, ValueError):
+                continue
+    state["universe"] = {"total": int(len(panel.symbols)), "eligible": eligible}
+    state["leg_funding"] = leg_funding
+    state["config_used"] = {
+        key: config.get(key)
+        for key in ("rebalance_hours", "n_legs", "gross_leverage", "fee_bps", "slippage_bps")
+    }
+
     state["last_tick_at"] = now_iso
     state["history"].append({
         "t": now_iso,
@@ -396,9 +421,12 @@ def reset_basket_state() -> bool:
 
 
 def basket_summary() -> dict:
-    """Compact view for the API: headline stats + a decimated equity curve."""
+    """Operator view for the API: headline stats, per-leg carry, universe
+    health, cadence, recent ticks, and a decimated equity curve. Reads only the
+    persisted state — never the lake."""
     state = get_basket_state()
     settings = _load_settings()
+    config = _basket_config(settings)
     if not state:
         return {"exists": False, "enabled": basket_enabled(settings)}
     history = state.get("history") or []
@@ -407,24 +435,85 @@ def basket_summary() -> dict:
         step = len(curve) / 400.0
         curve = [curve[int(i * step)] for i in range(400)] + [curve[-1]]
     equity = float(state.get("equity", 1.0))
+    weights = state.get("weights") or {}
+    leg_funding = state.get("leg_funding") or {}
+
+    now = get_now()
+
+    def _age_hours(iso: str | None) -> float | None:
+        if not iso:
+            return None
+        try:
+            then = datetime.fromisoformat(str(iso))
+        except ValueError:
+            return None
+        return round((now - then).total_seconds() / 3600.0, 2)
+
+    # Per-leg detail: weight, the funding rate it is positioned against, and its
+    # carry contribution. Rates are PER-HOUR (Binance 8h ÷ 8 convention); carry
+    # contribution = −w·rate annualized, so a short on positive funding shows a
+    # positive expected contribution.
+    legs = []
+    expected_carry_annualized = 0.0
+    for symbol, weight in weights.items():
+        rate = leg_funding.get(symbol)
+        contribution = (-float(weight) * float(rate) * 24.0 * 365.0) if rate is not None else None
+        if contribution is not None:
+            expected_carry_annualized += contribution
+        legs.append({
+            "symbol": symbol,
+            "weight": round(float(weight), 6),
+            "funding_rate_hourly": round(float(rate), 10) if rate is not None else None,
+            "carry_annualized": round(contribution, 6) if contribution is not None else None,
+        })
+    legs.sort(key=lambda leg: -leg["weight"])
+
+    # Next rebalance from the CURRENT settings cadence (an operator who changes
+    # the knob sees the new schedule immediately, not the as-of-tick one).
+    next_rebalance_at = None
+    last_rebalance = state.get("last_rebalance_at")
+    if last_rebalance:
+        try:
+            next_rebalance_at = (
+                datetime.fromisoformat(str(last_rebalance))
+                + timedelta(hours=float(config["rebalance_hours"]))
+            ).isoformat()
+        except ValueError:
+            next_rebalance_at = None
+
+    recent = list(reversed(history[-24:]))
+
     return {
         "exists": True,
         "enabled": basket_enabled(settings),
         "name": state.get("name"),
         "created_at": state.get("created_at"),
         "last_tick_at": state.get("last_tick_at"),
-        "last_rebalance_at": state.get("last_rebalance_at"),
+        "tick_age_hours": _age_hours(state.get("last_tick_at")),
+        "last_rebalance_at": last_rebalance,
+        "next_rebalance_at": next_rebalance_at,
         "rebalances": state.get("rebalances", 0),
         "equity": round(equity, 6),
         "total_return_pct": round((equity - 1.0) * 100.0, 4),
+        "expected_carry_annualized": round(expected_carry_annualized, 6) if legs else None,
         "pnl_decomposition": {
             "price": round(float(state.get("cum_price_pnl", 0.0)), 6),
             "funding": round(float(state.get("cum_funding_pnl", 0.0)), 6),
             "cost": round(float(state.get("cum_cost", 0.0)), 6),
         },
         "positions": {
-            "count": len(state.get("weights") or {}),
-            "weights": state.get("weights") or {},
+            "count": len(weights),
+            "weights": weights,
         },
+        "legs": legs,
+        "universe": state.get("universe") or None,
+        "config": {
+            "rebalance_hours": config["rebalance_hours"],
+            "n_legs": config["n_legs"],
+            "gross_leverage": config["gross_leverage"],
+            "fee_bps": config["fee_bps"],
+            "slippage_bps": config["slippage_bps"],
+        },
+        "recent_ticks": recent,
         "equity_curve": curve,
     }

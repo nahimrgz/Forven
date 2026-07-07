@@ -96,9 +96,9 @@
 	}
 
 	// --- basket derivations -------------------------------------------------
-	$: weights = Object.entries(basket?.positions?.weights ?? {});
-	$: longLegs = weights.filter(([, w]) => w > 0).sort((x, y) => y[1] - x[1]);
-	$: shortLegs = weights.filter(([, w]) => w < 0).sort((x, y) => x[1] - y[1]);
+	$: legs = basket?.legs ?? [];
+	$: longLegs = legs.filter((l) => l.weight > 0).sort((a, b) => b.weight - a.weight);
+	$: shortLegs = legs.filter((l) => l.weight < 0).sort((a, b) => a.weight - b.weight);
 	$: equityCurve = (basket?.equity_curve ?? []).map(
 		(p): EquityPoint => ({ timestamp: p.t, equity: p.equity })
 	);
@@ -108,6 +108,27 @@
 			? Math.abs(decomposition.funding) /
 				(Math.abs(decomposition.funding) + Math.abs(decomposition.price))
 			: null;
+	$: tickAge = basket?.tick_age_hours ?? null;
+	// The hourly job missing two beats means the loop is dead — say so loudly.
+	$: tickStale = basket?.enabled && tickAge !== null && tickAge > 2.5;
+	$: universe = basket?.universe ?? null;
+	$: universeThin =
+		universe && basket?.config ? universe.eligible < basket.config.n_legs * 2 : false;
+	$: recentTicks = (basket?.recent_ticks ?? []).slice(0, 12);
+	$: nextRebalanceIn = (() => {
+		const iso = basket?.next_rebalance_at;
+		if (!iso) return null;
+		const ms = new Date(iso).getTime() - Date.now();
+		if (Number.isNaN(ms)) return null;
+		if (ms <= 0) return 'due now';
+		const h = Math.floor(ms / 3_600_000);
+		const m = Math.round((ms % 3_600_000) / 60_000);
+		return h > 0 ? `in ${h}h ${m}m` : `in ${m}m`;
+	})();
+
+	// Funding rates are stored PER-HOUR; annualize for human eyes.
+	const annualizeHourly = (rate: number | null | undefined) =>
+		rate === null || rate === undefined ? null : rate * 24 * 365;
 
 	// --- allocator derivations ----------------------------------------------
 	$: snapshot = allocation?.snapshot ?? null;
@@ -190,7 +211,21 @@
 						basket in Settings, or force a tick below.{/if}
 				</div>
 			{:else}
-				<div class="grid grid-cols-2 md:grid-cols-5 gap-2 text-center">
+				{#if tickStale}
+					<div class="border border-red-900 bg-red-500/5 px-3 py-2 text-[11px] text-red-400">
+						Last tick was {fmtNum(tickAge, 1)}h ago — the hourly job should have fired. Check the
+						scheduler (forven-basket-funding-carry) or force a tick below.
+					</div>
+				{/if}
+				{#if universeThin && universe && basket.config}
+					<div class="border border-yellow-900 bg-yellow-500/5 px-3 py-2 text-[11px] text-yellow-500">
+						Universe thin: only {universe.eligible}/{universe.total} symbols eligible at the last
+						tick — the basket wants {basket.config.n_legs * 2} legs. Stale closes or missing
+						funding series shrink eligibility; the keepalive catches up within a collector cycle.
+					</div>
+				{/if}
+
+				<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 text-center">
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
 						<div class="text-[10px] uppercase tracking-wider text-[#666]">Equity</div>
 						<div class="text-base font-bold text-white">{fmtNum(basket.equity, 5)}</div>
@@ -203,6 +238,17 @@
 							{fmtNum(basket.total_return_pct, 3)}%
 						</div>
 					</div>
+					<div
+						class="border border-[#222] bg-[#0a0a0a] p-2"
+						title="Sum of −weight × current funding across the legs, annualized — what the book earns if rates and prices hold. The reason this basket exists."
+					>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Expected carry /yr</div>
+						<div
+							class={`text-base font-bold ${(basket.expected_carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+						>
+							{fmtPct(basket.expected_carry_annualized, 1)}
+						</div>
+					</div>
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
 						<div class="text-[10px] uppercase tracking-wider text-[#666]">Positions</div>
 						<div class="text-base font-bold text-white">{basket.positions?.count ?? 0}</div>
@@ -212,10 +258,30 @@
 						<div class="text-base font-bold text-white">{basket.rebalances ?? 0}</div>
 					</div>
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Next rebalance</div>
+						<div class="text-[11px] font-bold text-[#aaa] pt-1">
+							{nextRebalanceIn ?? '—'}
+						</div>
+					</div>
+					<div class="border border-[#222] bg-[#0a0a0a] p-2">
 						<div class="text-[10px] uppercase tracking-wider text-[#666]">Last tick</div>
-						<div class="text-[11px] font-bold text-[#aaa] pt-1">{fmtWhen(basket.last_tick_at)}</div>
+						<div class={`text-[11px] font-bold pt-1 ${tickStale ? 'text-red-400' : 'text-[#aaa]'}`}>
+							{tickAge !== null ? `${fmtNum(tickAge, 1)}h ago` : fmtWhen(basket.last_tick_at)}
+						</div>
 					</div>
 				</div>
+
+				{#if basket.config}
+					<div class="text-[10px] text-[#555]">
+						{basket.config.rebalance_hours}h cadence · {basket.config.n_legs} legs/side ·
+						{basket.config.gross_leverage}× gross · {fmtNum(basket.config.fee_bps + basket.config.slippage_bps, 1)}bps
+						cost per traded weight
+						{#if universe}
+							· universe {universe.eligible}/{universe.total} eligible
+						{/if}
+						· <a href="/settings#portfolio/risk.basket_rebalance_hours" class="text-[#666] hover:text-[#888] underline">edit</a>
+					</div>
+				{/if}
 
 				{#if equityCurve.length > 2}
 					<EquityChart data={equityCurve} height={220} showDrawdown={false} />
@@ -259,39 +325,109 @@
 					</div>
 				</div>
 
-				<!-- current legs -->
+				<!-- current legs: weight, the funding each is positioned against, and
+				     its expected carry contribution -->
 				<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
 					<div>
-						<div class="text-[10px] uppercase tracking-wider text-emerald-500 mb-1">
-							Long (lowest funding)
+						<div class="flex items-baseline justify-between mb-1">
+							<span class="text-[10px] uppercase tracking-wider text-emerald-500">Long (lowest funding)</span>
+							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · carry /yr</span>
 						</div>
-						{#each longLegs as [sym, w]}
+						{#each longLegs as leg (leg.symbol)}
 							<div
 								class="flex items-center justify-between border border-[#1c2b1c] bg-[#050805] px-3 py-1.5 text-[11px] mb-1"
 							>
-								<span class="font-bold text-[#aaa]">{sym}</span>
-								<span class="text-emerald-400">{fmtPct(w, 1)}</span>
+								<span class="font-bold text-[#aaa]">{leg.symbol}</span>
+								<span class="flex items-center gap-3">
+									<span class="text-emerald-400">{fmtPct(leg.weight, 1)}</span>
+									<span class="text-[#777] w-16 text-right" title="Current funding rate, annualized. A long leg WANTS this negative — shorts pay it the rate.">
+										{fmtPct(annualizeHourly(leg.funding_rate_hourly), 1)}
+									</span>
+									<span
+										class={`w-14 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+										title="This leg's expected carry contribution, annualized"
+									>
+										{fmtPct(leg.carry_annualized, 1)}
+									</span>
+								</span>
 							</div>
 						{:else}
 							<div class="text-[11px] text-[#555]">none</div>
 						{/each}
 					</div>
 					<div>
-						<div class="text-[10px] uppercase tracking-wider text-red-500 mb-1">
-							Short (highest funding)
+						<div class="flex items-baseline justify-between mb-1">
+							<span class="text-[10px] uppercase tracking-wider text-red-500">Short (highest funding)</span>
+							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · carry /yr</span>
 						</div>
-						{#each shortLegs as [sym, w]}
+						{#each shortLegs as leg (leg.symbol)}
 							<div
 								class="flex items-center justify-between border border-[#2b1c1c] bg-[#080505] px-3 py-1.5 text-[11px] mb-1"
 							>
-								<span class="font-bold text-[#aaa]">{sym}</span>
-								<span class="text-red-400">{fmtPct(w, 1)}</span>
+								<span class="font-bold text-[#aaa]">{leg.symbol}</span>
+								<span class="flex items-center gap-3">
+									<span class="text-red-400">{fmtPct(leg.weight, 1)}</span>
+									<span class="text-[#777] w-16 text-right" title="Current funding rate, annualized. A short leg WANTS this positive — it collects the rate from longs.">
+										{fmtPct(annualizeHourly(leg.funding_rate_hourly), 1)}
+									</span>
+									<span
+										class={`w-14 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+										title="This leg's expected carry contribution, annualized"
+									>
+										{fmtPct(leg.carry_annualized, 1)}
+									</span>
+								</span>
 							</div>
 						{:else}
 							<div class="text-[11px] text-[#555]">none</div>
 						{/each}
 					</div>
 				</div>
+
+				<!-- recent ticks: what actually happened, tick by tick -->
+				{#if recentTicks.length > 0}
+					<div class="space-y-1">
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Recent ticks</div>
+						<div class="overflow-x-auto">
+							<table class="w-full text-[11px]">
+								<thead>
+									<tr class="text-left text-[10px] uppercase tracking-wider text-[#666] border-b border-[#222]">
+										<th class="py-1 pr-2">When</th>
+										<th class="py-1 pr-2 text-right">Equity</th>
+										<th class="py-1 pr-2 text-right">Funding PnL</th>
+										<th class="py-1 pr-2 text-right">Price PnL</th>
+										<th class="py-1 pr-2 text-right">Cost</th>
+										<th class="py-1 text-right">Event</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each recentTicks as tick (tick.t)}
+										<tr class="border-b border-[#151515] text-[#999]">
+											<td class="py-1 pr-2">{fmtWhen(tick.t)}</td>
+											<td class="py-1 pr-2 text-right text-[#bbb]">{fmtNum(tick.equity, 5)}</td>
+											<td class={`py-1 pr-2 text-right ${tick.funding_pnl > 0 ? 'text-emerald-400' : tick.funding_pnl < 0 ? 'text-red-400' : 'text-[#555]'}`}>
+												{fmtPct(tick.funding_pnl, 4)}
+											</td>
+											<td class={`py-1 pr-2 text-right ${tick.price_pnl > 0 ? 'text-emerald-400' : tick.price_pnl < 0 ? 'text-red-400' : 'text-[#555]'}`}>
+												{fmtPct(tick.price_pnl, 4)}
+											</td>
+											<td class={`py-1 pr-2 text-right ${tick.cost > 0 ? 'text-red-300' : 'text-[#555]'}`}>
+												{tick.cost > 0 ? `−${fmtPct(tick.cost, 4)}` : '—'}
+											</td>
+											<td class="py-1 text-right">
+												{#if tick.rebalanced}
+													<span class="text-[10px] px-1.5 py-0.5 border border-[#333] text-[#aaa]">REBALANCE</span>
+												{:else}
+													<span class="text-[#555]">mark</span>
+												{/if}
+											</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					</div>
+				{/if}
 			{/if}
 
 			<div class="flex items-center gap-2 pt-1">

@@ -246,3 +246,44 @@ def test_active_symbols_include_universe_only_when_enabled(forven_db, monkeypatc
 
     monkeypatch.setattr(basket_runtime, "basket_enabled", lambda *a, **k: True)
     assert "ETH-USDT" in dm._fetch_active_symbols(include_recent_backtests=False)
+
+
+# ------------------------------------------------------------ operator telemetry
+
+
+def test_tick_captures_leg_funding_and_universe():
+    panel = _panel()
+    state, _ = tick_basket(_fresh_state("x"), panel, _now(panel), _config(funding_stale_hours=9.0))
+    assert state["universe"] == {"total": 4, "eligible": 4}
+    # Held legs carry their as-of-tick funding rate.
+    assert state["leg_funding"]["AAA-USDT"] == pytest.approx(0.001)   # short leg
+    assert state["leg_funding"]["BBB-USDT"] == pytest.approx(-0.001)  # long leg
+    assert state["config_used"]["n_legs"] == 1
+
+
+def test_summary_exposes_carry_universe_and_cadence(forven_db, monkeypatch):
+    from forven import basket_runtime
+    from forven.db import kv_set
+
+    panel = _panel(end=pd.Timestamp.now(tz="UTC").floor("h"))
+    monkeypatch.setattr(basket_runtime, "_load_settings",
+                        lambda: {"basket_funding_carry_enabled": True, "basket_n_legs": 1})
+    import forven.basket_lab as basket_lab
+
+    monkeypatch.setattr(basket_lab, "deep_universe_symbols", lambda min_bars: list(panel.symbols))
+    monkeypatch.setattr(basket_lab, "build_panel", lambda symbols, tail_bars=None: panel)
+    basket_runtime.run_basket_tick()
+
+    summary = basket_runtime.basket_summary()
+    # Short 0.5 @ +0.001/h and long 0.5 @ -0.001/h each contribute
+    # 0.5*0.001*24*365 = 4.38 annualized -> 8.76 total.
+    assert summary["expected_carry_annualized"] == pytest.approx(8.76, rel=1e-6)
+    legs = {leg["symbol"]: leg for leg in summary["legs"]}
+    assert legs["AAA-USDT"]["carry_annualized"] == pytest.approx(4.38, rel=1e-6)
+    assert legs["AAA-USDT"]["funding_rate_hourly"] == pytest.approx(0.001)
+    assert summary["universe"] == {"total": 4, "eligible": 4}
+    assert summary["next_rebalance_at"] is not None
+    assert summary["tick_age_hours"] is not None and summary["tick_age_hours"] < 1
+    assert summary["config"]["rebalance_hours"] == 24.0
+    assert len(summary["recent_ticks"]) == 1 and summary["recent_ticks"][0]["rebalanced"]
+    basket_runtime.reset_basket_state()
