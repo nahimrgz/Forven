@@ -2655,6 +2655,17 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             ("basket_n_legs", 5.0),
             ("basket_gross_leverage", 1.0),
             ("basket_universe_min_bars", 17520.0),
+            # BASKET-2: incumbency buffer on basket re-ranking (forven.basket_runtime).
+            ("basket_rank_buffer", 3.0),
+            # LIVE-LOOP-1: paper→live graduation recommender (forven.live_graduation).
+            ("graduation_min_soak_days", 14.0),
+            ("graduation_min_paper_trades", 10.0),
+            ("graduation_min_measured_trades", 5.0),
+            ("graduation_base_arm_usd", 100.0),
+            ("graduation_max_arm_usd", 250.0),
+            ("graduation_daily_limit", 2.0),
+            ("graduation_deny_cooldown_days", 7.0),
+            ("graduation_skew_lookback_days", 30.0),
         ):
             if _pb_key in payload:
                 updates[_pb_key] = _coerce_float(payload.get(_pb_key), _coerce_float(updates.get(_pb_key), _pb_default))
@@ -2679,6 +2690,13 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["portfolio_layer_enabled"] = _coerce_bool(
                 payload.get("portfolio_layer_enabled"),
                 bool(updates.get("portfolio_layer_enabled", False)),
+            )
+        # LIVE-LOOP-1 toggle: graduation recommender ships dark
+        # (forven.live_graduation — recommendation-only, never arms capital).
+        if "live_graduation_recommender_enabled" in payload:
+            updates["live_graduation_recommender_enabled"] = _coerce_bool(
+                payload.get("live_graduation_recommender_enabled"),
+                bool(updates.get("live_graduation_recommender_enabled", False)),
             )
         # PORT-LAYER-2 toggle (forven.basket_runtime).
         if "basket_funding_carry_enabled" in payload:
