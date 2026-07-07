@@ -372,9 +372,6 @@
 	function goNextPage() { currentPage = Math.min(pageCount, currentPage + 1); }
 
 	function openContainer(row: ManagerRow) {
-		// Hand the detail page the FULL filtered+sorted order (not just the visible
-		// page) so its prev/next arrows walk exactly what this view shows.
-		setForgeNavList(rowsInView.map((r) => ({ id: r.id, label: r.display_name || r.name })));
 		goto(`/lab/strategy/${encodeURIComponent(row.id)}?returnTo=${encodeURIComponent('/lab')}`);
 	}
 
@@ -758,6 +755,14 @@
 	})();
 
 	$: rowsInView = bucket === 'active' ? activeFiltered : bucket === 'parked' ? parkedFiltered : trashFiltered;
+	// Keep the detail page's prev/next context in sync with whatever this view
+	// currently shows (full filtered+sorted order, all pages) — captured on every
+	// view change, not on click, so EVERY route into a container (name link,
+	// Details button, middle-click) walks the same order. Empty views don't
+	// clobber a previously captured list.
+	$: if (rowsInView.length > 0) {
+		setForgeNavList(rowsInView.map((r) => ({ id: r.id, label: r.display_name || r.name })));
+	}
 	$: pageCount = Math.max(1, Math.ceil(rowsInView.length / pageSize));
 	$: if (currentPage > pageCount) currentPage = pageCount;
 	$: {
