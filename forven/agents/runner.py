@@ -200,7 +200,14 @@ def _truncate_input_data_for_prompt(
             "_prompt_budget_note": "(input data truncated for prompt budget)",
             "keys_present": keys_present,
         }
-        for key in ("origin_mode", "action_kind", "crucible_id", "hypothesis_id", "hypothesis_display_id"):
+        for key in (
+            "origin_mode",
+            "action_kind",
+            "crucible_id",
+            "hypothesis_id",
+            "hypothesis_display_id",
+            "previous_verdict",
+        ):
             if key not in data:
                 continue
             value = data[key]

@@ -3508,6 +3508,65 @@ def query_failure_taxonomy(
         return []
 
 
+def query_near_miss_rejections(days: int = 90, limit: int = 6) -> list[dict]:
+    """Query gate_rejections for candidates that cleared the 'Promising' verdict
+    bar (see api_core.calculate_backtest_verdict) but still died on a hard gate.
+
+    SQL-side pre-filter on json_extract(metrics_snapshot, ...) so we don't scan
+    every rejection row into Python; the caller (strategy_diversity.render_near_miss_digest)
+    re-derives the same fields defensively and applies the max-drawdown leg of the
+    threshold, since drawdown units (ratio vs percent points) aren't safe to compare
+    in raw SQL. Over-fetches (limit * 4) because that final filter can drop rows.
+    Best-effort: any failure (missing table, malformed JSON) returns [].
+    """
+    try:
+        normalized_limit = max(1, min(int(limit or 6), 50))
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT strategy_id, gate, reason_code, strategy_type, regime_context,
+                       metrics_snapshot, created_at,
+                       -- json_extract RAISES on malformed JSON (it does not return
+                       -- NULL), and one bad row would otherwise abort .fetchall()
+                       -- and silently zero the ENTIRE 90-day digest via the blanket
+                       -- except below. The json_valid guard lives INSIDE a CASE
+                       -- (not as a WHERE term) because SQLite's planner does not
+                       -- guarantee WHERE-term evaluation order — CASE branch order
+                       -- IS guaranteed, so json_extract can never see invalid JSON.
+                       -- log_gate_rejection only writes NULL or json.dumps output
+                       -- today, but a future writer, migration, or hand-edited row
+                       -- must only lose ITSELF, not the whole feature.
+                       CASE WHEN json_valid(metrics_snapshot) THEN COALESCE(
+                           json_extract(metrics_snapshot, '$.out_of_sample.sharpe'),
+                           json_extract(metrics_snapshot, '$.oos.sharpe'),
+                           json_extract(metrics_snapshot, '$.sharpe'),
+                           json_extract(metrics_snapshot, '$.sharpe_ratio')
+                       ) END AS eff_sharpe,
+                       CASE WHEN json_valid(metrics_snapshot) THEN COALESCE(
+                           json_extract(metrics_snapshot, '$.out_of_sample.profit_factor'),
+                           json_extract(metrics_snapshot, '$.oos.profit_factor'),
+                           json_extract(metrics_snapshot, '$.profit_factor')
+                       ) END AS eff_profit_factor,
+                       CASE WHEN json_valid(metrics_snapshot) THEN COALESCE(
+                           json_extract(metrics_snapshot, '$.out_of_sample.total_trades'),
+                           json_extract(metrics_snapshot, '$.oos.total_trades'),
+                           json_extract(metrics_snapshot, '$.total_trades')
+                       ) END AS eff_total_trades
+                FROM gate_rejections
+                WHERE datetime(created_at) > datetime('now', ? || ' days')
+                  AND eff_sharpe >= 1.0
+                  AND eff_profit_factor >= 1.3
+                  AND eff_total_trades >= 15
+                ORDER BY datetime(created_at) DESC
+                LIMIT ?
+                """,
+                (str(-abs(days)), normalized_limit * 4),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 # --- CRUD helpers ---
 
 def kv_get(key: str, default=None):

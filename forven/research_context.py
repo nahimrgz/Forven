@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from forven.research_contract import ResearchContract, build_research_contract, default_research_settings
-from forven.strategy_diversity import render_failure_taxonomy, render_strategy_diversity_guard
+from forven.strategy_diversity import (
+    render_failure_taxonomy,
+    render_near_miss_digest,
+    render_strategy_diversity_guard,
+)
 from forven.workspace import read_workspace
 
 
@@ -244,6 +248,13 @@ def build_research_context(
     failure_taxonomy = render_failure_taxonomy()
     if failure_taxonomy:
         sections.append(failure_taxonomy)
+
+    # Near-miss digest — same constraint-class treatment as the taxonomy above:
+    # steers TOWARD a specific rejected-but-promising neighborhood, so it doesn't
+    # conflict with novelty contracts the way inspiration-class memory would.
+    near_miss_digest = render_near_miss_digest()
+    if near_miss_digest:
+        sections.append(near_miss_digest)
 
     inspiration_mode = contract.memory_mode.get("inspiration_memory")
     normalized_inspiration_mode = str(inspiration_mode).strip().lower() if inspiration_mode is not None else ""

@@ -14,6 +14,19 @@ DEFAULT_HARD_SATURATION_THRESHOLD = 0.55
 DEFAULT_OUTCOME_WINDOW_DAYS = 90
 DEAD_FAMILY_MIN_ATTEMPTS = 8
 
+# Mirrors the "Promising" bucket of api_core.calculate_backtest_verdict
+# (forven/api_core.py ~line 5076: `total_trades >= 15 and sharpe >= 1.0 and
+# profit_factor >= 1.3 and max_dd < 35`). Duplicated as constants rather than
+# imported because api_core pulls in the whole API/router module graph — not
+# worth that import cost for four threshold numbers. Keep these in sync by hand
+# if that verdict bucket ever changes.
+NEAR_MISS_MIN_SHARPE = 1.0
+NEAR_MISS_MIN_PROFIT_FACTOR = 1.3
+NEAR_MISS_MIN_TRADES = 15
+NEAR_MISS_MAX_DRAWDOWN_PCT = 35.0  # percent points, e.g. 35 == 35%
+DEFAULT_NEAR_MISS_WINDOW_DAYS = 90
+DEFAULT_NEAR_MISS_LIMIT = 6
+
 FAMILY_LABELS = {
     "rsi": "RSI / oscillator momentum",
     "stochastic": "stochastic oscillator",
@@ -299,6 +312,140 @@ def render_failure_taxonomy(*, days: int = 30, limit: int = 8) -> str:
         ][:3]
         example_suffix = f" [e.g. {', '.join(example_ids)}]" if example_ids else ""
         lines.append(f"- {strategy_type} @ {gate}: {reason} ×{count} ({regime}){example_suffix}")
+    return "\n".join(lines)
+
+
+def _metrics_snapshot_section(snapshot: dict[str, Any], *keys: str) -> dict[str, Any]:
+    """First present nested section of a metrics_snapshot blob, unwrapped.
+
+    Mirrors the in_sample/out_of_sample convention used elsewhere for backtest
+    metric blobs (see forven/policy.py `_metrics_section`), so a near-miss digest
+    built from `gate_rejections.metrics_snapshot` reads OOS numbers the same way
+    the promotion gates do instead of drifting to a second, incompatible shape.
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+    for key in keys:
+        section = snapshot.get(key)
+        if isinstance(section, dict) and section:
+            return section
+    return {}
+
+
+def _extract_promising_metrics(snapshot: Any) -> dict[str, float] | None:
+    """Pull sharpe/profit_factor/total_trades/max_drawdown_pct out of a
+    metrics_snapshot blob (JSON text or already-decoded dict).
+
+    Every observed gate_rejections row today is flat (see forven/policy.py
+    `_load_metrics_snapshot_for_rejection`), but other backtest metric blobs in
+    this codebase nest an OOS leg under "out_of_sample" or "oos" (forven/policy.py
+    `_metrics_section`). Preferring that nested leg when present keeps this in
+    sync with those blobs' shape without assuming gate_rejections never grows one.
+    Returns None for anything that isn't a parseable metrics dict.
+    """
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+
+    oos = _metrics_snapshot_section(snapshot, "out_of_sample", "oos")
+    merged = dict(snapshot)
+    merged.update({k: v for k, v in oos.items() if v is not None})
+
+    try:
+        sharpe = float(merged.get("sharpe", merged.get("sharpe_ratio")) or 0.0)
+        profit_factor = float(merged.get("profit_factor") or 0.0)
+        total_trades = int(float(merged.get("total_trades") or 0))
+        max_dd_raw = merged.get("max_drawdown_pct", merged.get("max_drawdown"))
+        max_dd = float(max_dd_raw) if max_dd_raw is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+
+    # metrics_snapshot stores drawdown as a 0..1 ratio in every observed row;
+    # calculate_backtest_verdict's threshold is in percent points (35 == 35%).
+    # Only scale values that look like ratios so a future percent-points writer
+    # isn't silently multiplied again.
+    if abs(max_dd) <= 1.0:
+        max_dd *= 100.0
+
+    return {
+        "sharpe": sharpe,
+        "profit_factor": profit_factor,
+        "total_trades": float(total_trades),
+        "max_drawdown_pct": max_dd,
+    }
+
+
+def _is_near_miss(metrics: dict[str, float]) -> bool:
+    return (
+        metrics["sharpe"] >= NEAR_MISS_MIN_SHARPE
+        and metrics["profit_factor"] >= NEAR_MISS_MIN_PROFIT_FACTOR
+        and metrics["total_trades"] >= NEAR_MISS_MIN_TRADES
+        and metrics["max_drawdown_pct"] < NEAR_MISS_MAX_DRAWDOWN_PCT
+    )
+
+
+def render_near_miss_digest(
+    *,
+    days: int = DEFAULT_NEAR_MISS_WINDOW_DAYS,
+    limit: int = DEFAULT_NEAR_MISS_LIMIT,
+) -> str:
+    """Render gate-rejected strategies whose metrics cleared the 'Promising' bar.
+
+    `render_failure_taxonomy` tells generation "this region is disproven" — but
+    some rejections (overfit_reject on the IS leg, a sample-size floor) fire on
+    strategies whose actual performance looked genuinely good. Without this,
+    those get lumped in with true dead ends and the generator never learns to
+    explore NEAR them instead of away from them. Best-effort: any failure
+    (missing table, malformed JSON) yields "".
+    """
+    try:
+        from forven.db import query_near_miss_rejections
+
+        rows = query_near_miss_rejections(days=days, limit=limit)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+
+    normalized_limit = max(1, int(limit or DEFAULT_NEAR_MISS_LIMIT))
+    seen_strategy_ids: set[str] = set()
+    entries: list[str] = []
+    for row in rows:
+        strategy_id = _normalize_text(row.get("strategy_id"))
+        if not strategy_id or strategy_id in seen_strategy_ids:
+            continue
+        metrics = _extract_promising_metrics(row.get("metrics_snapshot"))
+        if not metrics or not _is_near_miss(metrics):
+            continue
+        seen_strategy_ids.add(strategy_id)
+        strategy_type = _normalize_text(row.get("strategy_type")) or "unknown family"
+        gate = _normalize_text(row.get("gate")) or "?"
+        reason = _normalize_text(row.get("reason_code")) or "unspecified"
+        entries.append(
+            f"- {strategy_id} ({strategy_type}): Sharpe {metrics['sharpe']:.2f}, "
+            f"PF {metrics['profit_factor']:.2f}, {int(metrics['total_trades'])} trades, "
+            f"DD {metrics['max_drawdown_pct']:.1f}% — died on {gate}/{reason}. "
+            "Explore near this, don't abandon the mechanism."
+        )
+        if len(entries) >= normalized_limit:
+            break
+
+    if not entries:
+        return ""
+
+    lines = [
+        f"# NEAR-MISS DIGEST (last {int(days)}d)",
+        "These rejections cleared the same 'Promising' performance bar as "
+        "calculate_backtest_verdict (Sharpe/profit-factor/sample-size/drawdown) "
+        "but still died on a structural gate. Treat the neighborhood as a live "
+        "region worth mutating, not a disproven one — address the specific "
+        "failure reason below rather than walking away from the mechanism.",
+    ]
+    lines.extend(entries)
     return "\n".join(lines)
 
 

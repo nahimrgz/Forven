@@ -18,6 +18,10 @@ MAX_IN_FLIGHT_DEFAULT = 5
 # Outcome buckets that count as positive for promise score. Child strategy verdict
 # is a JSON blob; we do a LIKE match on the serialized text to score quickly.
 POSITIVE_VERDICT_VALUES = ("deploy_eligible", "paper_eligible")
+# Truncation for the "Previous verdict" note pulled from hypotheses.verdict_memo
+# (see _previous_verdict_summary) — keeps a revisit dispatch's description/
+# input_data bounded even if the LLM-authored rationale ran long.
+_PREVIOUS_VERDICT_TRUNCATE_CHARS = 500
 
 
 def _current_in_flight_task_count() -> int:
@@ -115,6 +119,38 @@ def _score_rows() -> list[dict[str, Any]]:
     return scored
 
 
+def _previous_verdict_summary(hypothesis: dict[str, Any]) -> str:
+    """Best-effort 'Previous verdict' note from hypotheses.verdict_memo.
+
+    verdict_memo is the LLM-authored post-mortem written by
+    hypothesis_verdict.write_verdict_memo explaining WHY a hypothesis reached
+    its current status — but a revisit dispatch previously re-researched the
+    same hypothesis from scratch, blind to its own documented failure mode.
+    get_hypothesis() already returns verdict_memo pre-parsed as a dict (see
+    forven/hypotheses.py `_hypothesis_row_to_dict`), so no extra query is needed
+    here. Absent/malformed memo -> "" — never raises.
+    """
+    try:
+        memo = hypothesis.get("verdict_memo")
+        if not isinstance(memo, dict) or not memo:
+            return ""
+        verdict = str(memo.get("verdict") or "").strip()
+        # Collapse ALL internal whitespace (incl. newlines), mirroring
+        # crucible_discovery._disproven_rationale on this same LLM-authored
+        # field: a rationale with embedded newlines could otherwise smuggle
+        # structural markup (headings, "new instructions" blocks) into the
+        # revisit task description handed to a tool-using agent. Externally
+        # harvested content (YouTube/Reddit theses) feeds the verdict LLM's
+        # prompt, so this is defense-in-depth, not paranoia.
+        rationale = " ".join(str(memo.get("rationale") or "").split())
+        if not verdict and not rationale:
+            return ""
+        text = f"{verdict or 'unknown'}: {rationale}" if rationale else verdict
+        return text[:_PREVIOUS_VERDICT_TRUNCATE_CHARS]
+    except Exception:
+        return ""
+
+
 def _dispatch_task(hypothesis: dict[str, Any]) -> int | None:
     """Enqueue a strategy-developer research task with lineage context.
 
@@ -144,13 +180,17 @@ def _dispatch_task(hypothesis: dict[str, Any]) -> int | None:
 
     revisit_count = int(hypothesis.get("revisit_count") or 0)
     revisit_prefix = ""
+    previous_verdict = ""
     if revisit_count > 0:
+        previous_verdict = _previous_verdict_summary(hypothesis)
         revisit_prefix = (
             f"This hypothesis previously graduated (revisit #{revisit_count}). "
             "Goal: produce variants that beat the existing canonical children. "
             "The coverage map shows where canonicals exist — focus on cells "
             "with weak/degraded canonical performance or uncovered cells.\n\n"
         )
+        if previous_verdict:
+            revisit_prefix += f"Previous verdict: {previous_verdict}\n\n"
 
     description = (
         f"{revisit_prefix}"
@@ -168,22 +208,25 @@ def _dispatch_task(hypothesis: dict[str, Any]) -> int | None:
         "Use the exact provided hypothesis_id/crucible_id. Do not call create_hypothesis "
         "or create a replacement crucible. Then stop — one strategy per pick."
     )
+    input_data: dict[str, Any] = {
+        "origin_mode": "hypothesis_promotion_loop",
+        "action_kind": "develop_candidate",
+        "crucible_id": hypothesis_id,
+        "hypothesis_id": hypothesis_id,
+        "hypothesis_display_id": hypothesis.get("display_id"),
+        "revisit_count": revisit_count,
+        "siblings": siblings,
+        "canonical_coverage": coverage,
+    }
+    if previous_verdict:
+        input_data["previous_verdict"] = previous_verdict
     try:
         return int(assign_task(
             agent_id="strategy-developer",
             task_type="develop_candidate",
             title=f"Advance hypothesis {display_id}",
             description=description,
-            input_data={
-                "origin_mode": "hypothesis_promotion_loop",
-                "action_kind": "develop_candidate",
-                "crucible_id": hypothesis_id,
-                "hypothesis_id": hypothesis_id,
-                "hypothesis_display_id": hypothesis.get("display_id"),
-                "revisit_count": revisit_count,
-                "siblings": siblings,
-                "canonical_coverage": coverage,
-            },
+            input_data=input_data,
             priority=3,
         ))
     except Exception:

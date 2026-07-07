@@ -7,7 +7,11 @@ from datetime import date, datetime, timedelta, timezone
 log = logging.getLogger("forven.context")
 
 from forven.db import get_open_trades, get_recent_trades, get_strategies, kv_get, list_approvals
-from forven.strategy_diversity import render_failure_taxonomy, render_strategy_diversity_guard
+from forven.strategy_diversity import (
+    render_failure_taxonomy,
+    render_near_miss_digest,
+    render_strategy_diversity_guard,
+)
 from forven.workspace import (
     read_operator_profile,
     read_workspace,
@@ -393,6 +397,14 @@ def build_agent_context(
     failure_taxonomy = render_failure_taxonomy()
     if failure_taxonomy:
         parts.append(failure_taxonomy)
+
+    # Near-miss digest — gate rejections whose metrics cleared the 'Promising'
+    # verdict bar but still died on a structural gate. Complements the taxonomy
+    # above: that says "this region is disproven", this says "this specific
+    # neighborhood almost worked, explore near it instead of away from it".
+    near_miss_digest = render_near_miss_digest()
+    if near_miss_digest:
+        parts.append(near_miss_digest)
 
     # Learned quant skills — the curated, outcome-weighted "what works / what to
     # avoid" knowledge base. Previously extracted, versioned, and confidence-scored
