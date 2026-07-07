@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from forven.data_manager import DataManager, _merge_asof_parquet, _save_stream_parquet
 
@@ -247,6 +248,42 @@ def test_enrich_stream_failure_logged_at_warning(tmp_path, caplog):
 
     assert len(out) == len(frame)
     assert any("LSR enrichment skipped" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _enrich_with_market_data two-column funding convention (zero_trade fix)
+# ---------------------------------------------------------------------------
+
+def test_enrich_market_data_exposes_per8h_funding_and_hourly_cost_column(monkeypatch):
+    """zero_trade fix: strategies read the canonical PER-8H funding_rate they
+    calibrate deadbands against, while cost accrual reads the PER-HOUR
+    _funding_rate_hourly. _resolve_market_data_series returns per-hour points
+    (rate/8); the enrichment must expose funding_rate = 8x that, and
+    _funding_rate_hourly = the raw per-hour value."""
+    import forven.strategies.backtest as backtest_mod
+
+    ts = pd.date_range("2024-01-01", periods=24, freq="1h", tz="UTC")
+    frame = pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 10.0},
+        index=ts,
+    )
+    frame.index.name = "timestamp"
+
+    per_hour = 1.25e-5  # e.g. an 8h rate of 1e-4 divided by 8
+    funding_series = [(int(t.timestamp() * 1000), per_hour) for t in ts]
+    monkeypatch.setattr(
+        backtest_mod, "_resolve_market_data_series",
+        lambda asset, start_ms, end_ms: (funding_series, []),
+    )
+
+    out = backtest_mod._enrich_with_market_data(frame, "BTC")
+
+    assert "funding_rate" in out.columns
+    assert "_funding_rate_hourly" in out.columns
+    # Strategy-facing column is the canonical per-8h rate (8x the per-hour point).
+    assert out["funding_rate"].dropna().iloc[-1] == pytest.approx(per_hour * 8, rel=1e-9)
+    # Cost-facing column is the raw per-hour rate _apply_funding_to_trades expects.
+    assert out["_funding_rate_hourly"].dropna().iloc[-1] == pytest.approx(per_hour, rel=1e-9)
 
 
 # ---------------------------------------------------------------------------

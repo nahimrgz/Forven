@@ -2254,6 +2254,15 @@ def _resolve_market_data_series(normalized_asset: str, start_ms: int, end_ms: in
     )
 
 
+# Binance funds every 8h and delivers the rate per-hour (rate/8, see
+# market_data.fetch_binance_funding_series). This factor rescales that per-hour
+# series back to the canonical per-8h magnitude strategies calibrate deadbands
+# against. Mirrors market_data._BINANCE_FUNDING_INTERVAL_HOURS, kept local to
+# avoid import coupling. (The HL opt-out is natively hourly; ×8 normalizes it to
+# the same 8h-equivalent scale, which is the convention strategies assume.)
+_FUNDING_INTERVAL_HOURS = 8.0
+
+
 def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
     """Join supplementary market data (funding rate, OI) into the candle DataFrame,
     from the configured source (Binance by default — same venue as the candles, so
@@ -2280,11 +2289,22 @@ def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
         # Source-aware funding + OI (Binance by default — no HyperLiquid).
         funding_data, oi_data = _resolve_market_data_series(normalized_asset, start_ms, end_ms)
 
-        # Funding rates
+        # Funding rates — TWO columns with distinct scales, one series:
+        #   * ``funding_rate`` (PER-8H, canonical): what STRATEGIES read. LLM-
+        #     authored strategies calibrate funding deadbands against the well-
+        #     known per-8h magnitude (~1e-4). The series arrives PER-HOUR (rate/8
+        #     from fetch_binance_funding_series), so scale it back up by the
+        #     funding interval — otherwise a 1e-4 deadband is ~8x too strict on
+        #     the per-hour column and funding-gated strategies produce zero trades
+        #     (the zero_trade bucket root cause).
+        #   * ``_funding_rate_hourly`` (PER-HOUR): what COST accrual reads
+        #     (_apply_funding_to_trades), so per-bar accrual on the 1h grid is
+        #     unchanged — cost parity by construction.
         if funding_data:
-            fr_df = pd.DataFrame(funding_data, columns=["timestamp_ms", "funding_rate"])
+            fr_df = pd.DataFrame(funding_data, columns=["timestamp_ms", "_funding_rate_hourly"])
             fr_df["t"] = pd.to_datetime(fr_df["timestamp_ms"], unit="ms", utc=True)
-            fr_df = fr_df.set_index("t").sort_index()[["funding_rate"]]
+            fr_df = fr_df.set_index("t").sort_index()[["_funding_rate_hourly"]]
+            fr_df["funding_rate"] = fr_df["_funding_rate_hourly"] * _FUNDING_INTERVAL_HOURS
             fr_df = _coerce_index_to_ns_utc(fr_df)
             # Merge_asof: align funding to candle timestamps (backward fill)
             df = pd.merge_asof(
@@ -6370,7 +6390,14 @@ def _apply_funding_to_trades(
     if not trades:
         return trades, True
 
-    has_col = df is not None and "funding_rate" in getattr(df, "columns", [])
+    # Cost accrues on the PER-HOUR rate. _enrich_with_market_data exposes it as
+    # ``_funding_rate_hourly`` (the strategy-facing ``funding_rate`` is the
+    # canonical per-8h rate, 8x larger — using it here would overcharge funding
+    # ~8x). Fall back to ``funding_rate`` for legacy frames / unit callers that
+    # only carry the per-hour column under that name (back-compat, cost-neutral).
+    df_cols = getattr(df, "columns", [])
+    funding_col = "_funding_rate_hourly" if "_funding_rate_hourly" in df_cols else "funding_rate"
+    has_col = df is not None and funding_col in df_cols
     if not has_col:
         # No funding data at all for this asset/window — price PnL is unchanged
         # but the result is funding-incomplete so the promotion gate can hold it.
@@ -6380,7 +6407,7 @@ def _apply_funding_to_trades(
             t["funding_cost_pct"] = 0.0
         return trades, False
 
-    fr = df["funding_rate"]
+    fr = df[funding_col]
     n = len(fr)
     hours = _hours_per_bar(timeframe)
     lev = max(float(leverage), 0.0)
