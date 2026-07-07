@@ -207,3 +207,42 @@ def test_run_tick_noop_when_disabled(forven_db, monkeypatch):
     monkeypatch.setattr(basket_runtime, "_load_settings", lambda: {})
     assert basket_runtime.run_basket_tick() is None
     assert get_basket_state() is None
+
+
+# -------------------------------------------------------- universe keepalive
+
+
+def test_universe_symbols_cached(monkeypatch):
+    from forven import basket_runtime
+    import forven.basket_lab as basket_lab
+
+    basket_runtime._UNIVERSE_CACHE = None
+    calls = {"n": 0}
+
+    def _fake_universe(min_bars):
+        calls["n"] += 1
+        return ["AAA-USDT", "BBB-USDT"]
+
+    monkeypatch.setattr(basket_lab, "deep_universe_symbols", _fake_universe)
+    monkeypatch.setattr(basket_runtime, "_load_settings", lambda: {})
+    assert basket_runtime.basket_universe_symbols() == ["AAA-USDT", "BBB-USDT"]
+    assert basket_runtime.basket_universe_symbols() == ["AAA-USDT", "BBB-USDT"]
+    assert calls["n"] == 1  # second call served from the TTL cache
+    basket_runtime._UNIVERSE_CACHE = None
+
+
+def test_active_symbols_include_universe_only_when_enabled(forven_db, monkeypatch):
+    from forven import basket_runtime
+    from forven.data_manager import DataManager
+
+    monkeypatch.setattr(basket_runtime, "basket_universe_symbols", lambda *a, **k: ["ETH-USDT"])
+    dm = DataManager()
+    # Symbol normalization requires an existing dataset dir; keep it identity.
+    monkeypatch.setattr(DataManager, "_normalize_keepalive_symbol",
+                        lambda self, s, require_dataset=False: s)
+
+    monkeypatch.setattr(basket_runtime, "basket_enabled", lambda *a, **k: False)
+    assert "ETH-USDT" not in dm._fetch_active_symbols(include_recent_backtests=False)
+
+    monkeypatch.setattr(basket_runtime, "basket_enabled", lambda *a, **k: True)
+    assert "ETH-USDT" in dm._fetch_active_symbols(include_recent_backtests=False)

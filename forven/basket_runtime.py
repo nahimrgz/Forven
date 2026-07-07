@@ -48,6 +48,10 @@ DEFAULT_N_LEGS = 5
 DEFAULT_GROSS_LEVERAGE = 1.0
 DEFAULT_UNIVERSE_MIN_BARS = 17520  # mirror the validated deep-universe rule (2y of 1h)
 DEFAULT_MAX_STALE_HOURS = 3.0
+# Funding rates live on an 8h grid (Binance native) and persist until the next
+# print, so a rate up to ~9h old is the CURRENT rate, not a stale one. Closes
+# get the tight default above — a 3h-old price is not a mark.
+DEFAULT_FUNDING_STALE_HOURS = 9.0
 PANEL_TAIL_BARS = 24 * 14  # 14 days of 1h — plenty for marks + elapsed funding
 MAX_HISTORY_POINTS = 2400  # ~100 days of hourly ticks
 
@@ -86,7 +90,42 @@ def _basket_config(settings: dict) -> dict:
         "trade_cost": (fee_bps + slippage_bps) / 10_000.0,
         "fee_bps": fee_bps,
         "slippage_bps": slippage_bps,
+        "max_stale_hours": DEFAULT_MAX_STALE_HOURS,
+        "funding_stale_hours": DEFAULT_FUNDING_STALE_HOURS,
     }
+
+
+_UNIVERSE_CACHE: tuple[float, list[str]] | None = None
+_UNIVERSE_CACHE_TTL_SECONDS = 600.0
+
+
+def basket_universe_symbols(settings: dict | None = None) -> list[str]:
+    """The basket's ranking universe (deep-history perps), TTL-cached.
+
+    Used by the tick AND by DataManager's active-symbol discovery: while the
+    basket is enabled its whole universe needs the same background keepalive
+    as actively-trading symbols — a stale close fails the mark guard and a
+    stale funding print mis-ranks the carry (the first real tick could only
+    build 3 of 5 legs per side because 24/30 universe closes had gone stale
+    out of the keepalive set).
+    """
+    global _UNIVERSE_CACHE
+    import time as _time
+
+    now = _time.monotonic()
+    if _UNIVERSE_CACHE is not None and (now - _UNIVERSE_CACHE[0]) < _UNIVERSE_CACHE_TTL_SECONDS:
+        return list(_UNIVERSE_CACHE[1])
+    settings = settings if settings is not None else _load_settings()
+    config = _basket_config(settings)
+    try:
+        from forven.basket_lab import deep_universe_symbols
+
+        symbols = deep_universe_symbols(min_bars=config["universe_min_bars"])
+    except Exception:
+        log.debug("basket universe discovery failed", exc_info=True)
+        return []
+    _UNIVERSE_CACHE = (now, list(symbols))
+    return list(symbols)
 
 
 def _fresh_state(now_iso: str) -> dict:
@@ -107,6 +146,30 @@ def _fresh_state(now_iso: str) -> dict:
 
 
 # ------------------------------------------------------------------ tick core
+
+
+def _latest_within(frame, now: datetime, max_age_hours: float):
+    """Per-symbol last valid value, masked to NaN when older than the window.
+
+    A forward tick must not rank/mark on the exact last union-index row — the
+    panel's symbols update on different cadences (funding on an 8h grid, OHLCV
+    tails hours apart), so exact-row alignment silently disqualifies most of a
+    perfectly fresh universe (first real tick ran 2 legs/side against 30 fresh
+    symbols for exactly this reason). Forward-fill per symbol, then mask any
+    value whose own last print is genuinely too old.
+    """
+    import pandas as pd
+
+    if frame is None or frame.empty:
+        return None
+    filled = frame.ffill().iloc[-1]
+    cutoff = pd.Timestamp(now) - pd.Timedelta(hours=float(max_age_hours))
+    last_valid = frame.apply(lambda col: col.last_valid_index())
+    fresh_mask = pd.Series(
+        [(lv is not None and lv >= cutoff) for lv in last_valid],
+        index=filled.index,
+    )
+    return filled.where(fresh_mask)
 
 
 def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, dict]:
@@ -132,7 +195,10 @@ def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, 
         )
         return state, report
 
-    closes = panel.close.iloc[-1]
+    closes = _latest_within(panel.close, now, config.get("max_stale_hours", DEFAULT_MAX_STALE_HOURS))
+    if closes is None:
+        report["skipped_reason"] = "no close data"
+        return state, report
     now_iso = now.isoformat()
 
     # --- mark-to-market the held weights since the previous tick
@@ -159,7 +225,7 @@ def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, 
     turnover = 0.0
     due = _rebalance_due(state.get("last_rebalance_at"), now, config["rebalance_hours"])
     if due:
-        target = _target_weights(panel, config)
+        target = _target_weights(panel, config, now=now, closes=closes)
         old = state["weights"]
         traded_symbols = set(old) | set(target)
         turnover = sum(abs(float(target.get(s, 0.0)) - float(old.get(s, 0.0))) for s in traded_symbols)
@@ -241,11 +307,21 @@ def _rebalance_due(last_rebalance_iso: str | None, now: datetime, rebalance_hour
     return now - last >= timedelta(hours=float(rebalance_hours)) - timedelta(minutes=5)
 
 
-def _target_weights(panel, config: dict) -> dict[str, float]:
-    """FundingCarryBasket's rule on the freshest bar: long the lowest-funding
-    legs, short the highest, dollar-neutral per-leg fractions."""
-    scores = panel.funding.iloc[-1]
-    eligible = scores.notna() & panel.close.iloc[-1].notna()
+def _target_weights(panel, config: dict, *, now: datetime | None = None, closes=None) -> dict[str, float]:
+    """FundingCarryBasket's rule on each symbol's freshest values: long the
+    lowest-funding legs, short the highest, dollar-neutral per-leg fractions.
+
+    Uses last-within-window values per symbol (see _latest_within) — a funding
+    rate persists until its next 8h print, so ranking on it is ranking on the
+    CURRENT rate, not lookahead or staleness."""
+    if now is None:
+        now = panel.index[-1].to_pydatetime()
+    scores = _latest_within(panel.funding, now, config.get("funding_stale_hours", DEFAULT_FUNDING_STALE_HOURS))
+    if closes is None:
+        closes = _latest_within(panel.close, now, config.get("max_stale_hours", DEFAULT_MAX_STALE_HOURS))
+    if scores is None or closes is None:
+        return {}
+    eligible = scores.notna() & closes.notna()
     scores = scores[eligible]
     n_legs = min(int(config["n_legs"]), len(scores) // 2)
     if n_legs <= 0:
@@ -273,10 +349,10 @@ def run_basket_tick(force: bool = False) -> dict | None:
     if not force and not basket_enabled(settings):
         return None
     try:
-        from forven.basket_lab import build_panel, deep_universe_symbols
+        from forven.basket_lab import build_panel
 
         config = _basket_config(settings)
-        symbols = deep_universe_symbols(min_bars=config["universe_min_bars"])
+        symbols = basket_universe_symbols(settings)
         if not symbols:
             log.warning("basket tick: no universe symbols meet min_bars=%s", config["universe_min_bars"])
             return None

@@ -1500,6 +1500,22 @@ class DataManager:
                     if normalized:
                         symbols.add(normalized)
 
+                # PORT-LAYER-2: while the funding-carry basket is enabled, its
+                # WHOLE ranking universe needs keepalive, not just held legs —
+                # the tick ranks every universe symbol, and a stale close/funding
+                # print silently disqualifies it (first real tick: 24/30 symbols
+                # stale, basket degraded to 3 of 5 legs per side).
+                try:
+                    from forven.basket_runtime import basket_enabled, basket_universe_symbols
+
+                    if basket_enabled():
+                        for sym in basket_universe_symbols():
+                            normalized = self._normalize_keepalive_symbol(sym, require_dataset=True)
+                            if normalized:
+                                symbols.add(normalized)
+                except Exception:
+                    log.debug("basket universe keepalive enroll failed", exc_info=True)
+
                 if include_recent_backtests:
                     # Recent backtest symbols are useful for lower-frequency bulk
                     # maintenance, but the OHLCV keep-alive should prioritize the
