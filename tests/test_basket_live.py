@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 
 from forven.db import get_db, kv_get, kv_set
-from forven import basket_live
 from forven.basket_live import (
     ARMING_KV_KEY,
     CEILING_ID,
