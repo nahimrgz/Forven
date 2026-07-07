@@ -124,6 +124,7 @@
 	}
 
 	async function loadAll() {
+		loading = true;
 		error = '';
 		try {
 			const [snap, list] = await Promise.all([

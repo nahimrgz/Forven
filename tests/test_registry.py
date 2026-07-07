@@ -261,6 +261,72 @@ def test_register_type_rejects_incompatible_constructor():
     assert "bad_ctor" not in registry_mod._TYPE_MAP
 
 
+def test_register_module_tolerant_falls_back_to_class_strategy_type_attr():
+    """A custom module that declares only ``class X(BaseStrategy): strategy_type = "..."``
+    (no module-level TYPE_NAME/STRATEGY_CLASS) must still register its runtime type.
+
+    ``strategy_type`` is the canonical BaseStrategy contract attribute; ``TYPE_NAME``
+    is the legacy module-level convention. Codegen that emits only the contract
+    attribute (e.g. cme_weekend_gap_mr_v2 / S00203) must not fall through the
+    registry unregistered — otherwise the harness reports "Unknown strategy type"
+    even though the file exists and imports cleanly.
+    """
+    import types
+
+    registry_mod.reset()
+
+    module = types.ModuleType("forven.strategies.custom._tolerant_probe")
+
+    class ClassAttrOnlyStrategy(BaseStrategy):
+        strategy_type = "class_attr_only_probe"
+
+        @property
+        def name(self) -> str:
+            return "Class Attr Only"
+
+        @property
+        def asset(self) -> str:
+            return "BTC"
+
+        @property
+        def default_params(self) -> dict:
+            return {}
+
+        def generate_signal(self, df: pd.DataFrame) -> Signal:
+            return Signal(price=float(df["close"].iloc[-1]) if not df.empty else 0.0)
+
+    ClassAttrOnlyStrategy.__module__ = module.__name__
+    module.ClassAttrOnlyStrategy = ClassAttrOnlyStrategy
+
+    registry_mod._register_module_type_tolerant(module)
+
+    assert "class_attr_only_probe" in registry_mod._TYPE_MAP
+    assert registry_mod._TYPE_MAP["class_attr_only_probe"] is ClassAttrOnlyStrategy
+
+
+def test_register_module_tolerant_ignores_unoverridden_abstract_strategy_type():
+    """The class-attr fallback must only fire on a concrete string ``strategy_type``.
+
+    A class that leaves ``strategy_type`` as the inherited abstract property exposes
+    a property object (not a str) on the class, and must NOT be registered under a
+    bogus key derived from that descriptor.
+    """
+    import types
+
+    registry_mod.reset()
+
+    module = types.ModuleType("forven.strategies.custom._abstract_probe")
+    AbstractStrategy.__module__ = module.__name__
+    module.AbstractProbe = AbstractStrategy
+
+    registry_mod._register_module_type_tolerant(module)
+
+    # AbstractStrategy exposes ``strategy_type`` as a property (descriptor) on the
+    # class, not a concrete str. The fallback must skip it entirely rather than
+    # coerce the descriptor's repr into a bogus type key — so nothing registers.
+    assert registry_mod._TYPE_MAP == {}
+
+
 def test_custom_catalog_marks_versioned_modules_archived():
     assert custom_strategy_status("rsi_momentum") == "active"
     assert custom_strategy_status("rsi_momentum_s00293") == "archived"

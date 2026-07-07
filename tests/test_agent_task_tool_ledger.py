@@ -62,6 +62,62 @@ def test_ledger_marks_artifact_tool_success(forven_db):
     assert trace[0]["ok"] is True
 
 
+def test_ledger_marks_write_file_success(forven_db):
+    """A successful write_file returns 'Appended to ...' / 'Wrote ...' — the ledger
+    must recognize that as success, not a false [FAILED] (BUG-139)."""
+    task_id = "T00130"
+    log_tool_call(
+        task_id,
+        agent_id="research-agent",
+        tool_name="write_file",
+        input_data={"path": "notes/x.md"},
+        output_summary="Appended to notes/x.md",
+        duration_ms=7,
+    )
+
+    text, trace = _build_tool_ledger(task_id)
+
+    assert "[ok] write_file" in text
+    assert "[FAILED]" not in text
+    assert trace[0]["ok"] is True
+
+
+def test_ledger_marks_write_file_transient_failure(forven_db):
+    """A transient FS error surfaces a distinct envelope and stays [FAILED]."""
+    task_id = "T00131"
+    log_tool_call(
+        task_id,
+        agent_id="research-agent",
+        tool_name="write_file",
+        input_data={"path": "notes/x.md"},
+        output_summary="FAILED (transient): could not write notes/x.md: disk full. Safe to retry.",
+        duration_ms=7,
+    )
+
+    text, trace = _build_tool_ledger(task_id)
+
+    assert "[FAILED] write_file" in text
+    assert trace[0]["ok"] is False
+
+
+def test_ledger_marks_write_file_rejection_as_failed(forven_db):
+    """A policy rejection is not a success — it must not show as [ok]."""
+    task_id = "T00132"
+    log_tool_call(
+        task_id,
+        agent_id="research-agent",
+        tool_name="write_file",
+        input_data={"path": "secrets.txt"},
+        output_summary="REJECTED: secrets.txt is not a writable path for the agent. Do not retry.",
+        duration_ms=3,
+    )
+
+    text, trace = _build_tool_ledger(task_id)
+
+    assert "[FAILED] write_file" in text
+    assert trace[0]["ok"] is False
+
+
 def test_ledger_warns_when_no_artifact_tools_ran(forven_db):
     """Read-only tools only => ledger flags unverified narrative claims."""
     task_id = "T00125"

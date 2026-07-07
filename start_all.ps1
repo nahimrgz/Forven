@@ -466,7 +466,16 @@ function Test-BotTokenConfigured {
 
 function Stop-StartedProcessIfRunning { param([System.Diagnostics.Process]$Process)
     if ($null -eq $Process) { return }
-    try { if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue } } catch {}
+    try { if ($Process.HasExited) { return } } catch { return }
+
+    # Kill the whole descendant tree, not just the root PID: npm.cmd/uvicorn wrap
+    # node/python child processes on Windows, and Stop-Process does not cascade
+    # to children the way POSIX signals to a process group would.
+    $descendants = @(Get-DescendantProcessIds -RootProcessIds @($Process.Id))
+    $allPids = @($descendants + $Process.Id | Select-Object -Unique | Sort-Object -Descending)
+    foreach ($procId in $allPids) {
+        try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch {}
+    }
 }
 
 function Get-PythonLockStatus {
@@ -1480,6 +1489,7 @@ try {
         Stop-StartedProcessIfRunning -Process $botProc
         Stop-StartedProcessIfRunning -Process $frontendProc
         Stop-StartedProcessIfRunning -Process $backendProc
+        Stop-OrphanPythonMultiprocessingProcesses
     } elseif ($startupCompleted) {
         # Startup already completed a deliberate non-watchdog path.
     } else {

@@ -47,6 +47,25 @@ def test_clean_strategy_passes():
     assert report.findings == []
 
 
+def test_hmmlearn_import_allowed():
+    """Operator decision (Opción A): novel-mechanism regime classifiers may use
+    hmmlearn. The HMM import must pass the guard."""
+    assert scan_source("from hmmlearn.hmm import GaussianHMM\n").ok is True
+    assert scan_source("import hmmlearn\n").ok is True
+
+
+def test_sklearn_mixture_still_allowed():
+    """scikit-learn was already allowlisted — GaussianMixture (the GMM regime
+    fallback) must keep passing."""
+    assert scan_source("from sklearn.mixture import GaussianMixture\n").ok is True
+
+
+def test_sklearn_externals_gadget_still_blocked():
+    """Widening the allowlist must NOT reopen the pre-blocked sklearn.externals
+    gadget (bundles joblib/pickle)."""
+    assert scan_source("from sklearn.externals import joblib\n").ok is False
+
+
 def test_import_os_blocked():
     report = scan_source("import os\n")
     assert report.ok is False

@@ -72,13 +72,30 @@ def _implausible_leg(leg: object, label: str) -> list[str]:
     sharpe = _to_float(leg.get("sharpe"))
     if sharpe is not None:
         if abs(sharpe) >= _RISK_RATIO_CLAMP - 0.01:
+            # A value pegged AT the +/-clamp means the raw Sharpe blew up on a
+            # near-zero return dispersion — an engine/data artifact, not a real
+            # metric, so it is quarantined out of promotion in EITHER direction.
+            # But only a POSITIVE peg is the look-ahead/leak fingerprint; a
+            # NEGATIVE peg is a degenerate, consistently-losing sample.
+            if sharpe > 0:
+                out.append(
+                    f"{label} Sharpe {sharpe:.2f} is pegged at the +{_RISK_RATIO_CLAMP:.0f} clamp "
+                    "-- near-certain look-ahead / data leak, not a real edge"
+                )
+            else:
+                out.append(
+                    f"{label} Sharpe {sharpe:.2f} is pegged at the -{_RISK_RATIO_CLAMP:.0f} clamp "
+                    "-- degenerate near-zero return dispersion, metric unreliable"
+                )
+        elif sharpe >= _MAX_PLAUSIBLE_SHARPE:
+            # An implausibly high POSITIVE Sharpe is the look-ahead/data-leak
+            # fingerprint (a uniform future-bar leak makes performance implausibly
+            # GOOD). A large NEGATIVE Sharpe below the clamp is a genuinely losing
+            # strategy (or a low-dispersion small sample) — a normal rejection the
+            # gates already handle, NOT a data-quality anomaly. Flagging it fired
+            # false "data leak" errors on ordinary losers (e.g. S00239 OOS -8.64).
             out.append(
-                f"{label} Sharpe {sharpe:.2f} is pegged at the +/-{_RISK_RATIO_CLAMP:.0f} clamp "
-                "-- near-certain look-ahead / data leak, not a real edge"
-            )
-        elif abs(sharpe) >= _MAX_PLAUSIBLE_SHARPE:
-            out.append(
-                f"{label} Sharpe {sharpe:.2f} is implausibly high (|Sharpe| >= {_MAX_PLAUSIBLE_SHARPE:g}) "
+                f"{label} Sharpe {sharpe:.2f} is implausibly high (Sharpe >= {_MAX_PLAUSIBLE_SHARPE:g}) "
                 "-- likely a data leak"
             )
     pf = _to_float(leg.get("profit_factor"))

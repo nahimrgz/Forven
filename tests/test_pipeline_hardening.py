@@ -2421,8 +2421,8 @@ def test_request_fix_reports_to_triage_queue_not_engineer(forven_db):
         context={"error": "FutureWarning/TypeError"},
     )
 
-    # Report-only: no approval id, status 'reported', routed to the operator triage queue.
-    assert first["approval_id"] == 0 and first["status"] == "reported"
+    # Report-only: no approval id key at all, status 'reported', routed to triage.
+    assert first.get("approval_id") is None and first["status"] == "reported"
     assert second["queue"] == "operator_triage"
 
     with get_db() as conn:

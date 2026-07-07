@@ -65,8 +65,17 @@ ALLOWED_IMPORTS: frozenset[str] = frozenset(
         "pandas",
         "numpy",
         "pandas_ta",
+        # Real module name behind the `pandas_ta` alias (see forven/__init__.py);
+        # allowed so a strategy written against the fork's own name also passes.
+        "pandas_ta_classic",
         "scipy",
         "sklearn",
+        # Regime-classifier libraries for novel-mechanism strategies (operator
+        # decision 2026-07-05, H00030 HMM family). hmmlearn ships a compiled
+        # _hmmc extension but exposes no fs/network/process primitive; its only
+        # transitive reach (sklearn/numpy/scipy) is already allowlisted, and the
+        # sklearn.externals pickle gadget stays denied via _DENY_SUBMODULES.
+        "hmmlearn",
         # Pure-computation stdlib — none of these expose a filesystem, network,
         # process, or dynamic-exec primitive.
         "math",

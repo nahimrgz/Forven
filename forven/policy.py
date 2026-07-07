@@ -52,7 +52,75 @@ DEFAULT_PIPELINE_CONFIG = {
         # robustness floor to 0: the composite robustness score is EARNED inside the
         # gauntlet (MC/jitter/WFA), so a non-zero floor at quick-screen time is a
         # catch-22 that empties the funnel. Strict preset restores 30 / 40.
+        #
+        # WINDOW-AWARE SCALING (2026-07-06 audit): "min_trades" used to be enforced
+        # as a pure ABSOLUTE count, independent of the backtest WINDOW (app setting
+        # `backtest_duration_days`, Settings > Lab, default 730d — see
+        # DEFAULT_BACKTEST_DURATION_DAYS in api_core.py). A selective low-frequency
+        # edge (say 1-2 trades/week) mathematically cannot reach 20 trades on a
+        # SHORT window — the absolute floor silently converted "short window" into
+        # "reject good strategies". Verified casualties (~/.forven/forven.db):
+        # S00014/S00221 (Sharpe 1.45, PF 2.01, DD 2.4%, 14 trades -> rejected),
+        # S00046 (Sharpe 1.85, PF 2.28, 18 trades -> rejected).
+        #
+        # Fix (_effective_min_trades_floor): the enforced floor now SCALES with
+        # the ACTUAL quick-screen window:
+        #
+        #   effective_min_trades = max(min(hard_min_trades_floor, min_trades),
+        #                              ceil(rate_per_30d * window_days / 30))
+        #
+        # `hard_min_trades_floor` is a SEPARATE, non-scaling knob: the absolute
+        # bedrock below which Sharpe/PF are NEVER statistically trustworthy,
+        # regardless of window. It guards against WINDOW-SCALING collapse only —
+        # clamped to the configured min_trades (the min() above) so an explicit
+        # low `min_trades` override keeps meaning what it always meant instead of
+        # being silently raised by a knob the operator never touched. `rate_per_30d` is either the explicit
+        # `min_trades_per_30d` knob below (0 = unset) or, when unset, DERIVED
+        # from whatever `min_trades` resolves to (this default of 20, a preset's
+        # 5/30, or a plain custom KV override) anchored at the CONSTANT default
+        # window (api_core.DEFAULT_BACKTEST_DURATION_DAYS = 730d):
+        #
+        #   rate_per_30d = min_trades / (DEFAULT_BACKTEST_DURATION_DAYS / 30)
+        #
+        # This is a DELIBERATE design choice over a decoupled default rate: this
+        # merge pipeline (_normalize_pipeline_config) deep-copies DEFAULT_PIPELINE_
+        # CONFIG and shallow-updates each section with whatever the caller passed,
+        # so a stored numeric default for min_trades_per_30d would ALWAYS be
+        # present after merge (whether or not the caller ever touched it) —
+        # there is no cheap way for the gate functions (which only ever see the
+        # fully-merged config) to tell "user left this alone" apart from "user
+        # explicitly chose the default value". Deriving the rate from `min_trades`
+        # instead sidesteps that ambiguity entirely: a plain `{"min_trades": 45}`
+        # KV override (or a relaxed/strict preset's 5/30) keeps meaning "N trades
+        # at the default window" and scales proportionally, with ZERO extra
+        # plumbing to distinguish explicit-vs-defaulted. Anchoring at the fixed
+        # 730d constant (not the live current global setting) guarantees the
+        # anchor point never silently shifts if an operator later edits their
+        # global default window elsewhere.
+        #
+        # By construction this keeps the DEFAULT case byte-for-byte unchanged:
+        # at window_days == 730 (the default), rate_per_30d * 730/30 == min_trades
+        # exactly (same number divided and re-multiplied), so
+        # effective_min_trades == min_trades == 20 — no existing behavior or test
+        # shifts (see test_min_trades_window_scaling.py).
+        #
+        # `min_trades <= 0` DISABLES the floor entirely (pre-existing operator
+        # semantics — see _effective_min_trades_floor docstring): it is NOT
+        # re-floored to hard_min_trades_floor. With min_trades_per_30d also
+        # unset, effective resolves to 0 (call sites' own guards/safety-floor
+        # clamps take over); with min_trades_per_30d > 0, the rate alone drives
+        # the effective floor.
         "min_trades": 20,
+        # Absolute statistical bedrock (see comment above) — independent of preset
+        # and window. Metrics below this many trades are NEVER trusted, no matter
+        # how short the backtest window is.
+        "hard_min_trades_floor": 10,
+        # Explicit trades-per-30-calendar-days rate. 0 (default) = "derive from
+        # min_trades at the default window" (see formula above). Set a positive
+        # value to decouple the scaling rate from `min_trades` entirely (e.g. to
+        # keep a strict `min_trades` gate at the default window while using a
+        # gentler/steeper scaling curve at other windows).
+        "min_trades_per_30d": 0,
         "min_robustness_score": 0,
         # Fitness-scorer scaling knobs (score_strategy). Previously hardcoded as
         # min_trades_limit=20 / min_pf_limit=1.3 — now wired so the fitness curve
@@ -85,7 +153,14 @@ DEFAULT_PIPELINE_CONFIG = {
         # Win-rate is OFF as a gauntlet hard gate by default (see quick_screen note);
         # flip on only if you specifically want a win-rate floor at this stage.
         "gauntlet_enforce_win_rate": False,
+        # WINDOW-AWARE SCALING: same _effective_min_trades_floor formula and
+        # backward-compat anchoring as quick_screen.min_trades above (see that
+        # comment block for the full derivation/justification). Applied at both
+        # gauntlet gate trade-count enforcement sites (the unconditional capital-
+        # gate floor and the Monte-Carlo baseline-sample floor).
         "min_trades": 20,
+        "hard_min_trades_floor": 10,
+        "min_trades_per_30d": 0,
         "min_sharpe": 0.1,
         # Hard IS-Sharpe sanity floor — was a hardcoded 0.3 auto-reject in
         # brain._gauntlet_entry_guardrails that no Settings knob could relax. Now
@@ -276,9 +351,14 @@ PIPELINE_PRESETS = {
         # a fully-materialized stored config, so omitting it would let a prior preset's
         # value (strict sets 0.2) survive a strict→relaxed switch, leaving "relaxed"
         # stricter than default on the IS-Sharpe axis.
-        "quick_screen": {"min_trades": 5, "min_robustness_score": 0, "min_profit_factor": 1.0, "min_is_sharpe": 0.0},
+        # hard_min_trades_floor drops to 5 alongside min_trades: the relaxed
+        # preset's whole point is a visibly-active funnel, and its historic floor
+        # was 5 — leaving the default bedrock (10) in place would make "relaxed"
+        # silently STRICTER than its own configured min_trades at every window.
+        "quick_screen": {"min_trades": 5, "hard_min_trades_floor": 5, "min_robustness_score": 0, "min_profit_factor": 1.0, "min_is_sharpe": 0.0},
         "gauntlet": {
             "min_trades": 5,
+            "hard_min_trades_floor": 5,
             "min_sharpe": 0.0,
             "hard_min_is_sharpe": 0.0,
             "min_robustness_score": 20,
@@ -2463,6 +2543,21 @@ def _extract_reason_code(reason_text: str) -> str:
     # them from feeding the repeated-failure counter that auto-archives losers.
     if "metrics available" in text:
         return "no_metrics_error"
+    # Data-availability precheck (forven.strategies.data_availability): the backtest
+    # was refused BEFORE it ran because a required OHLCV/funding/OI feed "could not
+    # be downloaded" or is "not available and cannot be auto-downloaded" — no verdict
+    # was ever computed. Without this branch the text fell through to the generic
+    # 'gate_reject' bucket, which IS counted by the repeated-failure auto-archive
+    # counter, silently archiving a strategy for a data outage it was never judged on.
+    if "could not be downloaded" in text or "not available and cannot be auto-downloaded" in text:
+        return "data_unavailable"
+    # Mirrors gauntlet.engine.drain_exhausted_blocked_steps' own reason_code
+    # ("retries_exhausted"): a transient infra/data block (db-lock, timeout,
+    # process-restart) burned its full retry budget and was drained to a terminal
+    # state to unstick the workflow -- explicitly stamped "NOT a merit verdict" at
+    # the step level. Same fall-through-to-gate_reject bug as data_unavailable above.
+    if "retries exhausted on a transient block" in text:
+        return "retries_exhausted"
     # Evidence-ABSENCE outcomes one stage later than no_metrics_error: the gauntlet
     # artifacts/tests have not been run or persisted YET (work queued, optimization in
     # flight, validation awaiting a re-run). These previously fell into wfa_reject via
@@ -2645,6 +2740,13 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # was undersized for the strategy's trade cadence. Re-runnable, says nothing
     # about edge quality (S06127 2026-07-06).
     "wfa_window_insufficient",
+    # Required data feed could not be fetched -- the backtest was refused before
+    # it ran (2026-07-06 audit). No verdict exists to judge.
+    "data_unavailable",
+    # Transient infra/data block drained after exhausting its retry budget
+    # (gauntlet.engine.drain_exhausted_blocked_steps) -- explicitly not a merit
+    # verdict at the step level (2026-07-06 audit).
+    "retries_exhausted",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -3328,6 +3430,147 @@ def _implausible_metrics_reason(metrics: dict, config: dict) -> str | None:
     return None
 
 
+def _load_quick_screen_step_metrics(strategy_id: str) -> dict:
+    """Fallback metrics source for the quick-screen gate (2026-07-06 audit).
+
+    ``run_quick_screen_gate`` (forven/gauntlet/tasks.py) only persists the
+    winning backtest metrics onto ``strategies.metrics`` via
+    ``_persist_quick_screen_winner`` when its best-of-N timeframe lookup finds a
+    usable ``backtest_results`` row. When it does not (no row yet / all rows
+    degenerate / lookup raised and was swallowed), a merit-failing gate result
+    (``{"status": "failed_gate", "message": ..., "metrics": {...}}``) is recorded
+    ONLY in ``gauntlet_steps.error_json`` (via ``block_step``) — ``strategies.metrics``
+    stays empty. A later re-check of this same gate (e.g.
+    ``routers.robustness._reconcile_stage_after_validation``) then reads the empty
+    strategies row and reports "No quick-screen metrics available" even though the
+    strategy WAS judged and failed on merit. Reading the latest persisted
+    quick_screen/quick_screen_gate step's output lets the gate recover the real
+    verdict instead of mislabeling it as an evidence-absence outcome.
+
+    Read-only (no writes) and best-effort: any failure here must fall back to the
+    caller's existing "no metrics" behavior, never raise.
+    """
+    try:
+        with get_db() as conn:
+            # "Latest" relies on store.create_or_get_workflow REUSING one workflow
+            # per (strategy_id, definition_version) and touching updated_at on each
+            # step (re)run — so the newest row here is the current verdict, not a
+            # stale one from an abandoned parallel workflow. If workflow creation
+            # ever stops being idempotent per strategy, scope this to the active
+            # workflow explicitly.
+            row = conn.execute(
+                """
+                SELECT st.error_json, st.output_json
+                FROM gauntlet_steps st
+                JOIN gauntlet_workflows w ON w.id = st.workflow_id
+                WHERE w.strategy_id = ?
+                  AND st.step_key IN ('quick_screen_gate', 'quick_screen')
+                ORDER BY datetime(COALESCE(st.completed_at, st.updated_at)) DESC, st.rowid DESC
+                LIMIT 1
+                """,
+                (strategy_id,),
+            ).fetchone()
+    except Exception:
+        return {}
+    if not row:
+        return {}
+    # error_json first: a merit-failing gate result's metrics live there (see
+    # docstring above); output_json covers a "passed" step whose metrics were
+    # never promoted onto the strategy row for some other reason.
+    for blob_key in ("error_json", "output_json"):
+        raw = row[blob_key]
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        # Defense in depth: engine.drain_exhausted_blocked_steps stamps
+        # ``merit: False`` on drained transient blocks precisely so downstream
+        # consumers never mistake them for a judged verdict. Today those payloads
+        # carry no ``metrics`` key, but that is an unenforced invariant — honor
+        # the flag so a future diagnostic metrics blob on a blocked payload can
+        # never be resurrected as a real quick-screen verdict.
+        if payload.get("merit") is False:
+            continue
+        step_metrics = payload.get("metrics")
+        if isinstance(step_metrics, dict) and step_metrics:
+            return step_metrics
+    return {}
+
+
+def _effective_min_trades_floor(
+    gate: dict, defaults: dict, window_days: float
+) -> tuple[int, float, int]:
+    """Resolve the WINDOW-SCALED min-trades floor for a quick_screen/gauntlet gate.
+
+    See the "WINDOW-AWARE SCALING" comment on quick_screen.min_trades in
+    DEFAULT_PIPELINE_CONFIG for the full derivation and backward-compat
+    justification. Formula:
+
+        effective = max(min(hard_min_trades_floor, min_trades),
+                        ceil(rate_per_30d * window_days / 30))
+
+    ``rate_per_30d`` is the explicit ``min_trades_per_30d`` knob when set
+    (> 0), otherwise DERIVED from ``min_trades`` anchored at the constant
+    default window (api_core.DEFAULT_BACKTEST_DURATION_DAYS) — so a plain
+    ``min_trades`` override (default 20, a relaxed/strict preset's 5/30, or a
+    custom KV value) keeps meaning "N trades at the default window" and scales
+    proportionally, instead of being silently superseded by a decoupled rate
+    knob that would otherwise always be present post-merge (see the comment
+    block above for why "was min_trades_per_30d explicitly set?" can't be
+    answered from the fully-merged config the gate functions receive).
+
+    ``min_trades <= 0`` DISABLES the absolute bedrock entirely (pre-existing
+    semantics an operator relies on to turn the floor off) — the bedrock's
+    ``min()`` clamp binds to 0 in that case, not to ``hard_min_trades_floor``.
+    Two outcomes follow: with no explicit ``min_trades_per_30d`` set either,
+    ``effective`` resolves to 0 (floor fully disabled; call sites' own
+    ``> 0`` guards / safety-floor clamps take over). With an explicit
+    ``min_trades_per_30d > 0``, the rate becomes the SOLE driver of
+    ``effective`` — the disabled absolute floor does not clamp it.
+
+    Returns ``(effective_floor, rate_per_30d, hard_floor)`` — the latter two
+    purely so callers can render a self-explanatory rejection reason
+    ("window-scaled: 8/30d over 56d, statistical floor 10").
+    """
+    # Local import (matches this module's existing pattern, e.g.
+    # _load_pipeline_settings) to avoid a module-level circular import with
+    # forven.api_core, which imports several forven.policy functions lazily.
+    from forven.api_core import DEFAULT_BACKTEST_DURATION_DAYS
+
+    min_trades_value = _coerce_float(gate.get("min_trades", defaults.get("min_trades", 20)), defaults.get("min_trades", 20))
+    hard_floor = int(
+        _coerce_float(
+            gate.get("hard_min_trades_floor", defaults.get("hard_min_trades_floor", 10)),
+            defaults.get("hard_min_trades_floor", 10),
+        )
+    )
+    explicit_rate = _coerce_float(gate.get("min_trades_per_30d", 0), 0.0)
+    if explicit_rate > 0:
+        rate_per_30d = explicit_rate
+    else:
+        anchor_days = max(float(DEFAULT_BACKTEST_DURATION_DAYS), 1.0)
+        rate_per_30d = min_trades_value / (anchor_days / 30.0)
+
+    window = max(float(window_days or 0.0), 0.0)
+    scaled_floor = math.ceil(rate_per_30d * (window / 30.0)) if rate_per_30d > 0 else 0
+    # The bedrock exists to stop WINDOW-SCALING from collapsing the floor into
+    # statistical meaninglessness — NOT to overrule an operator's explicit
+    # absolute choice. Clamp it to the configured min_trades so a deliberate
+    # `min_trades: 1` override (previously floored only by the safety_floors
+    # rail) is not silently raised to 10 by a knob the operator never touched.
+    # `min_trades <= 0` is the operator's explicit "disable the floor" signal
+    # (pre-existing semantics quick_screen/gauntlet call sites already guard
+    # for) — it must bind to 0, NOT to hard_floor, or a disabled floor gets
+    # silently re-enabled at the bedrock value.
+    binding_hard_floor = min(hard_floor, int(math.ceil(min_trades_value))) if min_trades_value > 0 else 0
+    effective = max(binding_hard_floor, int(scaled_floor))
+    return effective, rate_per_30d, hard_floor
+
+
 def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     """Step 1 -> Step 2 gate: cheap triage on return/dd/sharpe with S00552 guardrails.
 
@@ -3346,6 +3589,13 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
 
     metrics = _load_metrics_blob(row)
     if not metrics:
+        # Evidence-of-record for this strategy's quick-screen run may exist in the
+        # gauntlet step history even though strategies.metrics was never updated
+        # (see _load_quick_screen_step_metrics docstring) — check before declaring
+        # "no metrics available", which mislabels a real merit failure AND exempts
+        # it from the repeated-failure auto-archive counter.
+        metrics = _load_quick_screen_step_metrics(strategy_id)
+    if not metrics:
         return False, "No quick-screen metrics available"
 
     # Fast sanity check: reject strategies with zero trades (can't produce signals)
@@ -3355,14 +3605,31 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
     if total_trades == 0 and oos_trades == 0:
         return False, "Quick screen reject: zero trades — strategy produces no signals in this market window"
 
-    # Launch hardening: enforce the wired quick_screen.min_trades floor. The
-    # gate previously rejected ONLY the zero/zero case, so the min_trades knob
-    # (default 30) was dead code and a 5-trade luck strategy advanced to the
-    # gauntlet — Sharpe/PF/win-rate are statistically meaningless below ~30
-    # trades. Use the LARGER of the IS/OOS counts so a strategy with a healthy
-    # primary backtest still passes when only the OOS slice is thin.
-    min_trades_floor = int(
-        _coerce_float(gate.get("min_trades", _qs_defaults["min_trades"]), _qs_defaults["min_trades"])
+    # Launch hardening + WINDOW-AWARE SCALING (2026-07-06 audit): enforce the
+    # wired quick_screen.min_trades floor. The gate previously rejected ONLY the
+    # zero/zero case, so the min_trades knob (default 30) was dead code and a
+    # 5-trade luck strategy advanced to the gauntlet — Sharpe/PF/win-rate are
+    # statistically meaningless below ~30 trades. Use the LARGER of the IS/OOS
+    # counts so a strategy with a healthy primary backtest still passes when
+    # only the OOS slice is thin.
+    #
+    # The floor itself SCALES with the actual quick-screen backtest window
+    # instead of the pure absolute count that used to reject good short-window
+    # strategies outright (see the "WINDOW-AWARE SCALING" comment on
+    # quick_screen.min_trades in DEFAULT_PIPELINE_CONFIG, and
+    # _effective_min_trades_floor, for the full formula/derivation).
+    #
+    # CAVEAT: this reads the CURRENT quick_screen_duration_days/backtest_duration_days
+    # setting, not necessarily the window this specific (possibly historical)
+    # backtest actually ran under — the metrics blob carries no persisted
+    # start/end/window field to reconstruct the true historical window. Every
+    # other knob this gate reads (min_profit_factor, min_robustness_score, ...)
+    # shares this same "current config at verdict time" limitation.
+    from forven.api_core import stage_backtest_duration_days
+
+    window_days = stage_backtest_duration_days("quick_screen")
+    min_trades_floor, _qs_rate_per_30d, _qs_hard_floor = _effective_min_trades_floor(
+        gate, _qs_defaults, window_days
     )
     # The persisted top-level total_trades is the OOS-flattened count (the
     # canonical backtest blob writes top-level fields from the OOS slice), so
@@ -3374,8 +3641,9 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
     effective_trades = max(total_trades, oos_trades, is_trades)
     if min_trades_floor > 0 and effective_trades < min_trades_floor:
         return False, (
-            f"Quick screen reject: {effective_trades} trades < {min_trades_floor} minimum "
-            f"(metrics statistically meaningless below the floor)"
+            f"Quick screen reject: {effective_trades} trades < {min_trades_floor} effective minimum "
+            f"(window-scaled: {_qs_rate_per_30d:.2g}/30d over {window_days:.0f}d, "
+            f"statistical floor {_qs_hard_floor})"
         )
 
     # === S00552 GUARDRAILS (Hard Gates for Gauntlet Admission) ===
@@ -3739,10 +4007,18 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     # (default 3) so a relaxed gauntlet.min_trades config cannot soften it below that
     # operator-set rail. (The old immutable 30 is now a low, tunable "achievable paper"
     # floor — entry to paper risks no real capital.)
-    sample_min_trades = max(
-        int(_coerce_float(gate.get("min_trades", floors["min_trades"]), floors["min_trades"])),
-        floors["min_trades"],
+    # WINDOW-AWARE SCALING (2026-07-06 audit): same _effective_min_trades_floor
+    # formula and anchoring as the quick_screen gate (see the "WINDOW-AWARE
+    # SCALING" comment on quick_screen.min_trades in DEFAULT_PIPELINE_CONFIG).
+    # The gauntlet optimize/confirm runs use the "confirmation" stage window.
+    # The safety_floors.min_trades operator rail still clamps from below.
+    from forven.api_core import stage_backtest_duration_days
+
+    _g_window_days = stage_backtest_duration_days("confirmation")
+    _g_effective_floor, _g_rate_per_30d, _g_hard_floor = _effective_min_trades_floor(
+        gate, DEFAULT_PIPELINE_CONFIG["gauntlet"], _g_window_days
     )
+    sample_min_trades = max(_g_effective_floor, floors["min_trades"])
     sample_trades = _resolve_full_sample_trade_count(metrics)
     if sample_trades is None:
         return False, (
@@ -3751,8 +4027,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
         )
     if int(sample_trades) < sample_min_trades:
         return False, (
-            f"Paper gate reject: {int(sample_trades)} trades < {sample_min_trades} minimum "
-            f"(insufficient sample for capital allocation)"
+            f"Paper gate reject: {int(sample_trades)} trades < {sample_min_trades} effective minimum "
+            f"(window-scaled: {_g_rate_per_30d:.2g}/30d over {_g_window_days:.0f}d, "
+            f"statistical floor {_g_hard_floor}; insufficient sample for capital allocation)"
         )
 
     min_return = float(gate.get("min_total_return_pct", 0.0))
@@ -3902,7 +4179,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     # percentile *calibration band* below stays gated behind required_tests.
     if mc_payload:
         mc_trades = mc_payload.get("n_trades", mc_payload.get("trade_count", mc_payload.get("total_trades")))
-        mc_min_trades = max(int(gate.get("min_trades", DEFAULT_PIPELINE_CONFIG["gauntlet"]["min_trades"]) or 1), floors["min_trades"])  # F2 floor
+        # F2 floor — same window-scaled effective floor as the capital gate above
+        # (computed once from the same gate config + confirmation window).
+        mc_min_trades = max(_g_effective_floor, floors["min_trades"])
         if mc_trades is not None and int(float(mc_trades or 0)) < mc_min_trades:
             return False, (
                 f"S00552 REJECT: Monte Carlo baseline has {int(float(mc_trades or 0))} trades, "

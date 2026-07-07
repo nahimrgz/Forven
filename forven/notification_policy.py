@@ -181,6 +181,13 @@ def resolve_notification_policy(
             send_to_discord=bool(prefs.get("risk_critical_to_discord", True)),
             cooldown_seconds=300,
         )
+    elif event_type == "bug_report":
+        policy.update(
+            delivery_mode="discord_immediate",
+            channel_name=channel_name or "ops",
+            send_to_discord=bool(prefs.get("agent_failure_to_discord", True)),
+            cooldown_seconds=3600,
+        )
     elif event_type == "brain_response":
         send_to_discord = bool(prefs.get("brain_response_to_discord", True)) and bool(channel_id or channel_name)
         policy.update(

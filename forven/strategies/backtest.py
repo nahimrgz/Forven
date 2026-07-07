@@ -776,38 +776,16 @@ def _is_backtest_risk_control_enabled(value: object) -> bool:
 
 
 def validate_backtest_risk_controls(
-
-
     params: dict | None,
-
-
     *,
-
-
     extra_controls: dict | None = None,
-
-
 ) -> str | None:
-
-
     controls: dict[str, object] = {}
-
-
     if isinstance(params, dict):
-
-
         controls.update(params)
-
-
     if isinstance(extra_controls, dict):
-
-
         for key, value in extra_controls.items():
-
-
             if key not in controls or controls.get(key) is None:
-
-
                 controls[key] = value
 
     # RISK-PARITY-1: a field carried in the nested execution_profile IS enforced
@@ -823,26 +801,23 @@ def validate_backtest_risk_controls(
             if _is_backtest_risk_control_enabled(profile.get(field))
         }
 
+    ignored_fields = set(profile_covered)
+    if isinstance(extra_controls, dict):
+        for field in HONORED_EXECUTION_CONTROL_FIELDS:
+            if extra_controls.get(field) is not None:
+                ignored_fields.add(field)
+
+    if "risk_per_trade" in ignored_fields:
+        ignored_fields.add("risk_pct")
 
     enabled_fields = [
-
-
         field_name
-
-
         for field_name in _UNSUPPORTED_BACKTEST_RISK_FIELDS.values()
-
-
-        if field_name not in profile_covered
+        if field_name not in ignored_fields
         and _is_backtest_risk_control_enabled(controls.get(field_name))
-
-
     ]
 
-
     if not enabled_fields:
-
-
         return None
 
 
@@ -999,6 +974,23 @@ def resolve_backtest_trade_mode(
         params=params,
         strategy_obj=strategy_obj,
     )
+
+    # Honor a strategy's DECLARED bidirectional capability by default. A strategy
+    # that emits a symmetric 4-series/DirectionalSignals payload and declares
+    # 'both' support was silently degraded to long_only whenever the caller passed
+    # no explicit trade_mode, no allow_shorting and no params.trade_mode — dropping
+    # its short legs (a symmetric strategy could go from 20 trades to 0). Upgrade
+    # ONLY to 'both', which always preserves the long leg, so a strategy that is
+    # merely mirror-short-safe (declares short_only but not 'both') stays long_only.
+    if (
+        explicit_mode is None
+        and not allow_shorting
+        and resolved == "long_only"
+        and _normalize_trade_mode_value((params or {}).get("trade_mode")) is None
+        and "both" in supported
+    ):
+        resolved = "both"
+
     if resolved == "both" and "both" not in supported:
         if explicit_mode is None and allow_shorting and "short_only" in supported:
             resolved = "short_only"
@@ -1047,68 +1039,27 @@ def expand_strategy_trade_modes(
 
 
 def _validate_backtest_execution_parity(
-
-
     strategy_type: str | None,
-
-
     params: dict | None,
-
-
     *,
-
-
     allow_uncertified: bool = False,
-
-
+    extra_controls: dict | None = None,
 ) -> tuple[dict, str | None, str | None]:
-
-
     """Returns (canonical_params, blocking_error, risk_warning)."""
-
-
     from forven.strategies.certification import EXECUTION_CERTIFIED_FAMILIES
 
-
-
-
-
     certification = certify_execution_strategy(strategy_type, params)
-
-
     certification_error = certification.format_error(context="backtest")
-
-
     if certification_error and allow_uncertified:
-
-
         normalized = str(strategy_type or "").strip().lower()
-
-
         family_unknown = normalized and normalized not in EXECUTION_CERTIFIED_FAMILIES
-
-
         if family_unknown and not certification.unsupported_rule_blobs and not certification.param_validation_errors:
-
-
             passthrough_params = dict(params) if isinstance(params, dict) else dict(certification.canonical_params)
-
-
-            risk_warning = validate_backtest_risk_controls(passthrough_params)
-
-
+            risk_warning = validate_backtest_risk_controls(passthrough_params, extra_controls=extra_controls)
             return passthrough_params, None, risk_warning
-
-
     if certification_error:
-
-
         return certification.canonical_params, certification_error, None
-
-
-    risk_warning = validate_backtest_risk_controls(certification.canonical_params)
-
-
+    risk_warning = validate_backtest_risk_controls(certification.canonical_params, extra_controls=extra_controls)
     return certification.canonical_params, None, risk_warning
 
 
@@ -1688,7 +1639,14 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 new_sharpe = float(metrics.get("sharpe") or metrics.get("sharpe_ratio") or 0)
                 existing_degenerate = is_degenerate_backtest_metrics(existing_metrics)
                 new_degenerate = is_degenerate_backtest_metrics(metrics)
-                keep_existing = (
+                # The best-of rule only ever PROTECTS honest stored metrics from a
+                # worse/degenerate rerun. With no stored metrics there is nothing to
+                # protect, so always take the new run — otherwise a fresh strategy
+                # whose first backtest reports flat (no in_sample block) metrics gets
+                # classified "degenerate", keeps its empty {} blob, and can never
+                # promote out of quick_screen.
+                has_existing = bool(existing_metrics)
+                keep_existing = has_existing and (
                     (new_degenerate and not existing_degenerate)
                     or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
                 )
@@ -7369,7 +7327,18 @@ def run_strategy_execution(
         # in this process). runtime_params (from the params ARG) is used, so a proxy
         # object with no real params attr still ships the right params.
         from forven.sandbox.strategy_worker import compute_directional_signals_isolated
-        _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        # The worker resolves the class by the key it was REGISTERED under (module
+        # TYPE_NAME / archived name / class strategy_type), not by the class's semantic
+        # ``strategy_type`` label — which can differ from its registration key (e.g.
+        # AdxRegimeComposite registers as 'adx_regime_composite' but declares
+        # strategy_type='composite'). Sending the semantic label failed isolated
+        # execution with "unknown strategy type". Prefer the caller-provided runtime
+        # key; only a sandbox-only proxy (whose class is never in this process) carries
+        # the resolvable namespaced runtime type on ``strategy_type`` itself.
+        if getattr(strategy_obj, "sandbox_only", False):
+            _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        else:
+            _iso_type = strategy_type or getattr(strategy_obj, "strategy_type", None)
         vectorized = compute_directional_signals_isolated(
             df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
             trade_mode=trade_mode, default_direction=default_direction,
@@ -8039,17 +8008,10 @@ def backtest_strategy(
 
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
-
         original_strategy_type,
-
-
         params,
-
-
         allow_uncertified=True,
-
-
+        extra_controls=execution_controls,
     )
 
 
@@ -10416,17 +10378,10 @@ def walk_forward(
 
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
-
         original_strategy_type,
-
-
         params,
-
-
         allow_uncertified=True,
-
-
+        extra_controls=execution_controls,
     )
 
 

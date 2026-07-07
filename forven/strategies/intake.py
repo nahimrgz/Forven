@@ -22,6 +22,17 @@ log = logging.getLogger("forven.strategies.intake")
 _BANNED_IMPORT_ROOTS: frozenset[str] = frozenset({"ta"})
 
 
+# Appended to instantiation failures so an agent that overrode __init__ with the
+# wrong signature (the common "takes 2 positional but 3 given" error) is told the
+# actual constructor contract instead of a bare TypeError.
+_CTOR_HINT = (
+    " Custom strategies must NOT define their own __init__ — inherit BaseStrategy's "
+    "__init__(self, strategy_id, params) and put tunables in default_params. If you "
+    "must override, use "
+    "'def __init__(self, strategy_id, params=None): super().__init__(strategy_id, params)'."
+)
+
+
 # Supported intervals for the STORED strategy timeframe. A declared "_timeframe"
 # outside this set (typo / no-data interval) falls back to "1h" so it can never
 # wedge the gauntlet on an "unsupported interval" error.
@@ -306,7 +317,7 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
         except Exception as exc:
             report.errors.append(IntakeError(
                 module_name=modname,
-                error=f"Could not instantiate: {exc}",
+                error=f"Could not instantiate: {exc}.{_CTOR_HINT}",
                 file_name=file_name,
             ))
             continue
@@ -595,7 +606,7 @@ def register_custom_strategy_file(
         default_params = probe.default_params
         asset = probe.asset if hasattr(probe, "asset") else "BTC"
     except Exception as exc:
-        raise ValueError(f"Could not instantiate {file_name}: {exc}") from exc
+        raise ValueError(f"Could not instantiate {file_name}: {exc}.{_CTOR_HINT}") from exc
 
     cert = certify_execution_strategy(type_name, default_params)
     certified = cert.certified
