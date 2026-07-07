@@ -102,6 +102,13 @@ DEFAULT_PIPELINE_CONFIG = {
         # exactly (same number divided and re-multiplied), so
         # effective_min_trades == min_trades == 20 — no existing behavior or test
         # shifts (see test_min_trades_window_scaling.py).
+        #
+        # `min_trades <= 0` DISABLES the floor entirely (pre-existing operator
+        # semantics — see _effective_min_trades_floor docstring): it is NOT
+        # re-floored to hard_min_trades_floor. With min_trades_per_30d also
+        # unset, effective resolves to 0 (call sites' own guards/safety-floor
+        # clamps take over); with min_trades_per_30d > 0, the rate alone drives
+        # the effective floor.
         "min_trades": 20,
         # Absolute statistical bedrock (see comment above) — independent of preset
         # and window. Metrics below this many trades are NEVER trusted, no matter
@@ -3373,6 +3380,15 @@ def _effective_min_trades_floor(
     block above for why "was min_trades_per_30d explicitly set?" can't be
     answered from the fully-merged config the gate functions receive).
 
+    ``min_trades <= 0`` DISABLES the absolute bedrock entirely (pre-existing
+    semantics an operator relies on to turn the floor off) — the bedrock's
+    ``min()`` clamp binds to 0 in that case, not to ``hard_min_trades_floor``.
+    Two outcomes follow: with no explicit ``min_trades_per_30d`` set either,
+    ``effective`` resolves to 0 (floor fully disabled; call sites' own
+    ``> 0`` guards / safety-floor clamps take over). With an explicit
+    ``min_trades_per_30d > 0``, the rate becomes the SOLE driver of
+    ``effective`` — the disabled absolute floor does not clamp it.
+
     Returns ``(effective_floor, rate_per_30d, hard_floor)`` — the latter two
     purely so callers can render a self-explanatory rejection reason
     ("window-scaled: 8/30d over 56d, statistical floor 10").
@@ -3403,7 +3419,11 @@ def _effective_min_trades_floor(
     # absolute choice. Clamp it to the configured min_trades so a deliberate
     # `min_trades: 1` override (previously floored only by the safety_floors
     # rail) is not silently raised to 10 by a knob the operator never touched.
-    binding_hard_floor = min(hard_floor, int(math.ceil(min_trades_value))) if min_trades_value > 0 else hard_floor
+    # `min_trades <= 0` is the operator's explicit "disable the floor" signal
+    # (pre-existing semantics quick_screen/gauntlet call sites already guard
+    # for) — it must bind to 0, NOT to hard_floor, or a disabled floor gets
+    # silently re-enabled at the bedrock value.
+    binding_hard_floor = min(hard_floor, int(math.ceil(min_trades_value))) if min_trades_value > 0 else 0
     effective = max(binding_hard_floor, int(scaled_floor))
     return effective, rate_per_30d, hard_floor
 

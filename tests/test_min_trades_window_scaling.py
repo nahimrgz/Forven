@@ -334,6 +334,51 @@ def test_gauntlet_gate_rejects_short_of_scaled_floor_at_short_window(forven_db):
     assert "minimum" in reason.lower()
 
 
+def test_min_trades_zero_disables_floor_when_no_rate_set():
+    """An explicit `min_trades: 0` (with no min_trades_per_30d) must DISABLE the
+    floor entirely — pre-existing semantics that quick_screen's `if
+    min_trades_floor > 0` guard and the gauntlet's `max(0, safety_floors)`
+    clamp both rely on. Regression: a min_trades=0 operator override must not
+    be silently re-floored to hard_min_trades_floor (10)."""
+    defaults = policy.DEFAULT_PIPELINE_CONFIG["quick_screen"]
+    gate = dict(defaults)
+    gate["min_trades"] = 0
+
+    effective_default, _, _ = policy._effective_min_trades_floor(gate, defaults, window_days=730)
+    assert effective_default == 0
+
+    effective_short, _, _ = policy._effective_min_trades_floor(gate, defaults, window_days=7)
+    assert effective_short == 0
+
+
+def test_min_trades_zero_with_explicit_rate_uses_rate_only():
+    """With min_trades disabled (0) but an explicit min_trades_per_30d set, the
+    rate is the SOLE driver — the disabled absolute floor must not clamp it."""
+    defaults = policy.DEFAULT_PIPELINE_CONFIG["quick_screen"]
+    gate = dict(defaults)
+    gate["min_trades"] = 0
+    gate["min_trades_per_30d"] = 8
+
+    effective, rate, _ = policy._effective_min_trades_floor(gate, defaults, window_days=56)
+    assert rate == 8
+    assert effective == 15  # ceil(8 * 56/30) = ceil(14.93) = 15
+
+
+def test_quick_screen_gate_min_trades_zero_disables_floor_end_to_end(forven_db):
+    """End-to-end: quick_screen.min_trades=0 must let a thin (5-trade) sample
+    pass the trade-count check — it may still fail LATER, unrelated gates,
+    but must never be rejected for trade count."""
+    strategy_id = "s-min-trades-zero-e2e"
+    _insert_strategy(strategy_id, metrics=_qs_metrics(5))
+    config = policy.load_pipeline_config()
+    config["quick_screen"]["min_trades"] = 0
+
+    passed, reason = policy._evaluate_quick_screen_gate(strategy_id, config)
+
+    if not passed:
+        assert "trades" not in reason.lower(), reason
+
+
 def test_gauntlet_gate_passes_reduced_trades_at_short_window(forven_db):
     kv_set("forven:settings", {"confirmation_duration_days": 30})
     strategy_id = "s-gauntlet-short-window-pass"
