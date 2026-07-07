@@ -29,12 +29,33 @@ def get_testnet_harness_last():
     return get_last_harness_report()
 
 
+# PORT-GATE-1: /api/portfolio/enabled is the ONLY route that exists while the
+# layer's master switch is off — the frontend uses it to decide whether to show
+# the Portfolio nav entry and settings tab at all. Everything else 404s so the
+# dark feature is indistinguishable from an absent one.
+def _require_portfolio_layer() -> None:
+    from fastapi import HTTPException
+
+    from forven.portfolio_allocator import portfolio_layer_enabled
+
+    if not portfolio_layer_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.get("/api/portfolio/enabled")
+def get_portfolio_layer_enabled():
+    from forven.portfolio_allocator import portfolio_layer_enabled
+
+    return {"enabled": portfolio_layer_enabled()}
+
+
 # PORT-LAYER-1: measured-risk portfolio allocation (weights, book vol, virtual
 # book). GET reads the persisted hourly snapshot; POST recomputes on demand
 # (force=True so operators can preview while the allocator flag is still off —
 # the live sizing hook independently requires both flags).
 @router.get("/api/portfolio/allocation")
 def get_portfolio_allocation():
+    _require_portfolio_layer()
     from forven.portfolio_allocator import allocator_enabled, allocator_live_enabled, get_allocation_snapshot
 
     return {
@@ -47,6 +68,7 @@ def get_portfolio_allocation():
 
 @router.post("/api/portfolio/allocation/refresh")
 def post_portfolio_allocation_refresh():
+    _require_portfolio_layer()
     from forven.portfolio_allocator import refresh_portfolio_allocation
 
     snapshot = refresh_portfolio_allocation(force=True)
@@ -58,6 +80,7 @@ def post_portfolio_allocation_refresh():
 # threadpool, never the request loop); POST /reset clears the paper book.
 @router.get("/api/portfolio/basket")
 def get_portfolio_basket():
+    _require_portfolio_layer()
     from forven.basket_runtime import basket_summary
 
     return {"ok": True, **basket_summary()}
@@ -65,6 +88,7 @@ def get_portfolio_basket():
 
 @router.post("/api/portfolio/basket/tick")
 def post_portfolio_basket_tick():
+    _require_portfolio_layer()
     from forven.basket_runtime import run_basket_tick
 
     report = run_basket_tick(force=True)
@@ -73,6 +97,7 @@ def post_portfolio_basket_tick():
 
 @router.post("/api/portfolio/basket/reset")
 def post_portfolio_basket_reset(body: ConfirmBody):
+    _require_portfolio_layer()
     from forven.basket_runtime import reset_basket_state
 
     return {"ok": reset_basket_state()}

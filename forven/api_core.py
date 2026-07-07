@@ -2674,6 +2674,12 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
                 payload.get("portfolio_allocator_live"),
                 bool(updates.get("portfolio_allocator_live", False)),
             )
+        # PORT-GATE-1: master switch for the whole portfolio layer.
+        if "portfolio_layer_enabled" in payload:
+            updates["portfolio_layer_enabled"] = _coerce_bool(
+                payload.get("portfolio_layer_enabled"),
+                bool(updates.get("portfolio_layer_enabled", False)),
+            )
         # PORT-LAYER-2 toggle (forven.basket_runtime).
         if "basket_funding_carry_enabled" in payload:
             updates["basket_funding_carry_enabled"] = _coerce_bool(

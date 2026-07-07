@@ -83,16 +83,30 @@ def _load_settings() -> dict:
 
 def allocator_enabled(settings: dict | None = None) -> bool:
     settings = settings if settings is not None else _load_settings()
-    return str(settings.get("portfolio_allocator_enabled", False)).strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    return portfolio_layer_enabled(settings) and _flag(settings, "portfolio_allocator_enabled")
 
 
 def allocator_live_enabled(settings: dict | None = None) -> bool:
     settings = settings if settings is not None else _load_settings()
-    return str(settings.get("portfolio_allocator_live", False)).strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    return portfolio_layer_enabled(settings) and _flag(settings, "portfolio_allocator_live")
+
+
+def _flag(settings: dict, key: str) -> bool:
+    return str(settings.get(key, False)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def portfolio_layer_enabled(settings: dict | None = None) -> bool:
+    """PORT-GATE-1: the master switch for the ENTIRE portfolio layer.
+
+    Default OFF — the layer ships dark. When off: the allocator and basket
+    no-op regardless of their own toggles, /api/portfolio/* routes 404, the
+    scheduler does not seed the layer's jobs, and the frontend hides the
+    sidebar entry and settings tab. One flag makes the whole feature invisible
+    to anyone who hasn't deliberately enabled it (Settings → System →
+    Experimental features).
+    """
+    settings = settings if settings is not None else _load_settings()
+    return _flag(settings, "portfolio_layer_enabled")
 
 
 # --------------------------------------------------------------------- cohort

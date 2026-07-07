@@ -3,6 +3,7 @@
 	import {
 		getPortfolioAllocation,
 		getPortfolioBasket,
+		getPortfolioLayerEnabled,
 		refreshPortfolioAllocation,
 		resetPortfolioBasket,
 		tickPortfolioBasket,
@@ -25,8 +26,17 @@
 	let confirmingReset = false;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
+	// PORT-GATE-1: while the master switch is off, every other portfolio route
+	// 404s — show the enable pointer instead of an error wall.
+	let layerEnabled: boolean | null = null;
+
 	async function load() {
 		try {
+			layerEnabled = await getPortfolioLayerEnabled();
+			if (!layerEnabled) {
+				loading = false;
+				return;
+			}
 			const [b, a] = await Promise.all([getPortfolioBasket(), getPortfolioAllocation()]);
 			basket = b;
 			allocation = a;
@@ -177,6 +187,15 @@
 
 	{#if loading}
 		<LoadingState message="Loading portfolio…" />
+	{:else if layerEnabled === false}
+		<div class="border border-[#222] bg-[#050505] p-6 text-center space-y-2">
+			<div class="text-sm font-bold uppercase tracking-wider text-[#888]">Portfolio layer is disabled</div>
+			<p class="text-xs text-[#666]">
+				Enable it under
+				<a href="/settings#system/risk.portfolio_layer_enabled" class="underline text-[#888] hover:text-white">Settings → System → Experimental features</a>
+				to activate the allocator, the basket, and this page.
+			</p>
+		</div>
 	{:else}
 		<!-- ─────────────────────────── funding-carry basket ─────────────────────────── -->
 		<div class="border border-[#222] bg-[#050505] p-4 space-y-4">

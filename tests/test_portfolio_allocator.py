@@ -60,7 +60,11 @@ def _seed_history(sid: str, *, days: int = 20, pnl: float = 0.01, start_day: int
 
 
 def _enable(settings_extra: dict | None = None) -> None:
-    kv_set("forven:settings", {"portfolio_allocator_enabled": True, **(settings_extra or {})})
+    kv_set("forven:settings", {
+        "portfolio_layer_enabled": True,  # PORT-GATE-1 master switch
+        "portfolio_allocator_enabled": True,
+        **(settings_extra or {}),
+    })
 
 
 # -------------------------------------------------------------------- math
@@ -199,6 +203,7 @@ def test_live_multiplier_applies_when_enabled(forven_db):
 
 def test_live_multiplier_neutral_without_snapshot(forven_db):
     kv_set("forven:settings", {
+        "portfolio_layer_enabled": True,
         "portfolio_allocator_enabled": True, "portfolio_allocator_live": True,
     })
     assert live_risk_multiplier("S-A") == 1.0
@@ -271,3 +276,67 @@ def test_live_open_scaled_by_allocation_multiplier(forven_db, monkeypatch):
     assert "LIVE-KERNEL-OPEN" in msg
     expected_units = 10000.0 * 2.0 * min(0.5 * multiplier, 1.0) / 100.0
     assert abs(calls["size"] - expected_units) < 1e-4
+
+
+# ------------------------------------------------------------- PORT-GATE-1
+
+
+def test_master_gate_overrides_own_toggles(forven_db):
+    from forven.portfolio_allocator import (
+        allocator_enabled,
+        allocator_live_enabled,
+        portfolio_layer_enabled,
+    )
+    from forven.basket_runtime import basket_enabled
+
+    # Own toggles on, master OFF: everything reads disabled.
+    kv_set("forven:settings", {
+        "portfolio_allocator_enabled": True,
+        "portfolio_allocator_live": True,
+        "basket_funding_carry_enabled": True,
+    })
+    assert not portfolio_layer_enabled()
+    assert not allocator_enabled()
+    assert not allocator_live_enabled()
+    assert not basket_enabled()
+
+    # Master ON: own toggles take effect.
+    kv_set("forven:settings", {
+        "portfolio_layer_enabled": True,
+        "portfolio_allocator_enabled": True,
+        "portfolio_allocator_live": True,
+        "basket_funding_carry_enabled": True,
+    })
+    assert portfolio_layer_enabled()
+    assert allocator_enabled() and allocator_live_enabled() and basket_enabled()
+
+
+def test_master_gate_404s_routes(forven_db):
+    from fastapi import HTTPException
+
+    import pytest as _pytest
+
+    from forven.routers.ops import get_portfolio_allocation, get_portfolio_basket, get_portfolio_layer_enabled
+
+    kv_set("forven:settings", {})
+    assert get_portfolio_layer_enabled() == {"enabled": False}
+    with _pytest.raises(HTTPException) as e1:
+        get_portfolio_allocation()
+    assert e1.value.status_code == 404
+    with _pytest.raises(HTTPException) as e2:
+        get_portfolio_basket()
+    assert e2.value.status_code == 404
+
+    kv_set("forven:settings", {"portfolio_layer_enabled": True})
+    assert get_portfolio_layer_enabled() == {"enabled": True}
+    assert get_portfolio_allocation()["ok"] is True
+
+
+def test_master_gate_controls_job_seeding(forven_db):
+    from forven import scheduler as sched
+
+    kv_set("forven:settings", {})
+    assert "forven-portfolio-allocation" not in sched._default_job_ids()
+    kv_set("forven:settings", {"portfolio_layer_enabled": True})
+    assert "forven-portfolio-allocation" in sched._default_job_ids()
+    assert "forven-basket-funding-carry" in sched._default_job_ids()

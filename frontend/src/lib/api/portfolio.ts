@@ -94,6 +94,16 @@ export interface BasketSummary {
 	equity_curve?: Array<{ t: string; equity: number }>;
 }
 
+export async function getPortfolioLayerEnabled(): Promise<boolean> {
+	// PORT-GATE-1: the only portfolio route that exists while the layer is off.
+	try {
+		const res = await fetchApi<{ enabled: boolean }>('/api/portfolio/enabled');
+		return Boolean(res?.enabled);
+	} catch {
+		return false;
+	}
+}
+
 export async function getPortfolioAllocation(): Promise<PortfolioAllocationResponse> {
 	return fetchApi('/api/portfolio/allocation');
 }

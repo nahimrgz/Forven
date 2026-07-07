@@ -179,9 +179,9 @@ def test_persisted_flow_and_summary(forven_db, monkeypatch):
     from forven import basket_runtime
     from forven.db import kv_set
 
-    kv_set("forven:settings", {"basket_funding_carry_enabled": True})
+    kv_set("forven:settings", {"portfolio_layer_enabled": True, "basket_funding_carry_enabled": True})
     panel = _panel(end=pd.Timestamp.now(tz="UTC").floor("h"))
-    monkeypatch.setattr(basket_runtime, "_load_settings", lambda: {"basket_funding_carry_enabled": True})
+    monkeypatch.setattr(basket_runtime, "_load_settings", lambda: {"portfolio_layer_enabled": True, "basket_funding_carry_enabled": True})
     import forven.basket_lab as basket_lab
 
     monkeypatch.setattr(basket_lab, "deep_universe_symbols", lambda min_bars: list(panel.symbols))
@@ -267,7 +267,7 @@ def test_summary_exposes_carry_universe_and_cadence(forven_db, monkeypatch):
 
     panel = _panel(end=pd.Timestamp.now(tz="UTC").floor("h"))
     monkeypatch.setattr(basket_runtime, "_load_settings",
-                        lambda: {"basket_funding_carry_enabled": True, "basket_n_legs": 1})
+                        lambda: {"portfolio_layer_enabled": True, "basket_funding_carry_enabled": True, "basket_n_legs": 1})
     import forven.basket_lab as basket_lab
 
     monkeypatch.setattr(basket_lab, "deep_universe_symbols", lambda min_bars: list(panel.symbols))

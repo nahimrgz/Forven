@@ -74,6 +74,11 @@ def _load_settings() -> dict:
 
 def basket_enabled(settings: dict | None = None) -> bool:
     settings = settings if settings is not None else _load_settings()
+    # PORT-GATE-1: the layer's master switch gates the basket too.
+    from forven.portfolio_allocator import portfolio_layer_enabled
+
+    if not portfolio_layer_enabled(settings):
+        return False
     return str(settings.get("basket_funding_carry_enabled", False)).strip().lower() in {
         "1", "true", "yes", "on",
     }

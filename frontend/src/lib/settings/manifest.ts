@@ -112,6 +112,7 @@ export const SETTINGS_SUBSECTIONS: SettingsSubsection[] = [
   { id: 'notif-delivery', area: 'notifications', label: 'Delivery policy', description: 'Overall notification level and noise control.' },
 
   // System
+  { id: 'system-experimental', area: 'system', label: 'Experimental features', description: 'Dark-shipped features that are off by default. Enabling one reveals its pages, settings, and jobs.' },
   { id: 'system-api-keys', area: 'system', label: 'Data source API keys', description: 'Polygon.io market-data key.' },
   { id: 'system-remote-engine', area: 'system', label: 'Remote engine', description: 'Offload backtests to a remote engine process.' },
   { id: 'system-throughput', area: 'system', label: 'Throughput', description: 'One preset dial (Trickle / Conserve / Balanced / Max) over agent cadences and the daily develop budget — turn it down to cut AI call volume on rate-limited providers.', advanced: true },
@@ -458,6 +459,20 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
   // PORT-LAYER-1: measured-risk portfolio allocation. Publishes per-strategy
   // risk multipliers from realized vol + correlations; paper sandboxes are
   // never scaled (they are the backtest-parity measurement instruments).
+  {
+    id: 'risk.portfolio_layer_enabled',
+    label: 'Portfolio layer',
+    default: false,
+    type: 'toggle',
+    area: 'system',
+    subsection: 'system-experimental',
+    backendSection: 'risk',
+    backendPath: 'portfolio_layer_enabled',
+    description:
+      'Master switch for the portfolio layer (measured-risk allocator + funding-carry paper basket). Off: no Portfolio page, no settings tab, no API routes, no scheduler jobs — the feature is invisible. On: the Portfolio tab appears here in Settings and the page appears in the sidebar. Job seeding takes effect on the next restart or scheduler reconcile.',
+    usedBy: ['forven.portfolio_allocator', 'forven.basket_runtime', 'forven.scheduler', 'forven.routers.ops'],
+    deepLinkTo: '/portfolio',
+  },
   {
     id: 'risk.portfolio_allocator_enabled',
     label: 'Portfolio allocator',

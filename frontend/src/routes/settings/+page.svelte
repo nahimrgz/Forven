@@ -23,6 +23,10 @@
 
 	const VALID_AREAS: ReadonlySet<string> = new Set(SETTINGS_AREAS.map((a) => a.id));
 
+	// PORT-GATE-1: the Portfolio settings tab exists only while the layer's
+	// master switch (System -> Experimental features) is on.
+	$: portfolioLayerOn = Boolean((settings as Record<string, unknown> | null)?.['portfolio_layer_enabled']);
+
 	let activeArea: SettingsAreaId = 'home';
 	let settings: Record<string, unknown> | null = null;
 	let dashboard: Record<string, unknown> | null = null;
@@ -179,7 +183,7 @@
 		</div>
 	{:else if settings}
 		<div class="flex gap-6">
-			<SettingsSidebar active={activeArea} onChange={setArea} />
+			<SettingsSidebar active={activeArea} onChange={setArea} hiddenAreas={portfolioLayerOn ? [] : ['portfolio']} />
 			<div class="flex-1 min-w-0">
 				{#if activeArea === 'home'}
 					<SettingsHome {settings} {dashboard} />
@@ -190,7 +194,13 @@
 				{:else if activeArea === 'trading'}
 					<SettingsTrading {settings} />
 				{:else if activeArea === 'portfolio'}
-					<SettingsPortfolio {settings} />
+					{#if portfolioLayerOn}
+						<SettingsPortfolio {settings} />
+					{:else}
+						<div class="border border-[#222] bg-[#050505] p-4 text-xs text-[#888]">
+							The portfolio layer is disabled. Enable it under System → Experimental features.
+						</div>
+					{/if}
 				{:else if activeArea === 'hyperliquid'}
 					<SettingsHyperliquid {settings} />
 				{:else if activeArea === 'notifications'}
