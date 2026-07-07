@@ -15,6 +15,7 @@ never saw the quant-skills KB. These tests pin the closed loop:
 from __future__ import annotations
 
 import json
+import re
 
 import forven.strategy_diversity as sd
 from forven.db import get_db
@@ -148,6 +149,30 @@ def test_render_failure_taxonomy_from_gate_rejections(forven_db):
 
 def test_render_failure_taxonomy_empty_without_rows(forven_db):
     assert sd.render_failure_taxonomy() == ""
+
+
+def _insert_rejection_with_sid(sid: str, gate: str, reason_code: str, strategy_type: str, regime: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO gate_rejections (strategy_id, gate, reason_code, reason_text, strategy_type, regime_context) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sid, gate, reason_code, f"{reason_code} details", strategy_type, regime),
+        )
+
+
+def test_render_failure_taxonomy_includes_example_strategy_ids(forven_db):
+    for i in range(4):
+        _insert_rejection_with_sid(f"S{i:04d}", "gauntlet", "wfa_degradation", "momentum", "trending")
+
+    block = sd.render_failure_taxonomy(days=30)
+
+    assert "momentum @ gauntlet: wfa_degradation ×4 (trending)" in block
+    match = re.search(r"\[e\.g\. ([^\]]+)\]", block)
+    assert match, block
+    examples = [x.strip() for x in match.group(1).split(",")]
+    # Capped at 3 examples even though 4 rejections exist.
+    assert len(examples) == 3
+    assert set(examples) <= {"S0000", "S0001", "S0002", "S0003"}
 
 
 # ── cited_skills persistence + outcome-closure integration ───────────────────

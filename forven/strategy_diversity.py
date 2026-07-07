@@ -292,7 +292,13 @@ def render_failure_taxonomy(*, days: int = 30, limit: int = 8) -> str:
             count = int(row.get("count") or 0)
         except (TypeError, ValueError):
             count = 0
-        lines.append(f"- {strategy_type} @ {gate}: {reason} ×{count} ({regime})")
+        example_ids = [
+            sid.strip()
+            for sid in _normalize_text(row.get("strategy_ids")).split(",")
+            if sid.strip()
+        ][:3]
+        example_suffix = f" [e.g. {', '.join(example_ids)}]" if example_ids else ""
+        lines.append(f"- {strategy_type} @ {gate}: {reason} ×{count} ({regime}){example_suffix}")
     return "\n".join(lines)
 
 
