@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 
 log = logging.getLogger("forven.context")
 
-from forven.db import get_open_trades, get_recent_trades, get_strategies, kv_get, list_approvals
+from forven.db import get_open_trades, get_recent_trades, get_strategies, list_approvals
 from forven.strategy_diversity import render_failure_taxonomy, render_strategy_diversity_guard
 from forven.workspace import (
     read_operator_profile,
