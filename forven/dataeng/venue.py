@@ -100,3 +100,100 @@ def hl_divergence(symbol: str, timeframe: str, *, probe_bars: int = 500) -> dict
     if primary is None or venue is None or primary.empty or venue.empty:
         return empty
     return reconcile_close_prices(primary.tail(probe_bars), venue.tail(probe_bars))
+
+
+# ── HL funding capture (PORT-HLFUND-1) ──────────────────────────────────────
+# The funding-carry basket ranks Binance funding, but execution happens on
+# Hyperliquid — and a live cross-venue probe (2026-07-07) showed the two
+# venues' funding agrees in sign only 20/27 with ~0.5 correlation: many HL
+# perps sit at the ~+11%/yr baseline while Binance shows real dispersion.
+# An HL-native basket therefore needs HL's OWN funding series. One
+# metaAndAssetCtxs call snapshots the CURRENT hourly rate for every listed
+# perp; captured hourly, that builds the series the HL-ranked paper book
+# accrues and ranks on. Stored per-asset under data/funding_hl/{COIN}/1h.parquet
+# with columns [timestamp, funding_rate] (per-hour rate, HL native).
+
+HL_FUNDING_DIRNAME = "funding_hl"
+
+
+def _hl_funding_path(hl_coin: str):
+    from forven.data import data_root
+
+    return data_root() / HL_FUNDING_DIRNAME / str(hl_coin).strip().upper() / "1h.parquet"
+
+
+def collect_hl_funding_snapshot() -> dict:
+    """Capture the current hourly funding rate for EVERY HL-listed perp.
+
+    One info call for the whole universe; rows are stamped to the top of the
+    current hour and deduped on merge, so running more often than hourly is
+    harmless. Returns {assets, rows_added, failed}.
+    """
+    import pandas as pd
+
+    from forven.data import _write_lake_parquet
+    from forven.market_data import post_hyperliquid_info
+
+    raw = post_hyperliquid_info({"type": "metaAndAssetCtxs"})
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise RuntimeError("metaAndAssetCtxs returned an unexpected shape")
+    meta, ctxs = raw
+    universe = meta.get("universe") if isinstance(meta, dict) else None
+    if not isinstance(universe, list) or not isinstance(ctxs, list):
+        raise RuntimeError("metaAndAssetCtxs missing universe/ctxs")
+
+    stamp = pd.Timestamp.now(tz="UTC").floor("h")
+    summary = {"assets": 0, "rows_added": 0, "failed": 0}
+    for asset_meta, ctx in zip(universe, ctxs):
+        try:
+            coin = str((asset_meta or {}).get("name") or "").strip().upper()
+            rate = float((ctx or {}).get("funding"))
+        except (TypeError, ValueError):
+            continue
+        if not coin:
+            continue
+        summary["assets"] += 1
+        try:
+            row = pd.DataFrame({"timestamp": [stamp], "funding_rate": [rate]})
+            path = _hl_funding_path(coin)
+            existing = None
+            if path.exists():
+                existing = pd.read_parquet(path)
+                if "timestamp" in existing.columns:
+                    existing["timestamp"] = pd.to_datetime(existing["timestamp"], utc=True)
+            # Plain merge — merge_and_dedup is OHLCV-schema-specific and would
+            # coerce this frame into candles, silently dropping funding_rate.
+            frames = [f for f in (existing, row) if f is not None and not f.empty]
+            merged = pd.concat(frames, ignore_index=True)
+            merged = merged.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp")
+            merged = merged[["timestamp", "funding_rate"]].reset_index(drop=True)
+            _write_lake_parquet(merged, path, symbol=coin, timeframe="1h", source="hyperliquid")
+            added = len(merged) - (len(existing) if existing is not None else 0)
+            summary["rows_added"] += max(0, added)
+        except Exception:
+            summary["failed"] += 1
+            log.debug("HL funding snapshot failed for %s", coin, exc_info=True)
+    log.info(
+        "HL funding snapshot: %d assets, %d rows added, %d failed",
+        summary["assets"], summary["rows_added"], summary["failed"],
+    )
+    return summary
+
+
+def load_hl_funding_series(hl_coin: str):
+    """Stored HL hourly funding for one coin as a UTC-indexed Series, or None."""
+    import pandas as pd
+
+    path = _hl_funding_path(hl_coin)
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+        if df.empty or "funding_rate" not in df.columns:
+            return None
+        ts = pd.to_datetime(df["timestamp"], utc=True)
+        series = pd.Series(df["funding_rate"].astype(float).values, index=ts).sort_index()
+        return series[~series.index.duplicated(keep="last")]
+    except Exception:
+        log.debug("HL funding load failed for %s", hl_coin, exc_info=True)
+        return None

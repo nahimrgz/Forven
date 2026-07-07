@@ -42,6 +42,19 @@ from forven.sim.clock import get_now
 log = logging.getLogger("forven.basket_runtime")
 
 BASKET_KV_KEY = "forven:portfolio:basket:funding_carry"
+# PORT-HLFUND-1: the HL-native book ranks/accrues Hyperliquid's OWN funding
+# (cross-venue funding agrees in sign only ~74% with ~0.5 correlation — a
+# Binance-ranked basket executed on HL would collect a different, partly
+# inverted carry). Marks still use the primary lake's closes: cross-venue
+# PRICE divergence is small (the source-reconciliation gate measures it),
+# funding divergence is the thing being fixed. Runs alongside the Binance
+# book so the two curves are directly comparable.
+BASKET_HL_KV_KEY = "forven:portfolio:basket:funding_carry:hl"
+VENUES = ("binance", "hyperliquid")
+
+
+def _state_key(venue: str = "binance") -> str:
+    return BASKET_HL_KV_KEY if str(venue).lower() in {"hl", "hyperliquid"} else BASKET_KV_KEY
 
 DEFAULT_REBALANCE_HOURS = 24  # Phase 0: 24h keeps ~all edge at 1/3 the turnover
 DEFAULT_N_LEGS = 5
@@ -460,34 +473,96 @@ def run_basket_tick(force: bool = False) -> dict | None:
                 log.warning("basket live reconcile failed", exc_info=True)
         else:
             log.warning("basket tick skipped: %s", report.get("skipped_reason"))
+
+        # PORT-HLFUND-1: tick the HL-native book on the same panel with the
+        # funding matrix swapped to Hyperliquid's own series. Fail-soft: the
+        # HL book is additive evidence and must never break the Binance tick.
+        try:
+            hl_report = _tick_hl_book(panel, now, config)
+            if hl_report is not None:
+                report["hl"] = {k: hl_report.get(k) for k in (
+                    "ticked", "rebalanced", "positions", "equity", "skipped_reason",
+                )}
+        except Exception:
+            log.warning("HL-native basket tick failed", exc_info=True)
         return report
     except Exception:
         log.warning("basket tick failed", exc_info=True)
         return None
 
 
-def get_basket_state() -> dict | None:
+def _hl_funding_matrix(panel):
+    """Panel-aligned funding DataFrame built from stored HL snapshots.
+
+    Columns keep the panel's lake symbols; each maps through the k-prefix
+    alias to its HL coin. Symbols with no HL series (not listed, or capture
+    too young) come back all-NaN — the tick's freshness masking then treats
+    them as ineligible, which is the truth."""
+    import pandas as pd
+
+    from forven.basket_live import lake_symbol_to_exchange_asset
+    from forven.dataeng.venue import load_hl_funding_series
+
+    columns = {}
+    found = 0
+    for symbol in panel.symbols:
+        series = load_hl_funding_series(lake_symbol_to_exchange_asset(symbol))
+        if series is not None and not series.empty:
+            columns[symbol] = series.reindex(panel.index, method=None)
+            found += 1
+        else:
+            columns[symbol] = pd.Series(float("nan"), index=panel.index)
+    if found == 0:
+        return None, 0
+    return pd.DataFrame(columns, index=panel.index), found
+
+
+def _tick_hl_book(panel, now, config) -> dict | None:
+    """Tick the HL-native book: same closes/marks, Hyperliquid funding."""
+    hl_funding, found = _hl_funding_matrix(panel)
+    if hl_funding is None or found < 2 * int(config.get("n_legs", DEFAULT_N_LEGS)):
+        # Not enough HL-covered symbols to build both sides yet — capture is
+        # young or the universe barely overlaps HL listings. Say so once the
+        # operator looks (state stays empty; summary reports absent).
+        return None
+    from forven.basket_lab import BasketPanel
+
+    hl_panel = BasketPanel(
+        index=panel.index, open=panel.open, close=panel.close,
+        funding=hl_funding, bar_hours=panel.bar_hours,
+    )
+    state = get_basket_state("hyperliquid")
+    if not isinstance(state, dict) or not state:
+        state = _fresh_state(get_now().isoformat())
+        state["name"] = "funding_carry_hl"
+    new_state, report = tick_basket(state, hl_panel, now, config)
+    if report.get("ticked"):
+        kv_set_best_effort(BASKET_HL_KV_KEY, new_state)
+    return report
+
+
+def get_basket_state(venue: str = "binance") -> dict | None:
     try:
-        state = kv_get(BASKET_KV_KEY, None)
+        state = kv_get(_state_key(venue), None)
     except Exception:
         return None
     return state if isinstance(state, dict) else None
 
 
-def reset_basket_state() -> bool:
+def reset_basket_state(venue: str = "binance") -> bool:
     """Operator reset: clears the paper book so it re-initializes next tick."""
     try:
-        kv_set_best_effort(BASKET_KV_KEY, {})
+        kv_set_best_effort(_state_key(venue), {})
         return True
     except Exception:
         return False
 
 
-def basket_summary() -> dict:
+def basket_summary(venue: str = "binance") -> dict:
     """Operator view for the API: headline stats, per-leg carry, universe
     health, cadence, recent ticks, and a decimated equity curve. Reads only the
     persisted state — never the lake."""
-    state = get_basket_state()
+    state = get_basket_state(venue)
     settings = _load_settings()
     config = _basket_config(settings)
     if not state:
@@ -549,6 +624,7 @@ def basket_summary() -> dict:
     return {
         "exists": True,
         "enabled": basket_enabled(settings),
+        "venue": "hyperliquid" if str(venue).lower() in {"hl", "hyperliquid"} else "binance",
         "name": state.get("name"),
         "created_at": state.get("created_at"),
         "last_tick_at": state.get("last_tick_at"),

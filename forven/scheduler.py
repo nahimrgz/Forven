@@ -1999,7 +1999,7 @@ async def run_job(job: dict) -> tuple[str, str | None]:
 
         # Hyperliquid venue candles for the traded subset (venue-fidelity series)
         if kind == "hl_venue_collect":
-            from forven.dataeng.venue import collect_hl_venue_series
+            from forven.dataeng.venue import collect_hl_funding_snapshot, collect_hl_venue_series
             await _run_sync_job(
                 collect_hl_venue_series,
                 timeout_seconds=_coerce_timeout_seconds(
@@ -2007,6 +2007,13 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                     _DATA_MANAGER_TIMEOUT_DEFAULTS["hl_venue_collect"],
                 ),
             )
+            # PORT-HLFUND-1: one info call snapshots every HL perp's current
+            # hourly funding — the series the HL-native basket ranks/accrues on.
+            # Fail-soft: a funding hiccup must not fail the candle collection.
+            try:
+                await _run_sync_job(collect_hl_funding_snapshot, timeout_seconds=60)
+            except Exception:
+                log.warning("HL funding snapshot failed", exc_info=True)
             return "ok", None
 
         # DataManager — Fear & Greed Index collection

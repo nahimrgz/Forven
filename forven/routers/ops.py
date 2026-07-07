@@ -83,7 +83,9 @@ def get_portfolio_basket():
     _require_portfolio_layer()
     from forven.basket_runtime import basket_summary
 
-    return {"ok": True, **basket_summary()}
+    # Top level = the Binance-ranked research book (rich lake history);
+    # "hl" = the HL-native book that live execution follows (PORT-HLFUND-1).
+    return {"ok": True, **basket_summary(), "hl": basket_summary("hyperliquid")}
 
 
 @router.post("/api/portfolio/basket/tick")

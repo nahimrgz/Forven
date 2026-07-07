@@ -101,6 +101,8 @@ export interface BasketSummary {
 	};
 	recent_ticks?: BasketTick[];
 	equity_curve?: Array<{ t: string; equity: number }>;
+	venue?: string;
+	hl?: BasketSummary;
 }
 
 export async function getPortfolioLayerEnabled(): Promise<boolean> {

@@ -347,3 +347,98 @@ def test_beta_drift_needs_minimum_history(forven_db, monkeypatch):
     ]
     basket_runtime._check_beta_drift(state)
     assert emitted == []
+
+
+# -------------------------------------------------------- HL-native book
+
+
+def test_hl_funding_matrix_alignment(monkeypatch):
+    import pandas as pd
+
+    from forven import basket_runtime
+    import forven.dataeng.venue as venue
+
+    panel = _panel()  # AAA/BBB/CCC/DDD-USDT
+
+    def _fake_series(coin):
+        if coin == "AAA":
+            return pd.Series([0.002] * 50, index=panel.index[-50:])
+        return None
+
+    monkeypatch.setattr(venue, "load_hl_funding_series", _fake_series)
+    matrix, found = basket_runtime._hl_funding_matrix(panel)
+    assert found == 1
+    assert matrix["AAA-USDT"].iloc[-1] == pytest.approx(0.002)
+    assert matrix["BBB-USDT"].isna().all()  # no HL series -> all-NaN -> ineligible
+
+
+def test_hl_book_ticks_and_persists(forven_db, monkeypatch):
+    import pandas as pd
+
+    from forven import basket_runtime
+    import forven.dataeng.venue as venue
+
+    panel = _panel()
+
+    def _fake_series(coin):
+        # HL disagrees with Binance: on HL, DDD is the expensive one and
+        # CCC the cheap one (Binance panel had AAA/BBB as the extremes).
+        rates = {"AAA": 0.0, "BBB": 0.0, "CCC": -0.003, "DDD": 0.003}
+        if coin in rates:
+            return pd.Series([rates[coin]] * len(panel.index), index=panel.index)
+        return None
+
+    monkeypatch.setattr(venue, "load_hl_funding_series", _fake_series)
+    report = basket_runtime._tick_hl_book(panel, _now(panel), _config(n_legs=1))
+    assert report and report["ticked"] and report["rebalanced"]
+    state = basket_runtime.get_basket_state("hyperliquid")
+    # The HL book picked HL's extremes, NOT Binance's.
+    assert state["weights"]["CCC-USDT"] == pytest.approx(0.5)   # long lowest HL funding
+    assert state["weights"]["DDD-USDT"] == pytest.approx(-0.5)  # short highest HL funding
+    assert state["name"] == "funding_carry_hl"
+    # Binance book untouched.
+    assert basket_runtime.get_basket_state("binance") is None
+
+
+def test_hl_book_refuses_thin_coverage(forven_db, monkeypatch):
+    from forven import basket_runtime
+    import forven.dataeng.venue as venue
+
+    panel = _panel()
+    monkeypatch.setattr(venue, "load_hl_funding_series", lambda coin: None)
+    assert basket_runtime._tick_hl_book(panel, _now(panel), _config(n_legs=1)) is None
+    assert basket_runtime.get_basket_state("hyperliquid") is None
+
+
+def test_summary_reports_venue(forven_db):
+    from forven.db import kv_set as _kv_set
+
+    _kv_set("forven:settings", {"portfolio_layer_enabled": True, "basket_funding_carry_enabled": True})
+    _kv_set("forven:portfolio:basket:funding_carry:hl", {
+        "name": "funding_carry_hl", "equity": 1.001, "weights": {"AAA-USDT": 0.5}, "history": [],
+    })
+    from forven.basket_runtime import basket_summary
+
+    hl = basket_summary("hyperliquid")
+    assert hl["exists"] and hl["venue"] == "hyperliquid"
+    assert basket_summary()["exists"] is False  # binance book absent independently
+
+
+def test_hl_funding_snapshot_writes_and_dedupes(forven_db, monkeypatch, tmp_path):
+    import forven.dataeng.venue as venue
+    import forven.market_data as market_data
+
+    monkeypatch.setattr(venue, "_hl_funding_path", lambda coin: tmp_path / coin / "1h.parquet")
+    payload = [
+        {"universe": [{"name": "AAA"}, {"name": "BBB"}]},
+        [{"funding": "0.0000125"}, {"funding": "-0.00005"}],
+    ]
+    monkeypatch.setattr(market_data, "post_hyperliquid_info", lambda p: payload)
+
+    first = venue.collect_hl_funding_snapshot()
+    assert first["assets"] == 2 and first["rows_added"] == 2
+    # Same hour, same rates -> dedup, nothing added.
+    second = venue.collect_hl_funding_snapshot()
+    assert second["rows_added"] == 0
+    series = venue.load_hl_funding_series("BBB")
+    assert series is not None and series.iloc[-1] == pytest.approx(-0.00005)

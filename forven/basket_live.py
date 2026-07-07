@@ -60,6 +60,8 @@ MIN_ORDER_NOTIONAL_USD = 12.0
 # Per-order ceiling registered at arming: 2 legs' worth of headroom over the
 # 10%-per-leg target so a flip (close one side, open the other) always fits.
 CEILING_CAPITAL_FRACTION = 0.2
+# The HL-native book must have at least a day of hourly ticks before arming.
+MIN_HL_BOOK_TICKS = 24
 
 # Hyperliquid's k-prefix convention for Binance's 1000x tickers.
 _HL_ASSET_ALIASES = {
@@ -107,9 +109,23 @@ def arm_basket_live(
 
     if not basket_enabled():
         raise ValueError("the basket paper book is disabled — live execution mirrors it, enable it first")
-    state = get_basket_state()
+    # PORT-HLFUND-1: live orders fill on Hyperliquid, so live execution follows
+    # the HL-NATIVE book — cross-venue funding diverges too much (sign agreement
+    # ~74%, corr ~0.5) to execute Binance rankings on HL. Arming requires the
+    # HL book to exist with at least a day of ticks.
+    state = get_basket_state("hyperliquid")
     if not state or not state.get("weights"):
-        raise ValueError("the paper book holds no positions yet — let it run before arming live execution")
+        raise ValueError(
+            "the HL-native paper book has no positions yet — it starts once HL funding "
+            "snapshots cover enough of the universe (the hl-venue-collect job captures "
+            "them hourly). Live execution follows the HL book, never the Binance one."
+        )
+    if len(state.get("history") or []) < MIN_HL_BOOK_TICKS:
+        raise ValueError(
+            f"the HL-native book has only {len(state.get('history') or [])} tick(s) — "
+            f"at least {MIN_HL_BOOK_TICKS} (a day) are required before arming, and weeks "
+            "of evidence are recommended"
+        )
 
     error = validate_go_live_confirmation(confirm, capital_usd)
     if error:
@@ -240,7 +256,7 @@ def reconcile_basket_live() -> dict | None:
         _ledger_append({"event": "reconcile_skipped", "reason": f"trading halted: {why}"})
         return {"skipped": f"trading halted: {why}"}
 
-    state = get_basket_state() or {}
+    state = get_basket_state("hyperliquid") or {}
     weights: dict[str, float] = state.get("weights") or {}
     capital = float(arming.get("capital_usd") or 0.0)
     address = str(arming.get("wallet_address") or "")

@@ -33,12 +33,13 @@ def _settings(**extra):
     })
 
 
-def _paper_book(weights=None):
-    kv_set("forven:portfolio:basket:funding_carry", {
-        "name": "funding_carry",
+def _paper_book(weights=None, ticks=48):
+    # PORT-HLFUND-1: arming and reconciliation follow the HL-NATIVE book.
+    kv_set("forven:portfolio:basket:funding_carry:hl", {
+        "name": "funding_carry_hl",
         "equity": 1.0,
         "weights": weights or {"AAA-USDT": 0.1, "BBB-USDT": -0.1},
-        "history": [],
+        "history": [{"t": f"h{i}", "equity": 1.0} for i in range(ticks)],
     })
 
 
@@ -92,8 +93,12 @@ def test_arming_requires_everything(forven_db):
         arm_basket_live("GO LIVE", 1000, "basket")
     # No paper positions yet.
     _settings()
-    kv_set("forven:portfolio:basket:funding_carry", {})
-    with pytest.raises(ValueError, match="no positions yet"):
+    kv_set("forven:portfolio:basket:funding_carry:hl", {})
+    with pytest.raises(ValueError, match="HL-native paper book has no positions"):
+        arm_basket_live("GO LIVE", 1000, "basket")
+    # Too few HL ticks.
+    _paper_book(ticks=3)
+    with pytest.raises(ValueError, match="at least 24"):
         arm_basket_live("GO LIVE", 1000, "basket")
     _paper_book()
     # Wrong phrase.

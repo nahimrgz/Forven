@@ -177,6 +177,8 @@
 	$: universeThin =
 		universe && basket?.config ? universe.eligible < basket.config.n_legs * 2 : false;
 	$: recentTicks = (basket?.recent_ticks ?? []).slice(0, 12);
+	$: hlBook = basket?.hl ?? null;
+	$: hlLegs = (hlBook?.legs ?? []) as NonNullable<BasketSummary['legs']>;
 	$: nextRebalanceIn = (() => {
 		const iso = basket?.next_rebalance_at;
 		if (!iso) return null;
@@ -585,6 +587,55 @@
 				{/if}
 			</div>
 
+			<!-- ───────────── HL-native book: what live execution actually follows ───────────── -->
+			<div class="border border-[#1a2438] bg-[#050a12] p-3 space-y-2">
+				<div class="flex items-center justify-between">
+					<h3 class="text-xs font-bold uppercase tracking-wider text-white">
+						Hyperliquid-native book
+						<span class="ml-2 text-[10px] font-normal normal-case text-[#667]">ranks HL's own funding — live execution follows THIS book, never the Binance one</span>
+					</h3>
+					{#if hlBook?.exists}
+						<span class="text-[10px] text-[#667]">{hlBook.positions?.count ?? 0} positions · {hlBook.rebalances ?? 0} rebalances</span>
+					{/if}
+				</div>
+				{#if hlBook?.exists}
+					<div class="grid grid-cols-3 gap-2 text-center text-[11px]">
+						<div class="border border-[#1a2438] bg-[#070d16] p-2">
+							<div class="text-[#667]">Book value</div>
+							<div class="font-bold text-white">{fmtUsd(hlBook.equity ?? 1)}</div>
+						</div>
+						<div class="border border-[#1a2438] bg-[#070d16] p-2">
+							<div class="text-[#667]">Total P&L</div>
+							<div class={`font-bold ${(hlBook.total_return_pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{fmtUsd((hlBook.equity ?? 1) - 1)}</div>
+						</div>
+						<div class="border border-[#1a2438] bg-[#070d16] p-2" title="What the HL book earns per year at Hyperliquid's own current funding — the number that matters for live capital.">
+							<div class="text-[#667]">Expected income /yr (HL)</div>
+							<div class={`font-bold ${(hlBook.expected_carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{fmtUsd(hlBook.expected_carry_annualized)}</div>
+						</div>
+					</div>
+					{#if hlLegs.length > 0}
+						<div class="flex flex-wrap gap-1 text-[10px]">
+							{#each hlLegs as leg (leg.symbol)}
+								<span class={`px-1.5 py-0.5 border ${leg.weight > 0 ? 'border-[#1c2b1c] text-emerald-400' : 'border-[#2b1c1c] text-red-400'}`}>
+									{leg.weight > 0 ? '▲' : '▼'} {leg.symbol.replace('-USDT', '')}
+								</span>
+							{/each}
+						</div>
+					{/if}
+					<p class="text-[10px] text-[#556]">
+						Cross-venue funding diverges (sign agreement ~74%, correlation ~0.5) — compare this book's
+						curve against the Binance one above before trusting either with capital. Marks use the
+						primary lake's prices; funding accrues from hourly Hyperliquid snapshots.
+					</p>
+				{:else}
+					<p class="text-[11px] text-[#667]">
+						Accumulating Hyperliquid funding snapshots (captured hourly by the hl-venue-collect job) —
+						this book starts once enough of the universe is covered. Until it exists and has a day of
+						ticks, live execution cannot be armed.
+					</p>
+				{/if}
+			</div>
+
 			<!-- ─────────────── live execution (real money, behind arming) ─────────────── -->
 			<div class={`border p-3 space-y-3 ${live?.armed ? 'border-red-800 bg-[#0a0505]' : 'border-[#222] bg-[#070707]'}`}>
 				<div class="flex items-center justify-between">
@@ -598,10 +649,11 @@
 							{/if}
 						</h3>
 						<p class="text-[11px] text-[#666]">
-							When armed, each tick mirrors the paper book into a dedicated wallet with real
-							orders: increases go through the liquidity guard, reductions are reduce-only,
-							every order is ceiling-checked and logged below. Losses are confined to that
-							wallet's capital.
+							When armed, each tick mirrors the <span class="text-[#99b]">Hyperliquid-native book above</span>
+							into a dedicated wallet with real orders: increases go through the liquidity guard,
+							reductions are reduce-only, every order is ceiling-checked and logged below. Losses
+							are confined to that wallet's capital. Arming requires the HL book to exist with at
+							least a day of ticks.
 						</p>
 					</div>
 				</div>
