@@ -21,7 +21,10 @@ def _write_custom_strategy(
     *,
     class_name: str = "AIDropzoneWave",
     type_name: str = "ai_dropzone_wave_test",
+    body_marker: str = "",
 ) -> None:
+    # body_marker injects a REAL statement into the logic so two strategies can
+    # share a class name yet have distinct bodies (a legit _v2 iteration).
     lines = [
         "import pandas as pd",
         "from forven.strategies.base import BaseStrategy, Signal",
@@ -44,6 +47,7 @@ def _write_custom_strategy(
         "        return {'risk_pct': 0.01, 'leverage': 1.0}",
         "",
         "    def generate_signal(self, df: pd.DataFrame) -> Signal:",
+        f"        _variant = {body_marker!r}",
         "        price = float(df['close'].iloc[-1]) if 'close' in df and len(df.index) else 0.0",
         "        return Signal(price=price)",
         "",
@@ -76,6 +80,52 @@ def test_substitution_uses_token_overlap_not_exact_substring():
     assert intake_mod._is_mechanism_substituted(
         "StrategyV2", hypothesis, []
     ) is False
+
+
+def test_duplicate_guard_matches_body_not_class_name(forven_db, monkeypatch, tmp_path):
+    """Fix: matching duplicates on class NAME mass-fired (a strategy matched its
+    own row on retry; _v2 iterations reused a class name over different logic).
+    Now only an IDENTICAL normalized body under the same hypothesis/lane is a
+    duplicate — a reused class name with different code is allowed."""
+    temp_custom_dir = tmp_path / "custom"
+    temp_custom_dir.mkdir()
+    monkeypatch.setattr(custom_pkg, "__path__", [str(temp_custom_dir)])
+    monkeypatch.setattr(custom_pkg, "__file__", str(temp_custom_dir / "__init__.py"))
+    registry.reset()
+    importlib.invalidate_caches()
+    for t in ("dup_a", "dup_b", "dup_c"):
+        sys.modules.pop(f"forven.strategies.custom.{t}", None)
+
+    hyp = create_hypothesis(
+        title="Momentum Overlay edge",
+        market_thesis="Momentum overlay on trend.",
+        mechanism="A momentum overlay strategy.",
+        why_now="now",
+        lane="benchmarking",
+        source_type="test",
+        target_assets=["BTC/USDT"],
+        target_timeframes=["1h"],
+    )
+    hyp_id = str(hyp["id"])
+
+    # A: class MomentumOverlay, body 'aaa'
+    fa = temp_custom_dir / "dup_a.py"
+    _write_custom_strategy(fa, class_name="MomentumOverlay", type_name="dup_a", body_marker="aaa")
+    ra = intake_mod.register_custom_strategy_file(file_path=str(fa), hypothesis_id=hyp_id)
+    assert ra["strategy_id"] is not None
+
+    # B: SAME class name, DIFFERENT body -> a legit iteration, must be ALLOWED.
+    fb = temp_custom_dir / "dup_b.py"
+    _write_custom_strategy(fb, class_name="MomentumOverlay", type_name="dup_b", body_marker="bbb_different_logic")
+    rb = intake_mod.register_custom_strategy_file(file_path=str(fb), hypothesis_id=hyp_id)
+    assert rb["strategy_id"] is not None
+
+    # C: SAME class name, IDENTICAL body to A -> true duplicate, must be FORBIDDEN.
+    fc = temp_custom_dir / "dup_c.py"
+    _write_custom_strategy(fc, class_name="MomentumOverlay", type_name="dup_c", body_marker="aaa")
+    with pytest.raises(ValueError) as ei:
+        intake_mod.register_custom_strategy_file(file_path=str(fc), hypothesis_id=hyp_id)
+    assert "Duplicate registration forbidden" in str(ei.value)
 
 
 def test_mechanism_substitution_guards(forven_db, monkeypatch, tmp_path):

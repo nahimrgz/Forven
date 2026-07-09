@@ -635,7 +635,18 @@ def register_custom_strategy_file(
                     raise ValueError(msg)
                 
                 # 2. Duplicate detection check
-                dup_reason = _check_90d_duplicate(clean_hypothesis_id, hypothesis.get("lane") or "", registered_class_name)
+                import inspect as _inspect
+                try:
+                    _reg_sig = _strategy_source_signature(_inspect.getsource(strategy_cls))
+                except Exception:
+                    _reg_sig = ""
+                dup_reason = _check_90d_duplicate(
+                    clean_hypothesis_id,
+                    hypothesis.get("lane") or "",
+                    registered_class_name,
+                    registered_type_name=type_name,
+                    registered_signature=_reg_sig,
+                )
                 if dup_reason:
                     msg = (
                         f"Duplicate registration forbidden: {dup_reason} "
@@ -1239,6 +1250,56 @@ def _mechanism_tokens(class_name: str) -> list[str]:
     return out
 
 
+def _strategy_source_signature(src: str | None) -> str:
+    """Normalized signature of strategy source for TRUE-duplicate detection.
+
+    Identical LOGIC yields an identical signature regardless of class name,
+    TYPE_NAME/STRATEGY_CLASS declarations, comments, docstrings, or whitespace.
+    Two strategies are duplicates only when their signatures match — a reused
+    class name on genuinely different logic (a ``_v2`` iteration) is NOT a
+    duplicate, which is why matching on class name alone mass-fired.
+    """
+    if not src:
+        return ""
+    s = re.sub(r'"""(?:.|\n)*?"""', "", src)
+    s = re.sub(r"'''(?:.|\n)*?'''", "", s)
+    s = re.sub(r"#.*", "", s)
+    s = re.sub(r"^\s*(?:TYPE_NAME|STRATEGY_CLASS)\s*=.*$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"class\s+\w+", "class", s)  # normalize the class name out
+    s = re.sub(r"\s+", "", s)
+    return s.lower()
+
+
+def _strategy_type_signature(stype: str) -> str:
+    """Source signature for a registered/custom strategy TYPE. Prefers the loaded
+    class (works regardless of on-disk location — e.g. monkeypatched test dirs);
+    falls back to reading the custom/builtin file."""
+    import inspect
+
+    from forven.strategies.registry import _TYPE_MAP
+
+    src = None
+    cls = _TYPE_MAP.get(stype)
+    if cls is not None:
+        try:
+            src = inspect.getsource(cls)
+        except Exception:
+            src = None
+    if src is None:
+        import os
+
+        for sub in ("custom", "builtin"):
+            fp = os.path.join(os.path.dirname(__file__), "..", "strategies", sub, f"{stype}.py")
+            if os.path.exists(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        src = f.read()
+                    break
+                except Exception:
+                    pass
+    return _strategy_source_signature(src)
+
+
 def _is_mechanism_substituted(registered_class_name: str, hypothesis: dict, artifacts: list[dict]) -> bool:
     """True when the class implements a DIFFERENT mechanism than the parent
     hypothesis describes.
@@ -1312,17 +1373,41 @@ def _is_operator_approved(hypothesis_id: str, registered_class_name: str) -> boo
     return False
 
 
-def _check_90d_duplicate(hypothesis_id: str, current_lane: str, registered_class_name: str) -> str | None:
+def _check_90d_duplicate(
+    hypothesis_id: str,
+    current_lane: str,
+    registered_class_name: str,
+    registered_type_name: str | None = None,
+    registered_signature: str | None = None,
+) -> str | None:
+    """Flag a TRUE body duplicate: a same-hypothesis/lane strategy of a DIFFERENT
+    type whose normalized source is IDENTICAL to the one being registered.
+
+    Matching on class name alone was catastrophically over-eager: it (a) matched
+    a strategy against its OWN row on a re-registration/retry (the type resolves
+    to its own class), and (b) blocked legitimate ``_v2`` iterations that reused a
+    class name over genuinely different logic. Both are gated out now — self is
+    excluded by type, and the source-signature equality is the real duplicate
+    test (a reused class name with different code is not a duplicate).
+    """
     from forven.db import get_db
     from datetime import datetime, timedelta, timezone
-    import re
-    
+
     def normalize(s: str) -> str:
-        return re.sub(r'[^a-zA-Z0-9]', '', s).lower()
-        
+        return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
+
     reg_norm = normalize(registered_class_name)
+    # Prefer the signature the caller derived from the loaded class (works even
+    # when the file lives outside the real custom dir, e.g. tests); fall back to
+    # reading the registering type's file.
+    reg_sig = registered_signature or (
+        _strategy_type_signature(registered_type_name) if registered_type_name else ""
+    )
+    if not reg_sig:
+        # Can't read the registering body -> can't prove a duplicate -> allow.
+        return None
     cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
-    
+
     with get_db() as conn:
         rows = conn.execute(
             """
@@ -1333,31 +1418,31 @@ def _check_90d_duplicate(hypothesis_id: str, current_lane: str, registered_class
             """,
             (cutoff,),
         ).fetchall()
-        
+
     for row in rows:
         stype = row["type"]
-        if not stype:
-            continue
-            
+        if not stype or stype == registered_type_name:
+            continue  # exclude self: a type never duplicates itself
+
         other_class = _get_strategy_class_name(stype)
-        if not other_class:
+        if not other_class or normalize(other_class) != reg_norm:
             continue
-            
-        if normalize(other_class) == reg_norm:
-            other_hyp_id = row["hypothesis_id"]
-            other_lane = row["lane"]
-            
-            same_hyp = (other_hyp_id == hypothesis_id)
-            same_lane = False
-            if current_lane and other_lane:
-                if current_lane.strip().lower() == other_lane.strip().lower():
-                    same_lane = True
-                    
-            if same_hyp or same_lane:
-                return (
-                    f"Strategy ID {row['id']} ('{stype}', class '{other_class}') was already registered "
-                    f"in the last 90 days under the same hypothesis family/lane (Hypothesis ID: {other_hyp_id}, Lane: {other_lane})."
-                )
+
+        other_hyp_id = row["hypothesis_id"]
+        other_lane = row["lane"]
+        same_hyp = other_hyp_id == hypothesis_id
+        same_lane = bool(
+            current_lane and other_lane and current_lane.strip().lower() == other_lane.strip().lower()
+        )
+        if not (same_hyp or same_lane):
+            continue
+
+        # True-duplicate gate: identical normalized source body.
+        if _strategy_type_signature(stype) == reg_sig:
+            return (
+                f"Strategy ID {row['id']} ('{stype}', class '{other_class}') was already registered "
+                f"in the last 90 days under the same hypothesis family/lane (Hypothesis ID: {other_hyp_id}, Lane: {other_lane})."
+            )
     return None
 
 
