@@ -180,7 +180,7 @@ def test_run_agent_task_uses_research_context_for_research_tasks(forven_db, monk
         calls.append(("research", contract.lane, list(contract.available_datasets)))
         return "research-context"
 
-    async def _fake_call_with_tools(provider, model_id, messages, system, tools=None):
+    async def _fake_call_with_tools(provider, model_id, messages, system, tools=None, **kwargs):
         calls.append(("call", system))
         return ("done", {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
 

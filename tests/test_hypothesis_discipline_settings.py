@@ -111,6 +111,7 @@ def test_block_missing_returns_all_defaults() -> None:
         # CRUX-1 allocator knobs.
         "crucible_daily_develop_budget": 150,
         "crucible_short_mode_quota_pct": 30,
+        "crucible_orthogonal_data_quota_pct": 40,
     }
 
 

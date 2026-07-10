@@ -68,7 +68,11 @@ _DISAMBIGUATION_MAP: dict[str, str] = {
     "supertrend": "supertrend",
     # VWAP_trend has three prefix matches (composite / momentum / pullback); composite is canonical
     "vwap_trend": "vwap_trend_composite",
+    # Donchian channel aliases -> base donchian type
+    "donchian_channel": "donchian",
+    "donchian_breakout": "donchian",
 }
+
 
 
 def register(strategy: BaseStrategy):

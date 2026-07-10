@@ -9,6 +9,11 @@ def test_discord_graceful_degradation_without_token(forven_db, monkeypatch):
     
     # Mock load_config to return empty config
     monkeypatch.setattr("forven.bot.load_config", lambda: {})
+    monkeypatch.setattr("forven.config.load_config", lambda: {})
+    
+    import forven.notifications as notifications
+    notifications._DISCORD_CONFIGURED_CACHE = None
+
     monkeypatch.setattr("forven.notifications.get_notification_preferences", lambda: {
         "providers": {
             "discord": {
@@ -34,12 +39,10 @@ def test_discord_graceful_degradation_without_token(forven_db, monkeypatch):
     
     # It should have status 'stored' (not new/failed)
     assert item["status"] == "stored"
+    assert item["delivery_mode"] == "app_only"
+    assert item.get("metadata", {}).get("discord_skipped") == "not_configured"
     
-    # Verify the delivery attempt was recorded as 'skipped'
+    # Verify no delivery attempt was recorded
     deliveries = list_notification_deliveries(item["id"]) or []
-    assert len(deliveries) > 0, "A delivery record must be created"
-    
-    discord_delivery = next((d for d in deliveries if d["target"] == "discord"), None)
-    assert discord_delivery is not None, "Discord delivery record must exist"
-    assert discord_delivery["status"] == "skipped"
-    assert "not configured" in discord_delivery["detail"]
+    assert len(deliveries) == 0
+

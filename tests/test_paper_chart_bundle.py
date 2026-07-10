@@ -139,7 +139,43 @@ def test_short_only_strategy_emits_full_history_triggers():
     only strategy produced ZERO trades → NO trigger triangles (the 'no triangles on the
     chart' bug). The trade mode must be resolved from the strategy."""
     import numpy as np
-    from forven.strategies.custom.ETH_emabreakatrshort_s157270 import STRATEGY_CLASS
+    from forven.strategies.base import BaseStrategy
+    from forven.strategies.base import Signal
+
+    class MockShortOnlyStrategy(BaseStrategy):
+        @property
+        def name(self) -> str:
+            return "mock_short_only"
+
+        @property
+        def asset(self) -> str:
+            return "BTC"
+
+        @property
+        def strategy_type(self) -> str:
+            return "mock_short_only"
+
+        @property
+        def default_params(self) -> dict:
+            return {}
+
+        @property
+        def supported_trade_modes(self) -> set[str]:
+            return {"short_only"}
+
+        def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+            entry = pd.Series(False, index=df.index)
+            exit_ = pd.Series(False, index=df.index)
+            for idx in [100, 200, 300, 400]:
+                if idx < len(df):
+                    entry.iloc[idx] = True
+            for idx in [120, 220, 320, 420]:
+                if idx < len(df):
+                    exit_.iloc[idx] = True
+            return entry, exit_
+
+        def generate_signal(self, df: pd.DataFrame) -> Signal:
+            return Signal(action="hold", price=float(df["close"].iloc[-1]))
 
     n = 600
     idx = pd.date_range("2026-05-01", periods=n, freq="1h", tz="UTC")
@@ -147,11 +183,11 @@ def test_short_only_strategy_emits_full_history_triggers():
     frame = pd.DataFrame(
         {"open": close, "high": close + 6, "low": close - 6, "close": close, "volume": 1000.0}, index=idx
     )
-    strat = STRATEGY_CLASS("S-SHORT", {"_asset": "BTC", "ema_fast": 16, "ema_slow": 40, "atr_period": 12, "exit_k": 1.2})
+    strat = MockShortOnlyStrategy("S-SHORT", {"_asset": "BTC"})
     assert paper_domain._resolve_trigger_trade_mode(strat, strat.params) == "short_only"
 
     entries, exits = paper_domain._kernel_trigger_markers(
-        strat, frame, params=strat.params, leverage=2.0, strategy_type="emabreakatrshort_r3l12_h", cutoff=None,
+        strat, frame, params=strat.params, leverage=2.0, strategy_type="mock_short_only", cutoff=None,
     )
     assert entries, "short-only strategy emitted no triggers (trade_mode regression)"
     # Short opens are SHORT (red ▼), closes are COVER (green ▲).

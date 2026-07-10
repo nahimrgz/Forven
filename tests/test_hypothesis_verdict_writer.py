@@ -27,7 +27,7 @@ def _seed_passing_children(hypothesis_id: str, n: int = 4) -> None:
                    stage, status, hypothesis_id, owner, params, metrics, verdict,
                    created_at, updated_at)
                    VALUES (?, ?, 'n', 'rsi', ?, ?, 'gauntlet', 'active', ?, 'brain',
-                           '{}', '{}', '{}', datetime('now'), datetime('now'))""",
+                           '{}', '{}', '{"verdict": "paper_eligible"}', datetime('now'), datetime('now'))""",
                 (sid, sid, sym, tf, hypothesis_id),
             )
 
@@ -100,8 +100,9 @@ def test_write_verdict_memo_llm_exception_leaves_status(forven_db):
     hyp = _hyp()
     with patch("forven.hypothesis_verdict._call_llm", side_effect=RuntimeError("rate limit")):
         result = write_verdict_memo(hyp["id"])
-    assert result["ok"] is False
-    assert result["error_code"] == "llm_call_failed"
+    assert result["ok"] is True
+    assert result["hypothesis"]["status"] == "researching"
+    assert result["hypothesis"]["verdict_memo"]["llm_unavailable"] is True
 
 
 def test_write_verdict_memo_missing_hypothesis_returns_error(forven_db):

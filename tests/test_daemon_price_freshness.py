@@ -12,7 +12,7 @@ import pytest
 import forven.daemon as d
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_run_tick_publishes_price_before_risk_cycle(forven_db, monkeypatch):
     order: list[str] = []
 

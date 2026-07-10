@@ -82,6 +82,8 @@ _DEFAULT_JOB_IDS = {
     "forven-gauntlet-step-loop",
     "forven-phantom-sweep",
     "forven-param-optimization",
+    "forven-testnet-harness",
+    "forven-exec-quality-watchdog",
 }
 _SUPERSEDED_CRUCIBLE_AGENT_JOB_IDS = {
     "forven-ideation-daily",

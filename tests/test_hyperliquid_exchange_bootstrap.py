@@ -90,13 +90,17 @@ def hl_exchange_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "hyperliquid.utils.constants", constants_mod)
     monkeypatch.setitem(sys.modules, "hyperliquid.utils.types", types_mod)
 
+    _orig_hl_module = sys.modules.get("forven.exchange.hyperliquid")
     sys.modules.pop("forven.exchange.hyperliquid", None)
     import forven.exchange.hyperliquid as hl
 
     module = importlib.reload(hl)
     module._exchange_calls = exchange_calls
     yield module
-    sys.modules.pop("forven.exchange.hyperliquid", None)
+    if _orig_hl_module is not None:
+        sys.modules["forven.exchange.hyperliquid"] = _orig_hl_module
+    else:
+        sys.modules.pop("forven.exchange.hyperliquid", None)
 
 
 def test_get_exchange_retries_with_sanitized_spot_meta(hl_exchange_module, monkeypatch):

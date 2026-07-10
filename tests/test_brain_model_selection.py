@@ -26,7 +26,7 @@ def test_run_brain_task_uses_saved_brain_agent_selection_by_default(forven_db, m
 
     captured: dict[str, str] = {}
 
-    async def _fake_call_with_tools(provider, model, messages, context, tools=None):
+    async def _fake_call_with_tools(provider, model, messages, context, tools=None, **kwargs):
         captured["provider"] = provider
         captured["model"] = model
         captured["message"] = messages[-1]["content"]
@@ -67,7 +67,7 @@ def test_run_brain_task_respects_explicit_payload_override(forven_db, monkeypatc
 
     captured: dict[str, str] = {}
 
-    async def _fake_call_with_tools(provider, model, messages, context, tools=None):
+    async def _fake_call_with_tools(provider, model, messages, context, tools=None, **kwargs):
         captured["provider"] = provider
         captured["model"] = model
         return "ok"

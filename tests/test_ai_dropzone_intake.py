@@ -353,7 +353,7 @@ def test_auto_intake_recent_files_links_embedded_hypothesis_id(forven_db, monkey
     from forven.hypotheses import create_hypothesis
 
     hypothesis = create_hypothesis(
-        title="Recent auto-intake lineage",
+        title="Recent auto-intake lineage AIDropzoneWave",
         market_thesis="Fresh custom strategy files should stay linked to their parent hypothesis.",
         mechanism="Read an embedded hypothesis marker before auto-intake creates a container.",
         lane="exploration",

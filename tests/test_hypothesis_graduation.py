@@ -37,7 +37,7 @@ def _make_strategy(
             type_="rsi",
             symbol=symbol,
             timeframe=timeframe,
-            params={},
+            params={"test_seed": sid_seed},
             stage=stage,
             hypothesis_id=hypothesis_id,
             strategy_id=f"S{50000 + sid_seed:05d}",

@@ -492,3 +492,17 @@ def test_load_archived_custom_runtime_type_negative_caches_broken_module(monkeyp
     assert registry_mod._load_archived_custom_runtime_type("broken_type_s99999") is False
     assert len(attempts) == 1
     assert "broken_type_s99999" in registry_mod._FAILED_CUSTOM_MODULES
+
+
+def test_resolve_runtime_type_resolves_donchian_aliases():
+    registry_mod.reset()
+    registry_mod.register_type("donchian", DummyStrategy)
+
+    resolved, meta = registry_mod.resolve_runtime_type("donchian_channel")
+    assert resolved == "donchian"
+    assert meta["blocked_reason"] is None
+
+    resolved, meta = registry_mod.resolve_runtime_type("donchian_breakout")
+    assert resolved == "donchian"
+    assert meta["blocked_reason"] is None
+

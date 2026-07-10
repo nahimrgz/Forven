@@ -68,6 +68,7 @@ def test_startup_recovery_preflight_blocks_on_reconciliation_issues(monkeypatch)
         "source": "exchange",
         "network": "testnet",
         "synced_at": state["account_equity_synced_at"],
+        "books": {},
     }
 
 
