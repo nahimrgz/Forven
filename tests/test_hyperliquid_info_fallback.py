@@ -49,10 +49,19 @@ def hl_module(monkeypatch):
     info_mod.Info = _BrokenInfo
 
     utils_mod = types.ModuleType("hyperliquid.utils")
+    utils_mod.__path__ = []
     constants_mod = types.ModuleType("hyperliquid.utils.constants")
     constants_mod.TESTNET_API_URL = "https://test.hyperliquid.local"
     constants_mod.MAINNET_API_URL = "https://main.hyperliquid.local"
     utils_mod.constants = constants_mod
+
+    types_mod = types.ModuleType("hyperliquid.utils.types")
+    class _DummyCloid:
+        @classmethod
+        def from_str(cls, val):
+            return val
+    types_mod.Cloid = _DummyCloid
+    utils_mod.types = types_mod
 
     root.exchange = exchange_mod
     root.info = info_mod
@@ -63,13 +72,18 @@ def hl_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "hyperliquid.info", info_mod)
     monkeypatch.setitem(sys.modules, "hyperliquid.utils", utils_mod)
     monkeypatch.setitem(sys.modules, "hyperliquid.utils.constants", constants_mod)
+    monkeypatch.setitem(sys.modules, "hyperliquid.utils.types", types_mod)
 
+    _orig_hl_module = sys.modules.get("forven.exchange.hyperliquid")
     sys.modules.pop("forven.exchange.hyperliquid", None)
     import forven.exchange.hyperliquid as hl
 
     module = importlib.reload(hl)
     yield module
-    sys.modules.pop("forven.exchange.hyperliquid", None)
+    if _orig_hl_module is not None:
+        sys.modules["forven.exchange.hyperliquid"] = _orig_hl_module
+    else:
+        sys.modules.pop("forven.exchange.hyperliquid", None)
 
 
 def test_get_account_value_uses_direct_info_fallback_when_sdk_bootstrap_breaks(hl_module, monkeypatch):
@@ -126,7 +140,7 @@ def test_build_info_client_logs_fallback_warning_once_per_process(hl_module, mon
     def _fake_warning(message, *args):
         warnings.append(message % args if args else str(message))
 
-    monkeypatch.setattr(hl.log, "warning", _fake_warning)
+    monkeypatch.setattr(hl.log, "info", _fake_warning)
 
     first = hl._build_info_client("https://test.hyperliquid.local")
     second = hl._build_info_client("https://test.hyperliquid.local")

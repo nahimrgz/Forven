@@ -35,7 +35,7 @@ from forven.policy import (
 
 def _insert_strategy(conn, sid, *, metrics=None, stage="paper_trading", stage_changed_at="DEFAULT"):
     if stage_changed_at == "DEFAULT":
-        stage_changed_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        stage_changed_at = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)).isoformat()
     conn.execute(
         "INSERT INTO strategies (id, name, type, stage, stage_changed_at, metrics, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -46,20 +46,21 @@ def _insert_strategy(conn, sid, *, metrics=None, stage="paper_trading", stage_ch
             stage,
             stage_changed_at,
             json.dumps(metrics or {}),
-            (datetime.now(timezone.utc) - timedelta(days=45)).isoformat(),
+            (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=45)).isoformat(),
         ),
     )
     conn.commit()
 
 
 def _insert_paper_trades(conn, sid, pnls):
-    base = datetime.now(timezone.utc) - timedelta(days=20)
+    base = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=20)
     for i, pnl in enumerate(pnls):
         closed_at = (base + timedelta(hours=i)).isoformat()
         conn.execute(
             "INSERT INTO trades (id, strategy_id, strategy, asset, direction, status, pnl_pct, "
-            "execution_type, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (f"t-{sid}-{i}", sid, sid, "BTC/USDT", "long", "CLOSED", pnl, "paper", closed_at),
+            "execution_type, closed_at, signal_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"t-{sid}-{i}", sid, sid, "BTC/USDT", "long", "CLOSED", pnl, "paper", closed_at,
+             json.dumps({"pnl_is_equity_fraction": 1})),
         )
     conn.commit()
 
@@ -376,16 +377,16 @@ def test_check_paper_trades_window_falls_back_to_created_at(forven_db):
     with get_db() as conn:
         _insert_strategy(conn, "p-window-fallback", metrics={}, stage_changed_at=None)
         # Old trades BEFORE created_at must not count toward the paper sample.
-        old = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+        old = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=400)).isoformat()
         for i in range(60):
             conn.execute(
                 "INSERT INTO trades (id, strategy_id, strategy, asset, direction, status, pnl_pct, "
-                "execution_type, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "execution_type, closed_at, signal_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (f"t-old-{i}", "p-window-fallback", "p-window-fallback", "BTC/USDT", "long",
-                 "CLOSED", 1.0, "paper", old),
+                 "CLOSED", 1.0, "paper", old, json.dumps({"pnl_is_equity_fraction": 1})),
             )
         conn.commit()
 
-    ok, detail = policy._check_paper_trades("p-window-fallback")
+    ok, detail, _ = policy._check_paper_trades("p-window-fallback")
     assert not ok
     assert detail.startswith("Insufficient paper trades: 0/")

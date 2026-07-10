@@ -198,7 +198,13 @@ for cls_name, cls in strategy_classes:
     try:
         instance = cls("test_id", {{}})
     except Exception as exc:
-        print(f"ERROR: Could not instantiate {{cls_name}}: {{exc}}")
+        print(
+            f"ERROR: Could not instantiate {{cls_name}}: {{exc}}. Custom strategies "
+            "must NOT define their own __init__ — inherit BaseStrategy's "
+            "__init__(self, strategy_id, params) and put tunables in default_params. "
+            "If you must override, use "
+            "'def __init__(self, strategy_id, params=None): super().__init__(strategy_id, params)'."
+        )
         sys.exit(1)
 
     try:

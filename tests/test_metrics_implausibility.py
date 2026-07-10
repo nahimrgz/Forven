@@ -51,6 +51,31 @@ def test_absurd_return_flagged():
     assert check_metrics_integrity(_metrics(1.0, 1.0, ret=24000.0))  # millions-% leak
 
 
+def test_large_negative_unclamped_sharpe_is_not_flagged_as_leak():
+    # S00239: OOS Sharpe -8.64 (unclamped) on a genuinely losing strategy is NOT a
+    # data leak — a leak makes performance implausibly GOOD (positive). A large
+    # negative Sharpe is a consistent loser / low-dispersion small sample the gates
+    # reject normally. It must not fire the data-quality "data leak" quarantine.
+    assert check_metrics_integrity(_metrics(-0.12, -8.64)) == []
+
+
+def test_s00239_realistic_losing_payload_is_clean():
+    # The real persisted S00239 legs — losing in both, no anomaly to quarantine.
+    metrics = {
+        "in_sample": {"sharpe": -0.12, "total_trades": 12, "profit_factor": 0.869, "total_return_pct": -0.02184},
+        "out_of_sample": {"sharpe": -8.64, "total_trades": 23, "profit_factor": 0.054, "total_return_pct": -0.22452},
+    }
+    assert check_metrics_integrity(metrics) == []
+
+
+def test_negative_unclamped_sharpe_does_not_mask_a_positive_leak_leg():
+    # A losing OOS leg must not be flagged, but an implausibly-high POSITIVE in_sample
+    # leg on the same payload still is — direction-awareness is per leg.
+    anomalies = check_metrics_integrity(_metrics(7.5, -8.64))
+    assert any("in_sample" in a and "leak" in a for a in anomalies)
+    assert not any("out_of_sample" in a for a in anomalies)
+
+
 def test_normal_metrics_pass_clean():
     assert check_metrics_integrity(_metrics(1.2, 0.9, pf=1.6, ret=0.08)) == []
     assert check_metrics_integrity(_metrics(0.07, 2.19, pf=1.96, ret=0.30)) == []  # real R2 winner S02754

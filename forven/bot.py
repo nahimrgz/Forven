@@ -475,6 +475,20 @@ def get_bot_token() -> str:
     return token
 
 
+def is_discord_configured() -> bool:
+    """Check if Discord bot token is configured."""
+    try:
+        token = os.environ.get("DISCORD_TOKEN")
+        if token and token.strip():
+            return True
+        cfg = load_config()
+        from forven.secret_storage import decrypt_secret
+        token = decrypt_secret(cfg.get("discord_token") or "")
+        return bool(token and token.strip())
+    except Exception:
+        return False
+
+
 def _build_default_agents() -> list[dict]:
     """Build the DEFAULT_AGENTS seed list, using dynamic settings from kv."""
     from forven.db import kv_get

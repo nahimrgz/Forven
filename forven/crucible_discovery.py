@@ -28,6 +28,33 @@ _VALID_MODES = {"operator_approves", "autonomous"}
 # How many known-crucible titles to inline in the discovery task description.
 # Bounded so a large pool can't blow up the prompt.
 _KNOWN_TITLE_DIGEST_LIMIT = 40
+# One-line rationale appended to each disproven title (see _disproven_rationale).
+_DISPROVEN_RATIONALE_TRUNCATE_CHARS = 200
+
+
+def _disproven_rationale(verdict_memo_raw: Any) -> str:
+    """One-line reason a disproven hypothesis died, from its verdict_memo.
+
+    verdict_memo (hypotheses.verdict_memo, written by
+    hypothesis_verdict.write_verdict_memo) carries the LLM-authored rationale
+    for why a hypothesis was disproven. Surfacing it next to the bare title lets
+    the discovery agent avoid re-proposing the same FAILURE MODE, not just the
+    same name. Best-effort: absent/malformed/legacy-empty memo -> "" so the
+    digest degrades to the bare title instead of failing.
+    """
+    try:
+        memo = verdict_memo_raw
+        if isinstance(memo, str):
+            memo = json.loads(memo)
+        if not isinstance(memo, dict):
+            return ""
+        rationale = str(memo.get("rationale") or "").strip()
+        if not rationale:
+            return ""
+        rationale = " ".join(rationale.split())
+        return rationale[:_DISPROVEN_RATIONALE_TRUNCATE_CHARS]
+    except Exception:
+        return ""
 
 
 def _known_crucible_titles(limit: int = _KNOWN_TITLE_DIGEST_LIMIT) -> list[str]:
@@ -54,7 +81,7 @@ def _known_crucible_titles(limit: int = _KNOWN_TITLE_DIGEST_LIMIT) -> list[str]:
         with get_db() as conn:
             rows = conn.execute(
                 """
-                SELECT title
+                SELECT title, status, verdict_memo
                 FROM hypotheses
                 WHERE (manager_state = 'active' AND status IN ('proposed', 'researching', 'proven'))
                    OR (status = 'disproven' AND COALESCE(verdict_memo_at, updated_at, created_at) >= ?)
@@ -71,9 +98,15 @@ def _known_crucible_titles(limit: int = _KNOWN_TITLE_DIGEST_LIMIT) -> list[str]:
     for row in rows:
         title = str(row["title"] or "").strip()
         key = title.lower()
-        if title and key not in seen:
-            seen.add(key)
-            titles.append(title)
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        entry = title
+        if str(row["status"] or "").strip().lower() == "disproven":
+            rationale = _disproven_rationale(row["verdict_memo"])
+            if rationale:
+                entry = f"{title} (died: {rationale})"
+        titles.append(entry)
     return titles
 
 

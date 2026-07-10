@@ -18,16 +18,15 @@ def _sample_ohlcv(rows: int = 240) -> pd.DataFrame:
     )
 
 
-def test_funding_strategy_uses_sentiment_funding_rates(monkeypatch):
-    monkeypatch.setattr(
-        "forven.strategies.sentiment.fetch_funding_rates",
-        lambda: {"BTC": {"funding": -0.0002, "openInterest": 1000.0}},
-    )
+def test_funding_strategy_uses_funding_rates():
+    df = _sample_ohlcv()
+    df["funding_rate"] = -0.0002
 
     strategy = FundingStrategy("S027-FUND-BTC", {"_asset": "BTC"})
-    signal = strategy.generate_signal(_sample_ohlcv())
+    signal = strategy.generate_signal(df)
 
     assert signal.price > 0
     assert signal.entry_signal is True
     assert signal.exit_signal is False
     assert float(signal.indicators.get("funding")) == -0.0002
+

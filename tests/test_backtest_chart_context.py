@@ -320,9 +320,6 @@ def test_chart_context_fetches_remote_ohlcv_when_local_dataset_is_unreadable(for
 	import forven.api_core as api_core
 	import forven.data as data_mod
 
-	monkeypatch.setattr(data_mod, "pa", None)
-	monkeypatch.setattr(data_mod, "pq", None)
-
 	unreadable_path = data_mod.parquet_path("DOT/USDT", "1h")
 	unreadable_path.parent.mkdir(parents=True, exist_ok=True)
 	unreadable_path.write_bytes(b"PAR1broken-dot-data")

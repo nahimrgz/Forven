@@ -16,6 +16,8 @@ hyperliquid-python-sdk>=0.22.0
 mcp>=1.0
 numpy>=1.26
 pandas>=2.2
+# Maintained fork of the retired pandas-ta; aliased to `pandas_ta` in forven/__init__.py.
+pandas-ta-classic>=0.6.52
 psutil>=5.9
 pyarrow>=16.0.0
 PyJWT>=2.8

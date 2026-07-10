@@ -69,7 +69,11 @@ _DISAMBIGUATION_MAP: dict[str, str] = {
     "supertrend": "supertrend",
     # VWAP_trend has three prefix matches (composite / momentum / pullback); composite is canonical
     "vwap_trend": "vwap_trend_composite",
+    # Donchian channel aliases -> base donchian type
+    "donchian_channel": "donchian",
+    "donchian_breakout": "donchian",
 }
+
 
 
 def register(strategy: BaseStrategy):
@@ -587,6 +591,17 @@ def _register_module_type_tolerant(module, *, raise_on_skip: bool = False) -> No
         cls = candidates[0]
     if not type_name:
         type_name = getattr(cls, "TYPE_NAME", None)
+    if not type_name:
+        # ``strategy_type`` is the canonical BaseStrategy contract attribute;
+        # ``TYPE_NAME`` is only the legacy module-level convention. Codegen that
+        # emits a concrete ``class X(BaseStrategy): strategy_type = "..."`` without
+        # a TYPE_NAME (e.g. cme_weekend_gap_mr_v2 / S00203) would otherwise fall
+        # through unregistered and surface as "Unknown strategy type" at backtest.
+        # Only a plain string overrides the inherited abstract property — the raw
+        # descriptor must never be coerced into a bogus key.
+        class_strategy_type = getattr(cls, "strategy_type", None)
+        if isinstance(class_strategy_type, str) and class_strategy_type.strip():
+            type_name = class_strategy_type
     if not type_name:
         return
     if isinstance(type_name, str) and type_name in _TYPE_MAP:

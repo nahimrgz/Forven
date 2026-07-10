@@ -146,6 +146,7 @@ def test_sweep_marks_incomplete_only_when_no_price_anywhere(forven_db):
     _insert_paper_trade(
         "P-SWEEP-NONE",
         asset="SOL",
+        entry_price=None,
         signal_exit_price=None,
         signal_data={
             "pending_close_reconcile": True,

@@ -72,6 +72,7 @@ def test_fetch_binance_candles_drops_unclosed_bar(monkeypatch):
     # forming (closes at 11*interval > end) and must be dropped.
     rows = [[i * interval_ms, 1.0 + i, 2.0 + i, 0.5 + i, 1.5 + i, 10 + i] for i in range(0, 11)]
     monkeypatch.setattr(md, "_binance_exchange", lambda: _FakeExchange(rows))
+    monkeypatch.setattr(md, "_binance_futures_exchange", lambda: _FakeExchange(rows))
     df = md.fetch_binance_candles("BTC", bars=5, interval="1h", end_time=end)
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
     assert len(df) == 5  # tail(5)
@@ -89,6 +90,7 @@ def test_fetch_binance_candles_include_unclosed_keeps_forming_bar(monkeypatch):
     end = 10 * interval_ms
     rows = [[i * interval_ms, 1.0 + i, 2.0 + i, 0.5 + i, 1.5 + i, 10 + i] for i in range(0, 11)]
     monkeypatch.setattr(md, "_binance_exchange", lambda: _FakeExchange(rows))
+    monkeypatch.setattr(md, "_binance_futures_exchange", lambda: _FakeExchange(rows))
     closed = md.fetch_binance_candles("BTC", bars=20, interval="1h", end_time=end)
     live = md.fetch_binance_candles("BTC", bars=20, interval="1h", end_time=end, include_unclosed=True)
     assert int(closed.index[-1].value // 1_000_000) == 9 * interval_ms   # forming bar dropped

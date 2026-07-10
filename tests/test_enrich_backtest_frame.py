@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from forven.data_manager import DataManager, _merge_asof_parquet, _save_stream_parquet
 

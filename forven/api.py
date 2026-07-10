@@ -751,6 +751,12 @@ if _frontend_dir and os.path.isdir(_frontend_dir):
         r for r in app.router.routes
         if not (getattr(r, "path", None) == "/" and "GET" in (getattr(r, "methods", None) or set()))
     ]
+    for r in app.router.routes:
+        if type(r).__name__ == "_IncludedRouter" and hasattr(r, "original_router"):
+            r.original_router.routes = [
+                sub_r for sub_r in r.original_router.routes
+                if not (getattr(sub_r, "path", None) == "/" and "GET" in (getattr(sub_r, "methods", None) or set()))
+            ]
     app.mount("/", StaticFiles(directory=_frontend_dir, html=True), name="frontend")
 
 

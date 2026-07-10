@@ -48,4 +48,62 @@ def _install_ta_import_tripwire() -> None:
         sys.meta_path.insert(0, _BannedTaImportFinder())
 
 
+def _install_pandas_ta_alias() -> None:
+    """Resolve `import pandas_ta` to the `pandas_ta_classic` fork.
+
+    The original `pandas-ta` distribution was pulled from PyPI, but the strategy
+    corpus, the sandbox allowlist (`forven.sandbox.ast_guard.ALLOWED_IMPORTS`),
+    and LLM-generated strategy sources all say `import pandas_ta`. We ship the
+    maintained community fork `pandas-ta-classic` (numpy>=2 compatible), whose
+    top-level module is `pandas_ta_classic`, and bridge the name gap here.
+
+    The finder is APPENDED to `sys.meta_path`, so a genuine `pandas_ta`
+    distribution — if one ever reappears in the environment — always resolves
+    first; this alias only fires when the normal import machinery has already
+    failed to find `pandas_ta`. Loading is lazy: `pandas_ta_classic` (and the
+    pandas/numpy stack it drags in) is only imported when strategy code first
+    asks for `pandas_ta`.
+    """
+    import sys
+    from importlib import import_module
+    from importlib.abc import Loader, MetaPathFinder
+    from importlib.util import spec_from_loader
+
+    _ALIAS = "pandas_ta"
+    _REAL = "pandas_ta_classic"
+
+    class _PandasTaAliasLoader(Loader):
+        """Hands the already-imported real module to the import machinery."""
+
+        def __init__(self, real_name: str) -> None:
+            self._real_name = real_name
+
+        def create_module(self, spec):  # noqa: D401, ANN001, ANN201
+            return import_module(self._real_name)
+
+        def exec_module(self, module) -> None:  # noqa: ANN001
+            pass  # create_module returned a fully-initialized module.
+
+    class _PandasTaAliasFinder(MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):  # noqa: D401, ANN001
+            if fullname != _ALIAS and not fullname.startswith(_ALIAS + "."):
+                return None
+            real_name = _REAL + fullname[len(_ALIAS):]
+            try:
+                real_module = import_module(real_name)
+            except ModuleNotFoundError:
+                return None  # fork not installed — fail like any missing module
+            spec = spec_from_loader(fullname, _PandasTaAliasLoader(real_name))
+            search = getattr(real_module, "__path__", None)
+            if search is not None:
+                spec.submodule_search_locations = list(search)
+            return spec
+
+    # Appended, NOT inserted at the front: a real `pandas_ta` install wins.
+    # Idempotent: only install once per process.
+    if not any(isinstance(f, _PandasTaAliasFinder) for f in sys.meta_path):
+        sys.meta_path.append(_PandasTaAliasFinder())
+
+
 _install_ta_import_tripwire()
+_install_pandas_ta_alias()

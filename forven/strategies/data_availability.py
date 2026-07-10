@@ -294,8 +294,52 @@ def infer_required_columns(strategy_cls, asset: str) -> frozenset[str]:
 _AVAIL_TTL_SECONDS = 60.0
 _AVAIL_CACHE: dict[tuple[str, str], tuple[float, frozenset[str]]] = {}
 _AVAIL_LOCK = threading.Lock()
-_FETCH_ATTEMPTED: set[tuple[str, str]] = set()
+# Maps (fs_symbol, stream) -> either ``True`` (fetch already landed -- never
+# needs redoing) or a ``float`` timestamp of the last FAILED attempt. Storing
+# a bare "attempted" flag here (the previous design) meant one transient BV/
+# ccxt hiccup on the very first call permanently poisoned that (symbol,
+# stream) for the rest of the process's life: every later strategy needing
+# e.g. BTC basis would see it as "already tried" and skip re-fetching, even
+# though the feed was fully obtainable again moments later (verified
+# manually: dm.backfill(symbol="BTC/USDT", streams=("basis",)) succeeds fine
+# on retry). This was the root cause behind repeated "could not be
+# downloaded" gate blocks for feeds (basis, taker_buy_sell_ratio,
+# funding_rate, ...) that are, in fact, downloadable -- see the H00012
+# post-mortem / gate_rejections for S00032/S00034/S00090/S00107/S00162/
+# S00168/S00173/S00174.
+_FETCH_ATTEMPTED: dict[tuple[str, str], float | bool] = {}
 _FETCH_LOCK = threading.Lock()
+# How long a FAILED attempt blocks a retry. Long-running gauntlet workers
+# re-enter this path constantly, so this must be long enough to avoid
+# hammering a genuinely-down source, but short enough that a transient blip
+# self-heals within one gauntlet sweep rather than archiving strategies on
+# infrastructure noise for the rest of the process's life.
+_FETCH_RETRY_COOLDOWN_SECONDS = 300.0
+
+
+def _probe_market_data_columns(symbol: str) -> frozenset[str]:
+    """Lazy-probe live market-data series to see if funding rate/OI are available.
+
+    Uses a 3-day window. Fails open (returns both columns) on any exception.
+    """
+    try:
+        from forven.strategies.backtest import _resolve_market_data_series
+
+        normalized_asset = str(symbol or "").strip().upper().replace("/USDT", "").replace("/USD", "")
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - 3 * 24 * 60 * 60 * 1000
+
+        funding_data, oi_data = _resolve_market_data_series(normalized_asset, start_ms, end_ms)
+
+        present = set()
+        if funding_data:
+            present.add("funding_rate")
+        if oi_data:
+            present.add("open_interest")
+        return frozenset(present)
+    except Exception as exc:
+        log.debug("probe of market data columns failed: %s", exc)
+        return frozenset({"funding_rate", "open_interest"})
 
 
 def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
@@ -314,7 +358,7 @@ def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
     try:
         from forven.dataeng.hub import _available_enrichment_specs
 
-        specs = _available_enrichment_specs(symbol, timeframe, include_macro=False, exclude_streams=set())
+        specs = _available_enrichment_specs(symbol, timeframe, include_macro=False, exclude_streams={"funding", "oi"})
         for spec in specs:
             present.update(spec.output_columns)
     except Exception as exc:  # pragma: no cover - defensive
@@ -328,6 +372,7 @@ def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
     return result
 
 
+
 def _invalidate_availability(symbol: str, timeframe: str) -> None:
     with _AVAIL_LOCK:
         _AVAIL_CACHE.pop((symbol, timeframe), None)
@@ -336,9 +381,12 @@ def _invalidate_availability(symbol: str, timeframe: str) -> None:
 def _fetch_stream(symbol: str, stream: str) -> bool:
     """Best-effort synchronous backfill of one stream for one symbol.
 
-    Guarded so each (symbol, stream) is attempted at most once per process —
-    gauntlet/optimization loops re-enter this path many times per strategy.
-    Returns True if a fetch was executed without raising.
+    A successful fetch is never repeated for the life of the process (nothing
+    to gain -- the data already landed). A FAILED fetch is retried after
+    ``_FETCH_RETRY_COOLDOWN_SECONDS`` instead of being remembered forever, so a
+    single transient network/API failure cannot permanently block every later
+    strategy that needs the same feed. Returns True if a fetch was executed
+    without raising.
     """
     selector = _STREAM_FETCH.get(stream)
     if selector is None:
@@ -350,10 +398,14 @@ def _fetch_stream(symbol: str, stream: str) -> bool:
     except Exception:
         fs_symbol = symbol
     guard_key = (fs_symbol, stream)
+    now = time.time()
     with _FETCH_LOCK:
-        if guard_key in _FETCH_ATTEMPTED:
-            return False
-        _FETCH_ATTEMPTED.add(guard_key)
+        last = _FETCH_ATTEMPTED.get(guard_key)
+        if last is True:
+            return False  # already landed this process; nothing to redo
+        if isinstance(last, (int, float)) and (now - last) < _FETCH_RETRY_COOLDOWN_SECONDS:
+            return False  # failed recently; still cooling down, don't hammer the source
+        _FETCH_ATTEMPTED[guard_key] = now
     try:
         from forven.data_manager import get_data_manager
 
@@ -363,6 +415,8 @@ def _fetch_stream(symbol: str, stream: str) -> bool:
             dm.collect_iv()
         else:
             dm.backfill(symbol=symbol, streams=tuple(selector))
+        with _FETCH_LOCK:
+            _FETCH_ATTEMPTED[guard_key] = True
         log.info("Auto-fetched %s (%s) for %s", stream, selector, symbol)
         return True
     except Exception as exc:

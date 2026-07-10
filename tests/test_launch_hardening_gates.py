@@ -23,27 +23,27 @@ from forven.policy import (
 
 def _insert_strategy(conn, sid, *, metrics=None, stage="paper_trading", stage_changed_at="DEFAULT"):
     if stage_changed_at == "DEFAULT":
-        stage_changed_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        stage_changed_at = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)).isoformat()
     conn.execute(
         "INSERT INTO strategies (id, name, type, stage, stage_changed_at, metrics, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             sid, sid, "rsi_momentum", stage, stage_changed_at,
             json.dumps(metrics or {}),
-            (datetime.now(timezone.utc) - timedelta(days=45)).isoformat(),
+            (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=45)).isoformat(),
         ),
     )
     conn.commit()
 
 
 def _insert_paper_trades(conn, sid, pnls):
-    base = datetime.now(timezone.utc) - timedelta(days=20)
+    base = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=20)
     for i, pnl in enumerate(pnls):
         conn.execute(
             "INSERT INTO trades (id, strategy_id, strategy, asset, direction, status, pnl_pct, "
-            "execution_type, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "execution_type, closed_at, signal_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (f"t-{sid}-{i}", sid, sid, "BTC/USDT", "long", "CLOSED", pnl, "paper",
-             (base + timedelta(hours=i)).isoformat()),
+             (base + timedelta(hours=i)).isoformat(), json.dumps({"pnl_is_equity_fraction": 1})),
         )
     conn.commit()
 
@@ -66,8 +66,8 @@ def test_quick_screen_rejects_low_trade_count(forven_db):
         )
     passed, msg = _evaluate_quick_screen_gate("qs-few", load_pipeline_config())
     assert not passed
-    assert "statistically meaningless" in msg
-    assert "20 minimum" in msg  # Default preset quick_screen.min_trades relaxed 30 -> 20
+    assert "effective minimum" in msg
+    assert "20 effective minimum" in msg  # Default preset quick_screen.min_trades relaxed 30 -> 20
 
 
 def test_quick_screen_min_trades_clears_at_sufficient_sample(forven_db):

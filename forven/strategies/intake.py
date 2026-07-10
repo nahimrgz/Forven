@@ -22,6 +22,17 @@ log = logging.getLogger("forven.strategies.intake")
 _BANNED_IMPORT_ROOTS: frozenset[str] = frozenset({"ta"})
 
 
+# Appended to instantiation failures so an agent that overrode __init__ with the
+# wrong signature (the common "takes 2 positional but 3 given" error) is told the
+# actual constructor contract instead of a bare TypeError.
+_CTOR_HINT = (
+    " Custom strategies must NOT define their own __init__ — inherit BaseStrategy's "
+    "__init__(self, strategy_id, params) and put tunables in default_params. If you "
+    "must override, use "
+    "'def __init__(self, strategy_id, params=None): super().__init__(strategy_id, params)'."
+)
+
+
 # Supported intervals for the STORED strategy timeframe. A declared "_timeframe"
 # outside this set (typo / no-data interval) falls back to "1h" so it can never
 # wedge the gauntlet on an "unsupported interval" error.
@@ -379,7 +390,7 @@ def scan_custom_strategies(*, register: bool = False) -> dict:
         except Exception as exc:
             report.errors.append(IntakeError(
                 module_name=modname,
-                error=f"Could not instantiate: {exc}",
+                error=f"Could not instantiate: {exc}.{_CTOR_HINT}",
                 file_name=file_name,
             ))
             continue
@@ -785,7 +796,60 @@ def register_custom_strategy_file(
         default_params = probe.default_params
         asset = probe.asset if hasattr(probe, "asset") else "BTC"
     except Exception as exc:
-        raise ValueError(f"Could not instantiate {file_name}: {exc}") from exc
+        raise ValueError(f"Could not instantiate {file_name}: {exc}.{_CTOR_HINT}") from exc
+
+    # Guard: forbid mechanism substitution and duplicate body classes without operator approval (Phase 5 / P5-T04)
+    clean_hypothesis_id = str(hypothesis_id or "").strip()
+    if clean_hypothesis_id:
+        from forven.hypotheses import get_hypothesis, list_hypothesis_artifacts
+        hypothesis = get_hypothesis(clean_hypothesis_id)
+        if hypothesis:
+            registered_class_name = strategy_cls.__name__
+            approved_override = _is_operator_approved(clean_hypothesis_id, registered_class_name)
+            if not approved_override:
+                # 1. Mechanism substitution check
+                artifacts = list_hypothesis_artifacts(clean_hypothesis_id)
+                if _is_mechanism_substituted(registered_class_name, hypothesis, artifacts):
+                    msg = (
+                        f"Mechanism substitution forbidden: Strategy class name '{registered_class_name}' "
+                        f"does not match the spec'd class name in the parent hypothesis {clean_hypothesis_id} "
+                        f"or its linked artifacts. An approval request has been queued."
+                    )
+                    _queue_mechanism_substitution_approval(
+                        hypothesis_id=clean_hypothesis_id,
+                        class_name=registered_class_name,
+                        type_name=type_name,
+                        origin_task_id=origin_task_id,
+                        reason_msg=msg,
+                    )
+                    raise ValueError(msg)
+                
+                # 2. Duplicate detection check
+                import inspect as _inspect
+                try:
+                    _reg_sig = _strategy_source_signature(_inspect.getsource(strategy_cls))
+                except Exception:
+                    _reg_sig = ""
+                dup_reason = _check_90d_duplicate(
+                    clean_hypothesis_id,
+                    hypothesis.get("lane") or "",
+                    registered_class_name,
+                    registered_type_name=type_name,
+                    registered_signature=_reg_sig,
+                )
+                if dup_reason:
+                    msg = (
+                        f"Duplicate registration forbidden: {dup_reason} "
+                        f"An approval request has been queued."
+                    )
+                    _queue_mechanism_substitution_approval(
+                        hypothesis_id=clean_hypothesis_id,
+                        class_name=registered_class_name,
+                        type_name=type_name,
+                        origin_task_id=origin_task_id,
+                        reason_msg=msg,
+                    )
+                    raise ValueError(msg)
 
     cert = certify_execution_strategy(type_name, default_params)
     certified = cert.certified
@@ -1336,3 +1400,324 @@ def _find_existing_strategy_container(
     with get_db() as conn:
         row = conn.execute(query, tuple(params)).fetchone()
     return dict(row) if row else None
+
+
+def camel_to_snake(name: str) -> str:
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+
+def _get_strategy_class_name(stype: str) -> str | None:
+    from forven.strategies.registry import _TYPE_MAP
+    if stype in _TYPE_MAP:
+        return _TYPE_MAP[stype].__name__
+    
+    import os
+    import re
+    # Check custom
+    custom_dir = os.path.join(os.path.dirname(__file__), "..", "strategies", "custom")
+    filepath = os.path.join(custom_dir, f"{stype}.py")
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            match = re.search(r"STRATEGY_CLASS\s*=\s*[\"']?([A-Za-z0-9_]+)[\"']?", content)
+            if match:
+                return match.group(1)
+            match_cls = re.search(r"class\s+([A-Za-z0-9_]+)\(\s*(?:BaseStrategy|builtin\.)", content)
+            if match_cls:
+                return match_cls.group(1)
+        except Exception:
+            pass
+            
+    # Check builtin
+    builtin_dir = os.path.join(os.path.dirname(__file__), "..", "strategies", "builtin")
+    filepath = os.path.join(builtin_dir, f"{stype}.py")
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            match = re.search(r"STRATEGY_CLASS\s*=\s*[\"']?([A-Za-z0-9_]+)[\"']?", content)
+            if match:
+                return match.group(1)
+            match_cls = re.search(r"class\s+([A-Za-z0-9_]+)\(\s*(?:BaseStrategy|builtin\.)", content)
+            if match_cls:
+                return match_cls.group(1)
+        except Exception:
+            pass
+    return None
+
+
+# Generic tokens carried by class names that say NOTHING about the mechanism —
+# stripped before the substitution comparison so they neither create spurious
+# matches nor dilute the overlap. Asset/side words are mechanism-neutral here
+# (the hypothesis already fixes asset and direction elsewhere).
+_MECHANISM_NOISE_TOKENS = frozenset({
+    "strategy", "strat", "signal", "model", "algo", "system", "bot",
+    "test", "probe", "candidate", "final", "new", "base",
+    "btc", "eth", "sol", "usdt", "usd", "perp", "spot", "coin",
+    "long", "short", "both", "entry", "exit",
+})
+
+
+def _mechanism_tokens(class_name: str) -> list[str]:
+    """Meaningful (mechanism-bearing) tokens of a strategy class name.
+
+    Splits camelCase/snake_case, lowercases, and drops noise: generic suffixes
+    (Strategy/Signal/...), asset/side words, version tags (v2), pure numbers, and
+    tokens shorter than 3 chars (single-letter separators like the 'X' in
+    'XAsset'). Returns [] when the name carries no mechanism signal.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in re.split(r'[^a-z0-9]+', camel_to_snake(class_name).lower()):
+        # Fold trailing digits into the stem so version/period suffixes collapse:
+        # "strategy2" -> "strategy" (noise), "v2" -> "v" (dropped), "rsi14" ->
+        # "rsi" (the indicator). A pure-digit token strips to "".
+        tok = tok.rstrip("0123456789")
+        if len(tok) < 3 or tok in _MECHANISM_NOISE_TOKENS or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _strategy_source_signature(src: str | None) -> str:
+    """Normalized signature of strategy source for TRUE-duplicate detection.
+
+    Identical LOGIC yields an identical signature regardless of class name,
+    TYPE_NAME/STRATEGY_CLASS declarations, comments, docstrings, or whitespace.
+    Two strategies are duplicates only when their signatures match — a reused
+    class name on genuinely different logic (a ``_v2`` iteration) is NOT a
+    duplicate, which is why matching on class name alone mass-fired.
+    """
+    if not src:
+        return ""
+    s = re.sub(r'"""(?:.|\n)*?"""', "", src)
+    s = re.sub(r"'''(?:.|\n)*?'''", "", s)
+    s = re.sub(r"#.*", "", s)
+    s = re.sub(r"^\s*(?:TYPE_NAME|STRATEGY_CLASS)\s*=.*$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"class\s+\w+", "class", s)  # normalize the class name out
+    s = re.sub(r"\s+", "", s)
+    return s.lower()
+
+
+def _strategy_type_signature(stype: str) -> str:
+    """Source signature for a registered/custom strategy TYPE. Prefers the loaded
+    class (works regardless of on-disk location — e.g. monkeypatched test dirs);
+    falls back to reading the custom/builtin file."""
+    import inspect
+
+    from forven.strategies.registry import _TYPE_MAP
+
+    src = None
+    cls = _TYPE_MAP.get(stype)
+    if cls is not None:
+        try:
+            src = inspect.getsource(cls)
+        except Exception:
+            src = None
+    if src is None:
+        import os
+
+        for sub in ("custom", "builtin"):
+            fp = os.path.join(os.path.dirname(__file__), "..", "strategies", sub, f"{stype}.py")
+            if os.path.exists(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        src = f.read()
+                    break
+                except Exception:
+                    pass
+    return _strategy_source_signature(src)
+
+
+def _is_mechanism_substituted(registered_class_name: str, hypothesis: dict, artifacts: list[dict]) -> bool:
+    """True when the class implements a DIFFERENT mechanism than the parent
+    hypothesis describes.
+
+    The old check required the normalized class name to appear as a CONTIGUOUS
+    substring of the hypothesis prose — a descriptively-named class
+    ('LeadLagXAssetMomentumStrategy') practically never does, so legitimate
+    candidates were mass-forbidden (86 false-positive approvals in one run). Now
+    we compare the class name's MECHANISM TOKENS against the hypothesis +
+    artifact prose: a class is 'substituted' only when NONE of its meaningful
+    tokens appear there (a genuinely different edge). Erring permissive is
+    deliberate — the guard exists to catch blatant mechanism swaps, not to police
+    naming; the duplicate and certification guards backstop everything else.
+    """
+    tokens = _mechanism_tokens(registered_class_name)
+    if not tokens:
+        # No mechanism signal in the name (generic/noise-only) — unjudgeable, so
+        # don't block on it.
+        return False
+
+    corpus_parts = [
+        hypothesis.get("title") or "",
+        hypothesis.get("mechanism") or "",
+        hypothesis.get("market_thesis") or "",
+    ]
+    for art in artifacts:
+        corpus_parts.append(art.get("source_title") or "")
+        corpus_parts.append(art.get("claimed_edge") or "")
+        corpus_parts.append(art.get("implementation_summary") or "")
+        corpus_parts.append(art.get("cached_content") or "")
+
+    corpus = re.sub(r'[^a-z0-9]', '', " ".join(corpus_parts).lower())
+    if not corpus:
+        return False  # nothing to compare against — don't block
+
+    matched = sum(1 for tok in tokens if tok in corpus)
+    return matched == 0  # substituted only when NO mechanism token overlaps
+
+
+def _is_operator_approved(hypothesis_id: str, registered_class_name: str) -> bool:
+    from forven.db import get_db
+    import json
+    import re
+    
+    def normalize(s: str) -> str:
+        return re.sub(r'[^a-zA-Z0-9]', '', s).lower()
+        
+    reg_norm = normalize(registered_class_name)
+    
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, payload FROM approvals
+            WHERE approval_type = 'mechanism_substitution_approval'
+              AND status = 'approved'
+              AND target_id = ?
+            """,
+            (hypothesis_id,),
+        ).fetchall()
+        
+        for row in rows:
+            payload_str = row["payload"] or ""
+            try:
+                payload = json.loads(payload_str)
+                if isinstance(payload, dict):
+                    p_cls = payload.get("class_name") or ""
+                    if normalize(p_cls) == reg_norm:
+                        return True
+            except Exception:
+                pass
+    return False
+
+
+def _check_90d_duplicate(
+    hypothesis_id: str,
+    current_lane: str,
+    registered_class_name: str,
+    registered_type_name: str | None = None,
+    registered_signature: str | None = None,
+) -> str | None:
+    """Flag a TRUE body duplicate: a same-hypothesis/lane strategy of a DIFFERENT
+    type whose normalized source is IDENTICAL to the one being registered.
+
+    Matching on class name alone was catastrophically over-eager: it (a) matched
+    a strategy against its OWN row on a re-registration/retry (the type resolves
+    to its own class), and (b) blocked legitimate ``_v2`` iterations that reused a
+    class name over genuinely different logic. Both are gated out now — self is
+    excluded by type, and the source-signature equality is the real duplicate
+    test (a reused class name with different code is not a duplicate).
+    """
+    from forven.db import get_db
+    from datetime import datetime, timedelta, timezone
+
+    def normalize(s: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
+
+    reg_norm = normalize(registered_class_name)
+    # Prefer the signature the caller derived from the loaded class (works even
+    # when the file lives outside the real custom dir, e.g. tests); fall back to
+    # reading the registering type's file.
+    reg_sig = registered_signature or (
+        _strategy_type_signature(registered_type_name) if registered_type_name else ""
+    )
+    if not reg_sig:
+        # Can't read the registering body -> can't prove a duplicate -> allow.
+        return None
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.id, s.type, s.hypothesis_id, h.lane, h.title
+            FROM strategies s
+            LEFT JOIN hypotheses h ON s.hypothesis_id = h.id
+            WHERE s.created_at >= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    for row in rows:
+        stype = row["type"]
+        if not stype or stype == registered_type_name:
+            continue  # exclude self: a type never duplicates itself
+
+        other_class = _get_strategy_class_name(stype)
+        if not other_class or normalize(other_class) != reg_norm:
+            continue
+
+        other_hyp_id = row["hypothesis_id"]
+        other_lane = row["lane"]
+        same_hyp = other_hyp_id == hypothesis_id
+        same_lane = bool(
+            current_lane and other_lane and current_lane.strip().lower() == other_lane.strip().lower()
+        )
+        if not (same_hyp or same_lane):
+            continue
+
+        # True-duplicate gate: identical normalized source body.
+        if _strategy_type_signature(stype) == reg_sig:
+            return (
+                f"Strategy ID {row['id']} ('{stype}', class '{other_class}') was already registered "
+                f"in the last 90 days under the same hypothesis family/lane (Hypothesis ID: {other_hyp_id}, Lane: {other_lane})."
+            )
+    return None
+
+
+def _queue_mechanism_substitution_approval(
+    hypothesis_id: str,
+    class_name: str,
+    type_name: str,
+    origin_task_id: str | None,
+    reason_msg: str
+) -> None:
+    from forven.db import get_db, create_approval
+    import json
+    
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, payload FROM approvals
+            WHERE approval_type = 'mechanism_substitution_approval'
+              AND status = 'pending_approval'
+              AND target_id = ?
+            """,
+            (hypothesis_id,),
+        ).fetchall()
+        
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+                if payload.get("class_name") == class_name:
+                    return
+            except Exception:
+                pass
+                
+    create_approval(
+        approval_type="mechanism_substitution_approval",
+        target_type="hypothesis",
+        target_id=hypothesis_id,
+        requested_status="override",
+        status="pending_approval",
+        reason=reason_msg,
+        payload={
+            "hypothesis_id": hypothesis_id,
+            "class_name": class_name,
+            "type_name": type_name,
+            "origin_task_id": origin_task_id,
+        }
+    )

@@ -87,6 +87,8 @@ _DEFAULT_JOB_IDS = {
     "forven-gauntlet-step-loop",
     "forven-phantom-sweep",
     "forven-param-optimization",
+    "forven-testnet-harness",
+    "forven-exec-quality-watchdog",
 }
 
 # PORT-GATE-1: the portfolio layer's jobs exist only while its master switch is

@@ -223,6 +223,19 @@ def dry_run_signal_validation(
             if isinstance(vec, tuple) and len(vec) == 2:
                 entries = vec[0]
                 signal_count = int(entries.fillna(False).astype(bool).sum())
+            elif isinstance(vec, tuple) and len(vec) == 4:
+                # Engine contract (backtest._normalize_signals): a 4-series
+                # payload is (long_entries, long_exits, short_entries,
+                # short_exits) — so ENTRIES are payload[0] + payload[2]. Count
+                # them the same way the backtest consumes them, so an over-tight
+                # 4-series strategy is caught here instead of falling through to
+                # the scalar sweep's "-1 unable to validate" and dying later as
+                # zero_trade.
+                long_e, short_e = vec[0], vec[2]
+                signal_count = int(
+                    long_e.fillna(False).astype(bool).sum()
+                    + short_e.fillna(False).astype(bool).sum()
+                )
             elif hasattr(vec, "long_entries") and hasattr(vec, "short_entries"):
                 signal_count = int(
                     vec.long_entries.fillna(False).astype(bool).sum()

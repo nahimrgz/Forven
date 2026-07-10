@@ -198,3 +198,6 @@ notes/
 Python/
 _my_hunks.patch
 h01421_section.txt
+
+# Agent Teams Lite / skill-registry local tooling
+.atl/

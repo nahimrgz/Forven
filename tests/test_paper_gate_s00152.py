@@ -64,11 +64,11 @@ def test_gate_excludes_non_equity_fraction_rows(forven_db):
         _insert_legacy_margin_trades(conn, "s-mixed", [0.30] * 5, flag={"non_vectorizable_legacy": True})
 
     # Sample counts ONLY the 12 flagged rows (not 17).
-    _, msg = _check_paper_trades("s-mixed")
+    _, msg, _ = _check_paper_trades("s-mixed")
     assert "12/" in msg, msg
 
     # And the excluded +30% margin rows can't inflate the compounded paper return.
-    passed, ret_msg = _check_paper_return("s-mixed")
+    passed, ret_msg, _ = _check_paper_return("s-mixed")
     assert passed  # the 12 small positive equity-fraction trades are net positive
     # 12 * +1% compounded ≈ +12.7%, NOT the ~3700% five +30% margin rows would add.
     pct = float(ret_msg.split(":")[1].strip().rstrip("%"))

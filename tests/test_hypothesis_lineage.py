@@ -90,6 +90,99 @@ def test_sibling_table_empty_when_no_children(forven_db):
     assert build_sibling_table(h["id"]) == []
 
 
+def _insert_gate_rejection(
+    strategy_id: str,
+    *,
+    gate: str = "gauntlet",
+    reason_code: str = "wfa_degradation",
+    reason_text: str = "reason detail",
+    created_at: str | None = None,
+) -> None:
+    with get_db() as conn:
+        if created_at:
+            conn.execute(
+                "INSERT INTO gate_rejections "
+                "(strategy_id, gate, reason_code, reason_text, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (strategy_id, gate, reason_code, reason_text, created_at),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO gate_rejections "
+                "(strategy_id, gate, reason_code, reason_text) "
+                "VALUES (?, ?, ?, ?)",
+                (strategy_id, gate, reason_code, reason_text),
+            )
+        conn.commit()
+
+
+def test_sibling_table_carries_latest_rejection_reason(forven_db):
+    h = _hyp()
+    s1 = _make_strategy(h["id"], sid_seed=1)
+    _insert_gate_rejection(
+        s1, gate="quick_screen", reason_code="low_sharpe",
+        reason_text="older rejection", created_at="2026-01-01T00:00:00+00:00",
+    )
+    _insert_gate_rejection(
+        s1, gate="gauntlet", reason_code="wfa_degradation",
+        reason_text="x" * 300, created_at="2026-06-01T00:00:00+00:00",
+    )
+
+    table = build_sibling_table(h["id"])
+    by_id = {row["strategy_id"]: row for row in table}
+    rejection = by_id[s1]["last_rejection"]
+
+    assert rejection is not None
+    # Most recent rejection wins, not the first one inserted.
+    assert rejection["gate"] == "gauntlet"
+    assert rejection["reason_code"] == "wfa_degradation"
+    assert rejection["reason"] == ("x" * 300)[:200]
+
+
+def test_sibling_table_no_rejection_is_none(forven_db):
+    h = _hyp()
+    s1 = _make_strategy(h["id"], sid_seed=1)
+
+    table = build_sibling_table(h["id"])
+    by_id = {row["strategy_id"]: row for row in table}
+
+    assert by_id[s1].get("last_rejection") is None
+
+
+def test_sibling_table_rejection_window_scoped_to_own_hypothesis(forven_db):
+    """Rejections belonging to a strategy from a DIFFERENT hypothesis must
+    never leak into this hypothesis's sibling table. Guards the windowed
+    subquery scoping (performance fix) didn't change join semantics."""
+    h1 = _hyp(0)
+    h2 = _hyp(1)
+    s1 = _make_strategy(h1["id"], sid_seed=1)
+    s2 = _make_strategy(h2["id"], sid_seed=2)
+    _insert_gate_rejection(
+        s2, gate="gauntlet", reason_code="other_hypothesis_rejection",
+        reason_text="belongs to a different hypothesis",
+    )
+
+    table = build_sibling_table(h1["id"])
+    by_id = {row["strategy_id"]: row for row in table}
+
+    assert by_id[s1].get("last_rejection") is None
+
+
+def test_sibling_table_survives_missing_gate_rejections_table(forven_db):
+    h = _hyp()
+    s1 = _make_strategy(h["id"], sid_seed=1)
+    with get_db() as conn:
+        conn.execute("DROP TABLE gate_rejections")
+        conn.commit()
+
+    table = build_sibling_table(h["id"])
+    ids = [row["strategy_id"] for row in table]
+
+    assert s1 in ids
+    by_id = {row["strategy_id"]: row for row in table}
+    assert by_id[s1].get("last_rejection") is None
+
+
 # ---- canonical coverage map ----
 
 

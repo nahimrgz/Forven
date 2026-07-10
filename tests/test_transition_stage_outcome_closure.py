@@ -121,7 +121,7 @@ def test_paper_to_live_graduated_triggers_positive_closure(env, monkeypatch):
     """Brain-driven promotion exercises the positive-closure branch.
     The promotion-gate (symbol resolution, robustness, etc.) is patched out —
     this test is about the closure hook, not the gauntlet of promotion checks."""
-    forven_db.kv_set("forven:settings", {"auto_approve_promotions": "true"})
+    forven_db.kv_set("forven:settings", {"auto_approve_promotions": "true", "allow_auto_live_promotion": "true"})
     monkeypatch.setattr(
         "forven.brain.evaluate_promotion",
         lambda *a, **k: (True, "ok"),

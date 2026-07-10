@@ -842,38 +842,16 @@ def _is_backtest_risk_control_enabled(value: object) -> bool:
 
 
 def validate_backtest_risk_controls(
-
-
     params: dict | None,
-
-
     *,
-
-
     extra_controls: dict | None = None,
-
-
 ) -> str | None:
-
-
     controls: dict[str, object] = {}
-
-
     if isinstance(params, dict):
-
-
         controls.update(params)
-
-
     if isinstance(extra_controls, dict):
-
-
         for key, value in extra_controls.items():
-
-
             if key not in controls or controls.get(key) is None:
-
-
                 controls[key] = value
 
     # RISK-PARITY-1: a field carried in the nested execution_profile IS enforced
@@ -889,26 +867,23 @@ def validate_backtest_risk_controls(
             if _is_backtest_risk_control_enabled(profile.get(field))
         }
 
+    ignored_fields = set(profile_covered)
+    if isinstance(extra_controls, dict):
+        for field in HONORED_EXECUTION_CONTROL_FIELDS:
+            if extra_controls.get(field) is not None:
+                ignored_fields.add(field)
+
+    if "risk_per_trade" in ignored_fields:
+        ignored_fields.add("risk_pct")
 
     enabled_fields = [
-
-
         field_name
-
-
         for field_name in _UNSUPPORTED_BACKTEST_RISK_FIELDS.values()
-
-
-        if field_name not in profile_covered
+        if field_name not in ignored_fields
         and _is_backtest_risk_control_enabled(controls.get(field_name))
-
-
     ]
 
-
     if not enabled_fields:
-
-
         return None
 
 
@@ -1065,6 +1040,23 @@ def resolve_backtest_trade_mode(
         params=params,
         strategy_obj=strategy_obj,
     )
+
+    # Honor a strategy's DECLARED bidirectional capability by default. A strategy
+    # that emits a symmetric 4-series/DirectionalSignals payload and declares
+    # 'both' support was silently degraded to long_only whenever the caller passed
+    # no explicit trade_mode, no allow_shorting and no params.trade_mode — dropping
+    # its short legs (a symmetric strategy could go from 20 trades to 0). Upgrade
+    # ONLY to 'both', which always preserves the long leg, so a strategy that is
+    # merely mirror-short-safe (declares short_only but not 'both') stays long_only.
+    if (
+        explicit_mode is None
+        and not allow_shorting
+        and resolved == "long_only"
+        and _normalize_trade_mode_value((params or {}).get("trade_mode")) is None
+        and "both" in supported
+    ):
+        resolved = "both"
+
     if resolved == "both" and "both" not in supported:
         if explicit_mode is None and allow_shorting and "short_only" in supported:
             resolved = "short_only"
@@ -1129,68 +1121,27 @@ def expand_strategy_trade_modes(
 
 
 def _validate_backtest_execution_parity(
-
-
     strategy_type: str | None,
-
-
     params: dict | None,
-
-
     *,
-
-
     allow_uncertified: bool = False,
-
-
+    extra_controls: dict | None = None,
 ) -> tuple[dict, str | None, str | None]:
-
-
     """Returns (canonical_params, blocking_error, risk_warning)."""
-
-
     from forven.strategies.certification import EXECUTION_CERTIFIED_FAMILIES
 
-
-
-
-
     certification = certify_execution_strategy(strategy_type, params)
-
-
     certification_error = certification.format_error(context="backtest")
-
-
     if certification_error and allow_uncertified:
-
-
         normalized = str(strategy_type or "").strip().lower()
-
-
         family_unknown = normalized and normalized not in EXECUTION_CERTIFIED_FAMILIES
-
-
         if family_unknown and not certification.unsupported_rule_blobs and not certification.param_validation_errors:
-
-
             passthrough_params = dict(params) if isinstance(params, dict) else dict(certification.canonical_params)
-
-
-            risk_warning = validate_backtest_risk_controls(passthrough_params)
-
-
+            risk_warning = validate_backtest_risk_controls(passthrough_params, extra_controls=extra_controls)
             return passthrough_params, None, risk_warning
-
-
     if certification_error:
-
-
         return certification.canonical_params, certification_error, None
-
-
-    risk_warning = validate_backtest_risk_controls(certification.canonical_params)
-
-
+    risk_warning = validate_backtest_risk_controls(certification.canonical_params, extra_controls=extra_controls)
     return certification.canonical_params, None, risk_warning
 
 
@@ -1780,7 +1731,14 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 new_sharpe = float(metrics.get("sharpe") or metrics.get("sharpe_ratio") or 0)
                 existing_degenerate = is_degenerate_backtest_metrics(existing_metrics)
                 new_degenerate = is_degenerate_backtest_metrics(metrics)
-                keep_existing = (
+                # The best-of rule only ever PROTECTS honest stored metrics from a
+                # worse/degenerate rerun. With no stored metrics there is nothing to
+                # protect, so always take the new run — otherwise a fresh strategy
+                # whose first backtest reports flat (no in_sample block) metrics gets
+                # classified "degenerate", keeps its empty {} blob, and can never
+                # promote out of quick_screen.
+                has_existing = bool(existing_metrics)
+                keep_existing = has_existing and (
                     (new_degenerate and not existing_degenerate)
                     or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
                 )
@@ -2398,6 +2356,15 @@ def _resolve_market_data_series(normalized_asset: str, start_ms: int, end_ms: in
     )
 
 
+# Binance funds every 8h and delivers the rate per-hour (rate/8, see
+# market_data.fetch_binance_funding_series). This factor rescales that per-hour
+# series back to the canonical per-8h magnitude strategies calibrate deadbands
+# against. Mirrors market_data._BINANCE_FUNDING_INTERVAL_HOURS, kept local to
+# avoid import coupling. (The HL opt-out is natively hourly; ×8 normalizes it to
+# the same 8h-equivalent scale, which is the convention strategies assume.)
+_FUNDING_INTERVAL_HOURS = 8.0
+
+
 def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
     """Join supplementary market data (funding rate, OI) into the candle DataFrame,
     from the configured source (Binance by default — same venue as the candles, so
@@ -2424,11 +2391,22 @@ def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
         # Source-aware funding + OI (Binance by default — no HyperLiquid).
         funding_data, oi_data = _resolve_market_data_series(normalized_asset, start_ms, end_ms)
 
-        # Funding rates
+        # Funding rates — TWO columns with distinct scales, one series:
+        #   * ``funding_rate`` (PER-8H, canonical): what STRATEGIES read. LLM-
+        #     authored strategies calibrate funding deadbands against the well-
+        #     known per-8h magnitude (~1e-4). The series arrives PER-HOUR (rate/8
+        #     from fetch_binance_funding_series), so scale it back up by the
+        #     funding interval — otherwise a 1e-4 deadband is ~8x too strict on
+        #     the per-hour column and funding-gated strategies produce zero trades
+        #     (the zero_trade bucket root cause).
+        #   * ``_funding_rate_hourly`` (PER-HOUR): what COST accrual reads
+        #     (_apply_funding_to_trades), so per-bar accrual on the 1h grid is
+        #     unchanged — cost parity by construction.
         if funding_data:
-            fr_df = pd.DataFrame(funding_data, columns=["timestamp_ms", "funding_rate"])
+            fr_df = pd.DataFrame(funding_data, columns=["timestamp_ms", "_funding_rate_hourly"])
             fr_df["t"] = pd.to_datetime(fr_df["timestamp_ms"], unit="ms", utc=True)
-            fr_df = fr_df.set_index("t").sort_index()[["funding_rate"]]
+            fr_df = fr_df.set_index("t").sort_index()[["_funding_rate_hourly"]]
+            fr_df["funding_rate"] = fr_df["_funding_rate_hourly"] * _FUNDING_INTERVAL_HOURS
             fr_df = _coerce_index_to_ns_utc(fr_df)
             # Merge_asof: align funding to candle timestamps (backward fill)
             df = pd.merge_asof(
@@ -6519,7 +6497,14 @@ def _apply_funding_to_trades(
     if not trades:
         return trades, True
 
-    has_col = df is not None and "funding_rate" in getattr(df, "columns", [])
+    # Cost accrues on the PER-HOUR rate. _enrich_with_market_data exposes it as
+    # ``_funding_rate_hourly`` (the strategy-facing ``funding_rate`` is the
+    # canonical per-8h rate, 8x larger — using it here would overcharge funding
+    # ~8x). Fall back to ``funding_rate`` for legacy frames / unit callers that
+    # only carry the per-hour column under that name (back-compat, cost-neutral).
+    df_cols = getattr(df, "columns", [])
+    funding_col = "_funding_rate_hourly" if "_funding_rate_hourly" in df_cols else "funding_rate"
+    has_col = df is not None and funding_col in df_cols
     if not has_col:
         # No funding data at all for this asset/window — price PnL is unchanged
         # but the result is funding-incomplete so the promotion gate can hold it.
@@ -6529,7 +6514,7 @@ def _apply_funding_to_trades(
             t["funding_cost_pct"] = 0.0
         return trades, False
 
-    fr = df["funding_rate"]
+    fr = df[funding_col]
     n = len(fr)
     hours = _hours_per_bar(timeframe)
     lev = max(float(leverage), 0.0)
@@ -7492,7 +7477,18 @@ def run_strategy_execution(
         # in this process). runtime_params (from the params ARG) is used, so a proxy
         # object with no real params attr still ships the right params.
         from forven.sandbox.strategy_worker import compute_directional_signals_isolated
-        _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        # The worker resolves the class by the key it was REGISTERED under (module
+        # TYPE_NAME / archived name / class strategy_type), not by the class's semantic
+        # ``strategy_type`` label — which can differ from its registration key (e.g.
+        # AdxRegimeComposite registers as 'adx_regime_composite' but declares
+        # strategy_type='composite'). Sending the semantic label failed isolated
+        # execution with "unknown strategy type". Prefer the caller-provided runtime
+        # key; only a sandbox-only proxy (whose class is never in this process) carries
+        # the resolvable namespaced runtime type on ``strategy_type`` itself.
+        if getattr(strategy_obj, "sandbox_only", False):
+            _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
+        else:
+            _iso_type = strategy_type or getattr(strategy_obj, "strategy_type", None)
         vectorized = compute_directional_signals_isolated(
             df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
             trade_mode=trade_mode, default_direction=default_direction,
@@ -8162,17 +8158,10 @@ def backtest_strategy(
 
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
-
         original_strategy_type,
-
-
         params,
-
-
         allow_uncertified=True,
-
-
+        extra_controls=execution_controls,
     )
 
 
@@ -10684,17 +10673,10 @@ def walk_forward(
 
 
     params, validation_error, risk_parity_warning = _validate_backtest_execution_parity(
-
-
         original_strategy_type,
-
-
         params,
-
-
         allow_uncertified=True,
-
-
+        extra_controls=execution_controls,
     )
 
 

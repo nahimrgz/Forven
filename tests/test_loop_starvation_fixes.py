@@ -78,7 +78,7 @@ def test_health_summary_includes_event_loop(forven_db, monkeypatch):
     assert payload["details"]["event_loop"]["window_ticks"] == 1
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_watchdog_measures_injected_stall(monkeypatch):
     monitor = lw.LoopLagMonitor()
     monkeypatch.setattr(lw, "_MONITOR", monitor)
@@ -144,7 +144,7 @@ def _make_send_json(ws, timeout_seconds: float):
     return _send_json, consecutive
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_ws_send_survives_one_timeout_drops_after_grace():
     from forven.api_domains import live_ws
 
@@ -156,7 +156,7 @@ async def test_ws_send_survives_one_timeout_drops_after_grace():
     assert consecutive[0] == 2
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_ws_send_success_resets_grace_counter():
     healthy = _HealthyWs()
     send, consecutive = _make_send_json(healthy, timeout_seconds=0.5)
@@ -164,7 +164,7 @@ async def test_ws_send_success_resets_grace_counter():
     assert consecutive[0] == 0
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_ws_send_hard_error_drops_immediately():
     ws = _TimeoutThenDeadWs(hang_count=0)  # raises on first call
     send, _ = _make_send_json(ws, timeout_seconds=0.5)

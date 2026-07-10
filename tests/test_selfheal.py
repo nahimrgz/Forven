@@ -122,3 +122,56 @@ class VectorSignalStrategy(BaseStrategy):
 
     assert result["valid"] is False
     assert "must be a scalar value" in result["execution_result"]["stdout"]
+
+
+def test_validate_strategy_code_rejects_non_signal_return_with_actionable_message():
+    """An agent returning an int (thinking Signal is a BUY/SELL/NONE enum) must get
+    the return contract + the correct import, not a bare 'invalid type: int'."""
+    result = selfheal_mod.validate_strategy_code(
+        """
+from forven.strategies.base import BaseStrategy
+
+class IntSignalStrategy(BaseStrategy):
+    name = "intsig"
+    asset = "BTC"
+    strategy_type = "intsig"
+    default_params = {}
+
+    def generate_signal(self, df):
+        return 1
+"""
+    )
+
+    assert result["valid"] is False
+    stdout = result["execution_result"]["stdout"]
+    assert "must return a Signal or a dict" in stdout
+    assert "from forven.strategies.base import Signal" in stdout
+    assert "NOT a BUY/SELL/NONE enum" in stdout
+
+
+def test_validate_strategy_code_rejects_bad_init_signature_with_actionable_message():
+    """An agent overriding __init__ with the wrong signature (params only) must be
+    told the required BaseStrategy constructor, not a bare TypeError (BUG id=248)."""
+    result = selfheal_mod.validate_strategy_code(
+        """
+from forven.strategies.base import BaseStrategy, Signal
+
+class BadInitStrategy(BaseStrategy):
+    name = "badinit"
+    asset = "BTC"
+    strategy_type = "badinit"
+    default_params = {}
+
+    def __init__(self, params=None):
+        super().__init__("badinit", params)
+
+    def generate_signal(self, df):
+        return Signal(price=float(df["close"].iloc[-1]))
+"""
+    )
+
+    assert result["valid"] is False
+    stdout = result["execution_result"]["stdout"]
+    assert "Could not instantiate" in stdout
+    assert "__init__(self, strategy_id, params)" in stdout
+    assert "default_params" in stdout

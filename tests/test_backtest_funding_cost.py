@@ -32,6 +32,37 @@ def test_long_pays_positive_funding():
     assert out[0]["funding_complete"] is True
 
 
+def test_funding_cost_prefers_hourly_column_for_parity():
+    """Two-column funding convention (zero_trade fix): strategies read the
+    canonical PER-8H ``funding_rate``, but cost accrual must use the PER-HOUR
+    ``_funding_rate_hourly`` the enrichment provides. The charged cost must be
+    IDENTICAL to the legacy per-hour-only frame — parity by construction."""
+    ts = pd.date_range("2024-01-01", periods=10, freq="1h", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "funding_rate": [0.008] * 10,          # per-8h (strategy-facing, 8x)
+            "_funding_rate_hourly": [0.001] * 10,  # per-hour (cost source)
+        },
+        index=ts,
+    )
+    trades = [{"entry_bar": 0, "bars_held": 4, "direction": "long", "pnl_pct": 0.10}]
+    out, complete = bt._apply_funding_to_trades(trades, df, leverage=2.0, timeframe="1h")
+    # Cost is driven by the HOURLY column, so it equals the legacy
+    # test_long_pays_positive_funding result exactly: 4*0.001*1h*2x = 0.008.
+    assert complete is True
+    assert out[0]["funding_cost_pct"] == pytest.approx(-0.008, abs=1e-9)
+    assert out[0]["pnl_pct"] == pytest.approx(0.092, abs=1e-9)
+
+
+def test_funding_cost_falls_back_to_funding_rate_without_hourly():
+    """Legacy frames (and unit callers) with only ``funding_rate`` and no
+    ``_funding_rate_hourly`` keep the OLD per-hour interpretation — back-compat."""
+    df = _funding_df([0.001] * 10)  # only funding_rate, treated as per-hour
+    trades = [{"entry_bar": 0, "bars_held": 4, "direction": "long", "pnl_pct": 0.10}]
+    out, _ = bt._apply_funding_to_trades(trades, df, leverage=2.0, timeframe="1h")
+    assert out[0]["funding_cost_pct"] == pytest.approx(-0.008, abs=1e-9)
+
+
 def test_short_receives_positive_funding():
     df = _funding_df([0.001] * 10)
     trades = [{"entry_bar": 0, "bars_held": 4, "direction": "short", "pnl_pct": 0.10}]

@@ -8,10 +8,12 @@ feed the result back -> AI continues until it produces a final answer.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from contextvars import Token
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from forven.ai import (
     _is_quota_exhausted,
@@ -88,6 +90,150 @@ def _is_missing_credentials_error(error: Exception) -> bool:
 
 # Backward-compatible re-export used by forven.agents.__init__ and older tests.
 _current_agent_id = _legacy_current_agent_id
+
+# Task prompts embed ``input_data`` (siblings, canonical coverage, etc.) as a
+# JSON code block. This used to be a blind `json.dumps(...)[:3000]` slice,
+# which cuts the JSON mid-token once the payload grows past a few sibling
+# rows — feeding the model invalid JSON. 12000 chars is generous headroom
+# over a typical few-sibling-with-rejection payload (each sibling with a
+# truncated 200-char rejection reason runs roughly 400-600 serialized chars,
+# so a dozen siblings comfortably fits) while still bounding worst-case
+# prompt bloat for hypotheses with many siblings.
+PROMPT_INPUT_DATA_BUDGET_CHARS = 12_000
+_PROMPT_SIBLING_REASON_TRUNCATE_CHARS = 120
+
+
+def _truncate_input_data_for_prompt(
+    input_data: dict[str, Any],
+    *,
+    budget: int = PROMPT_INPUT_DATA_BUDGET_CHARS,
+) -> str:
+    """Serialize ``input_data`` for the task prompt, valid JSON, within budget.
+
+    Order of operations when the naive serialization exceeds ``budget``:
+
+      1. Shorten the longest individual fields first — each sibling's
+         ``last_rejection.reason`` (see hypothesis_lineage.build_sibling_table)
+         is cut to ``_PROMPT_SIBLING_REASON_TRUNCATE_CHARS`` chars.
+      2. If still over budget, drop siblings from the tail one at a time and
+         leave an explicit "(+N more siblings omitted...)" marker instead of
+         silently vanishing or corrupting the JSON.
+      3. Last-resort safety net for payloads with no "siblings" key (or that
+         are still oversized after (1)-(2)): fall back to a minimal-but-valid
+         JSON envelope carrying only small, high-signal fields, again with an
+         explicit omission marker. This fallback enforces the budget on its
+         OWN output: if the whitelisted fields verbatim (e.g. a corrupted
+         30K-char ``hypothesis_display_id``) or an unbounded ``keys_present``
+         list (e.g. a 2000-key payload) would still exceed ``budget``, string
+         fields are capped to a small length and ``keys_present`` is capped
+         to a small count; if it STILL doesn't fit, a minimal hard envelope
+         (``_prompt_budget_note`` only) is returned instead.
+
+    For payloads that already fit in the budget, this returns the exact same
+    string as the previous ``json.dumps(input_data, indent=2)`` call (modulo
+    the now-added ``default=str`` for datetime-ish values, which is a no-op
+    for the plain JSON-native payloads this has always been called with).
+
+    Guarantee: ``len(result) <= budget`` unconditionally, for any input and
+    any budget a caller reasonably passes.
+    """
+    serialized = json.dumps(input_data, indent=2, default=str)
+    if len(serialized) <= budget:
+        return serialized
+
+    data = copy.deepcopy(input_data)
+    siblings = data.get("siblings")
+
+    if isinstance(siblings, list) and siblings:
+        for sibling in siblings:
+            if not isinstance(sibling, dict):
+                continue
+            rejection = sibling.get("last_rejection")
+            if isinstance(rejection, dict) and isinstance(rejection.get("reason"), str):
+                rejection["reason"] = rejection["reason"][:_PROMPT_SIBLING_REASON_TRUNCATE_CHARS]
+
+        serialized = json.dumps(data, indent=2, default=str)
+
+        if len(serialized) > budget:
+            kept = list(siblings)
+            while kept:
+                trial = dict(data)
+                trial["siblings"] = kept
+                trial["_prompt_budget_note"] = (
+                    f"(+{len(siblings) - len(kept)} more siblings omitted for prompt budget)"
+                )
+                trial_serialized = json.dumps(trial, indent=2, default=str)
+                if len(trial_serialized) <= budget:
+                    data = trial
+                    serialized = trial_serialized
+                    break
+                kept.pop()
+            else:
+                data["siblings"] = []
+                data["_prompt_budget_note"] = (
+                    f"(+{len(siblings)} more siblings omitted for prompt budget)"
+                )
+                serialized = json.dumps(data, indent=2, default=str)
+
+    if len(serialized) <= budget:
+        return serialized
+
+    # Last-resort: still over budget (no "siblings" key to shrink, or some
+    # other field is huge). Guarantee valid JSON rather than ever slicing
+    # the serialized text itself. This fallback must enforce the budget on
+    # its OWN output too — a corrupted/oversized whitelisted ID field (e.g.
+    # a 30K-char hypothesis_display_id) or a payload with thousands of
+    # top-level keys (blowing up ``keys_present``) must not sail through
+    # unconditionally.
+    _FALLBACK_ID_FIELD_TRUNCATE_CHARS = 256
+    _FALLBACK_MAX_KEYS_PRESENT = 50
+
+    def _build_fallback(*, cap_fields: bool) -> dict[str, Any]:
+        all_keys = sorted(str(k) for k in data.keys())
+        keys_present: list[str] = all_keys
+        if cap_fields and len(all_keys) > _FALLBACK_MAX_KEYS_PRESENT:
+            omitted = len(all_keys) - _FALLBACK_MAX_KEYS_PRESENT
+            keys_present = all_keys[:_FALLBACK_MAX_KEYS_PRESENT] + [
+                f"(+{omitted} more keys omitted for prompt budget)"
+            ]
+        fb: dict[str, Any] = {
+            "_prompt_budget_note": "(input data truncated for prompt budget)",
+            "keys_present": keys_present,
+        }
+        for key in (
+            "origin_mode",
+            "action_kind",
+            "crucible_id",
+            "hypothesis_id",
+            "hypothesis_display_id",
+            "previous_verdict",
+        ):
+            if key not in data:
+                continue
+            value = data[key]
+            if cap_fields and isinstance(value, str) and len(value) > _FALLBACK_ID_FIELD_TRUNCATE_CHARS:
+                value = value[:_FALLBACK_ID_FIELD_TRUNCATE_CHARS] + "...(truncated)"
+            fb[key] = value
+        return fb
+
+    fallback = _build_fallback(cap_fields=False)
+    serialized = json.dumps(fallback, indent=2, default=str)
+
+    if len(serialized) > budget:
+        fallback = _build_fallback(cap_fields=True)
+        serialized = json.dumps(fallback, indent=2, default=str)
+
+    if len(serialized) > budget:
+        # Even the capped envelope doesn't fit (e.g. an extremely tight
+        # budget). Fall back to a minimal, always-valid, always-in-budget
+        # envelope rather than ever exceeding the caller's budget.
+        serialized = json.dumps(
+            {"_prompt_budget_note": "input_data omitted: exceeded prompt budget after all reductions"},
+            indent=2,
+            default=str,
+        )
+
+    return serialized
 
 
 class _TaskTranscript:
@@ -1313,7 +1459,7 @@ async def _run_agent_task_inner(
         # Build task prompt
         prompt = f"# Task: {task.get('title', 'Untitled')}\n\n{task.get('description', '')}"
         if input_data:
-            prompt += f"\n\n## Input Data\n```json\n{json.dumps(input_data, indent=2)[:3000]}\n```"
+            prompt += f"\n\n## Input Data\n```json\n{_truncate_input_data_for_prompt(input_data)}\n```"
 
         # Call AI with tool loop
         provider = agent.get("model", "openai")

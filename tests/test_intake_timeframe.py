@@ -20,6 +20,9 @@ def test_declared_supported_timeframe_is_stored():
     assert _intended_timeframe({"_timeframe": "15m"}) == "15m"
     assert _intended_timeframe({"_timeframe": "1d"}) == "1d"
     assert _intended_timeframe({"_timeframe": "1h"}) == "1h"
+    assert _intended_timeframe({"_timeframe": "2h"}) == "2h"
+    assert _intended_timeframe({"_timeframe": "12h"}) == "12h"
+    assert _intended_timeframe({"_timeframe": "1w"}) == "1w"
 
 
 def test_absent_or_blank_falls_back_to_1h():
@@ -34,7 +37,7 @@ def test_absent_or_blank_falls_back_to_1h():
 def test_unsupported_or_typod_timeframe_falls_back_to_1h():
     # Unsupported / no-data intervals must NOT be stored verbatim -- they would
     # wedge the gauntlet on an "unsupported interval" error. They fall back to 1h.
-    for bad in ("3h", "2h", "12h", "1w", "60m", "weekly", "1H_typo"):
+    for bad in ("3h", "60m", "weekly", "1H_typo"):
         assert _intended_timeframe({"_timeframe": bad}) == "1h", bad
 
 

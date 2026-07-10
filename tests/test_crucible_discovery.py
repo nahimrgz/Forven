@@ -124,3 +124,58 @@ def test_discovery_task_lists_known_crucibles_in_description(forven_db):
         ).fetchone()
     assert active["title"] in row["description"]
     assert disproven["title"] in row["description"]
+
+
+def test_disproven_title_carries_verdict_rationale(forven_db):
+    """A disproven title alone only stops the agent re-minting the same NAME —
+    the verdict_memo rationale is appended so it also avoids the same failure
+    mode under a different name."""
+    from forven.hypotheses import create_hypothesis, update_hypothesis_status
+
+    disproven = create_hypothesis(
+        title="Funding Rate Mean Reversion",
+        market_thesis="m", mechanism="x",
+        lane="benchmarking", source_type="public_benchmark",
+        target_assets=["BTC/USDT"], target_timeframes=["1h"],
+    )
+    update_hypothesis_status(
+        disproven["id"], new_status="disproven",
+        memo={"verdict": "disproven", "rationale": "Funding edge decayed to zero after fees; no regime filter fixed it."},
+        by="test",
+    )
+
+    _enable()
+    res = run_crucible_discovery()
+    assert res["created"] is True
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT description FROM agent_tasks WHERE id = ?", (res["task_id"],)
+        ).fetchone()
+    assert disproven["title"] in row["description"]
+    assert "Funding edge decayed to zero after fees" in row["description"]
+
+
+def test_disproven_title_without_memo_is_bare(forven_db):
+    """Absent verdict_memo -> bare title, no crash."""
+    from forven.hypotheses import create_hypothesis
+
+    disproven = create_hypothesis(
+        title="No Memo Thesis",
+        market_thesis="m", mechanism="x",
+        lane="benchmarking", source_type="public_benchmark",
+        target_assets=["BTC/USDT"], target_timeframes=["1h"],
+    )
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE hypotheses SET status = 'disproven', manager_state = 'archived' WHERE id = ?",
+            (disproven["id"],),
+        )
+
+    _enable()
+    res = run_crucible_discovery()
+    assert res["created"] is True
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT description FROM agent_tasks WHERE id = ?", (res["task_id"],)
+        ).fetchone()
+    assert disproven["title"] in row["description"]

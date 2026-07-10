@@ -1,4 +1,4 @@
-﻿"""Brain orchestrator ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ the hub-and-spoke boss.
+"""Brain orchestrator ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ the hub-and-spoke boss.
 
 The Brain is the ONLY orchestrator. All agent output returns to the Brain.
 Agents NEVER task other agents. Everything goes through the Brain.
@@ -2581,6 +2581,20 @@ def escalate_to_engineer(
         # "pipeline is slow/stalled" reports. Never let the stamp break reporting.
         "throughput_preset": _safe_effective_throughput_preset(),
     }
+    ctx = context or {}
+    strategy_id = str(ctx.get("strategy_id") or ctx.get("strategy") or "").strip().lower()
+    error_type = str(ctx.get("error_type") or ctx.get("error_class") or ctx.get("exception_class") or "").strip()
+
+    if strategy_id:
+        dedupe_key = f"bug_report:strategy:{strategy_id}"
+    elif error_type:
+        dedupe_key = f"bug_report:error:{error_type.lower()}"
+    else:
+        norm_title = title.strip().lower()
+        if norm_title.startswith("[bug]"):
+            norm_title = norm_title[len("[bug]"):].strip()
+        dedupe_key = f"bug_report:title:{norm_title}"
+
     # First-class operator notification — the triage queue. Deduped by title so a
     # repeated report of the same bug doesn't spam, while distinct bugs each show.
     _severity_to_notif = {"low": "info", "medium": "warn", "high": "fail", "critical": "critical"}
@@ -2593,7 +2607,7 @@ def escalate_to_engineer(
             title=f"[BUG] {title}",
             body=description,
             metadata=meta,
-            dedupe_key=f"bug_report:{title.strip().lower()}",
+            dedupe_key=dedupe_key,
         )
     except Exception as exc:  # noqa: BLE001 - never let a reporting failure break the caller
         log.warning("bug-report notification failed for %r: %s", title, exc)
@@ -2608,7 +2622,7 @@ def escalate_to_engineer(
         "Bug reported to triage queue: %s [severity=%s, from=%s]",
         title, severity, requesting_agent,
     )
-    return {"status": "reported", "queue": "operator_triage", "approval_id": 0}
+    return {"status": "reported", "queue": "operator_triage"}
 
 
 # Default models for different tasks come from shared routing policy.

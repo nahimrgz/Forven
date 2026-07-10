@@ -199,6 +199,22 @@ def emit_notification(
     if event["delivery_mode"] == "drop":
         return _store_notification(event, status="dropped")
 
+    if event["send_to_discord"]:
+        from forven.bot import is_discord_configured
+
+        if not is_discord_configured():
+            stored = _store_notification(event, status="stored")
+            _record_delivery(
+                stored["id"],
+                target="discord",
+                delivery_mode=event["delivery_mode"],
+                channel_name=event["resolved_channel_name"],
+                channel_id=event["resolved_channel_id"],
+                status="skipped",
+                detail="Discord token not configured",
+            )
+            return stored
+
     stored = _store_notification(event, status="new" if event["send_to_discord"] else "stored")
     if not event["send_to_discord"]:
         return stored

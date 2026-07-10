@@ -375,21 +375,24 @@ def _tool_write_file(path: str, content: str, append: bool = True) -> str:
     """Write or append to a workspace file."""
     # H-S8: hardened path validation (catches symlink escapes too)
     from forven.workspace import WorkspacePathError, safe_workspace_path
+    # Policy rejections use a distinct REJECTED: prefix so the agent knows the
+    # write will never succeed as-is and must NOT be retried (vs. a transient
+    # FS error below, which is retryable). See BUG-139.
     try:
         safe_workspace_path(path)
     except WorkspacePathError as exc:
-        return f"Error: {exc}"
+        return f"REJECTED: {exc} Do not retry."
     # Block editing core identity files
     protected = {"SOUL.md", "USER.md", "AGENTS.md", "BACKUPS.md"}
     if path in protected:
-        return f"Error: {path} is protected. Only the Brain can edit it with Judder's permission."
+        return f"REJECTED: {path} is protected. Only the Brain can edit it with Judder's permission. Do not retry."
     # P1 pre-beta allow-list: reject paths outside the sanctioned areas.
     if not _write_file_allowed(path):
         return (
-            f"Error: {path} is not a writable path for the agent. "
+            f"REJECTED: {path} is not a writable path for the agent. "
             "Allowed: LESSONS.md, evolution_journal.md, or files under "
             "memory/, agents/, narratives/, post_mortems/, lessons/, notes/ "
-            "with extension .md/.txt/.json."
+            "with extension .md/.txt/.json. Do not retry."
         )
     # Post-write verification via the SAME read path agents use: the tool's
     # return value is ground truth, not an assumption. Agents spent a week

@@ -144,6 +144,29 @@ def test_agent_run_backtest_persists_result_without_mutating_strategy(forven_db,
     assert stored_metrics == {}
 
 
+def test_sync_persists_first_backtest_metrics_when_none_stored(forven_db):
+    """A fresh strategy's first (flat) backtest metrics must persist. They lack an
+    in_sample block so is_degenerate flags them, but with no stored metrics there is
+    nothing to protect — the best-of rule must not discard them and keep the empty
+    {} blob, which would strand the strategy in quick_screen forever."""
+    _insert_strategy("s-fresh-metrics", stage="quick_screen")  # stored metrics = {}
+
+    from forven.strategies.backtest import _sync_strategy_metrics_and_promote_if_eligible
+
+    _sync_strategy_metrics_and_promote_if_eligible(
+        "s-fresh-metrics",
+        {"total_trades": 120, "sharpe": 1.8, "profit_factor": 1.9, "win_rate": 0.57},
+        promotion_reason="test",
+    )
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT metrics FROM strategies WHERE id = ?", ("s-fresh-metrics",)
+        ).fetchone()
+    stored = json.loads(row["metrics"] or "{}")
+    assert float(stored.get("sharpe", 0)) == 1.8
+
+
 def test_agent_verdict_persistence_normalizes_gauntlet_aliases(forven_db):
     _insert_strategy(
         "s-agent-verdict",

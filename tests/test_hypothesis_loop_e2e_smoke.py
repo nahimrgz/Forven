@@ -51,7 +51,7 @@ def _attach_passing_child(hypothesis_id: str, *, sid_seed: int, symbol: str, sha
             type_="rsi",
             symbol=symbol,
             timeframe="1h",
-            params={},
+            params={"test_seed": sid_seed},
             stage="paper",
             hypothesis_id=hypothesis_id,
             strategy_id=f"S{60000 + sid_seed:05d}",
