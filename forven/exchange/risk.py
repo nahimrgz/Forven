@@ -3428,6 +3428,91 @@ def reconcile_all_books(
         exchange_open += int(p.get("exchange_open") or 0)
         synced = synced and bool(p.get("synced"))
 
+    # UNRESOLVABLE-ROUTE-1: an OPEN book-stamped trade whose route resolves to
+    # _UNRESOLVABLE_ROUTE (a locked/unreadable settings read in _trade_routed_address)
+    # is EXCLUDED from every pass above — its own book's and master's — by the scope
+    # filter. That is correct (mis-scoping into master would ghost-close a real
+    # sub-account position), but silent: if that account's position is liquidated or
+    # closed while settings reads fail, the DB trade stays OPEN indefinitely and
+    # nobody knows. Fail LOUD, not silent — re-check the OPEN book-stamped trades now
+    # and surface any that are still unroutable, then try ONE fresh re-resolution +
+    # catch-up pass in case the settings read has recovered.
+    unresolved_ids: list[str] = []
+    reresolved_addresses: set[str | None] = set()
+    try:
+        with get_db() as conn:
+            open_booked = conn.execute(
+                "SELECT * FROM trades WHERE status = 'OPEN' AND book IS NOT NULL AND book != ''"
+            ).fetchall()
+        for _row in open_booked:
+            _trade = dict(_row)
+            if _trade_routed_address(_trade) == _UNRESOLVABLE_ROUTE:
+                _tid = str(_trade.get("id") or "").strip()
+                if _tid:
+                    unresolved_ids.append(_tid)
+    except Exception:
+        log.debug("Unresolvable-route re-check failed", exc_info=True)
+
+    if unresolved_ids:
+        log.error(
+            "Reconcile: %d OPEN book-stamped trade(s) have an UNRESOLVABLE route "
+            "(settings read failure) and were skipped by every pass — %s. A close/"
+            "liquidation on those accounts would go unreconciled until the settings "
+            "read recovers.",
+            len(unresolved_ids), ", ".join(unresolved_ids),
+        )
+        log_activity(
+            "error",
+            "risk",
+            (
+                f"Reconcile could not route {len(unresolved_ids)} open trade(s) "
+                f"({', '.join(unresolved_ids)}) — settings read failure left them "
+                f"OUT of every reconcile pass. A close/liquidation on those accounts "
+                f"is currently invisible; will retry route resolution."
+            ),
+            {"unresolvable_route_trade_ids": unresolved_ids},
+        )
+
+        # ONE fresh re-resolution: the settings read may have recovered since the
+        # per-book passes ran. Collect the accounts these trades now route to and run
+        # a scoped catch-up pass for each; a trade that resolves cleanly this time is
+        # reconciled normally. A trade still unroutable stays flagged (surfaced above).
+        try:
+            with get_db() as conn:
+                catchup_rows = conn.execute(
+                    f"SELECT * FROM trades WHERE id IN ({','.join('?' for _ in unresolved_ids)})",
+                    tuple(unresolved_ids),
+                ).fetchall()
+            for _row in catchup_rows:
+                _addr = _trade_routed_address(dict(_row))
+                if _addr != _UNRESOLVABLE_ROUTE:
+                    reresolved_addresses.add(_addr)
+        except Exception:
+            log.debug("Unresolvable-route re-resolution failed", exc_info=True)
+
+        catchup_passes: list[dict] = []
+        for _addr in reresolved_addresses:
+            _label = address_labels.get(_addr)
+            catchup_passes.append(
+                reconcile_exchange_positions(
+                    testnet,
+                    adopt_missing_in_sqlite=False,
+                    recovery_batch_id=recovery_batch_id,
+                    account_address=_addr,
+                    book_label=_label,
+                    open_orders=None,
+                )
+            )
+        for _p in catchup_passes:
+            if not isinstance(_p, dict) or _p.get("error"):
+                synced = False
+                continue
+            merged_discrepancies.extend(_p.get("discrepancies") or [])
+            merged_informational.extend(_p.get("informational") or [])
+            merged_adopted.extend(_p.get("adopted_positions") or [])
+            merged_actions.extend(_p.get("resolved_actions") or [])
+            synced = synced and bool(_p.get("synced"))
+
     merged = {
         "sqlite_open": sqlite_open,
         "exchange_open": exchange_open,
@@ -3438,8 +3523,11 @@ def reconcile_all_books(
         "resolved_actions": merged_actions,
         "synced": synced,
         "testnet": bool(testnet),
-        "per_book_passes": len(passes),
+        "per_book_passes": len(passes) + len(reresolved_addresses),
     }
+    if unresolved_ids:
+        merged["unresolvable_route_trade_ids"] = unresolved_ids
+        merged["unresolvable_route_reresolved_count"] = len(reresolved_addresses)
     if unreachable_books:
         merged["degraded"] = True
         merged["unreachable_books"] = unreachable_books
@@ -4146,6 +4234,38 @@ def close_all_positions() -> list[dict]:
             strategy_ids = open_strategy_by_asset.get(coin.upper(), [])
             strategy_id = _first_item(strategy_ids) if len(strategy_ids) == 1 else None
             trade_ids = open_trade_ids_by_asset.get(coin.upper(), [])
+
+            # KS-TIMEOUT-1: stamp pending_close_reconcile on this asset's trade rows
+            # BEFORE the exchange close. The daemon wraps this whole call in a hard
+            # timeout (RISK_CLOSE_TIMEOUT_SECONDS): if it fires after the exchange
+            # close SUCCEEDS but before the post-loop close_trade_record runs, the
+            # row would otherwise stay a bare OPEN with no marker — and the
+            # reconciler would ghost-close it at the reconcile-time mid, fabricating
+            # PnL on the emergency path. Marking first means a timeout at ANY point
+            # leaves the trade carrying the marker; the reconciler then re-verifies
+            # against exchange truth (recovers the true exit from the fill ledger,
+            # guarded by the empty-read streak) instead of guessing a mid. A
+            # confirmed close runs close_trade_record below, which SUPERSEDES the
+            # marker (it pops every pending_close_* key). Best-effort: a failed
+            # pre-mark must not abort the flatten — the FAILED-close path re-marks
+            # with the richer error metadata at the fallback below.
+            preclose_marked_at = get_now().isoformat()
+            for trade_id in trade_ids:
+                try:
+                    mark_trade_pending_close_reconcile(
+                        trade_id,
+                        close_reason="kill_switch",
+                        close_price_source="kill_switch_close",
+                        requested_at=preclose_marked_at,
+                        extra_signal_data={
+                            "kill_switch_close_preclose_marked_at": preclose_marked_at,
+                        },
+                    )
+                except Exception as _premark_exc:
+                    log.error(
+                        "Kill-switch could not pre-mark trade %s pending-close for %s: %s",
+                        trade_id, coin, _premark_exc,
+                    )
 
             log.warning("Kill-switch closing: %s %.4f %s", side, size, coin)
             close_response = None

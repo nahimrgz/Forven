@@ -187,6 +187,92 @@ class TestReconcilerBookSafetyGuard:
         assert dict(row)["status"] != "OPEN"
 
 
+class TestUnresolvableRouteAlerting:
+    """UNRESOLVABLE-ROUTE-1: an OPEN book-stamped trade whose route can't be
+    resolved (a locked/unreadable settings read -> _UNRESOLVABLE_ROUTE) is EXCLUDED
+    from every reconcile pass by the scope guard. That is correct (mis-scoping into
+    master could ghost-close a real sub-account position), but it must NOT be silent:
+    a close/liquidation on that account would otherwise leave the DB trade OPEN
+    forever with nobody alerted."""
+
+    def _empty_snapshot(self, *_args, **_kwargs):
+        return {"raw_positions": [], "positions": [], "open_orders": [], "price_map": {}}
+
+    def test_unresolvable_route_emits_alert_and_flags_trade(self, forven_db, monkeypatch):
+        _books_settings()
+        _seed_open_trade("T-UNRES-1", "BTC", "short", "scalp", "short")
+        monkeypatch.setattr(
+            "forven.exchange.risk._snapshot_exchange_state", self._empty_snapshot
+        )
+        # The settings read fails for the WHOLE cycle -> the trade routes to the
+        # sentinel on every resolution, including the end-of-cycle re-resolution.
+        from forven.exchange import risk as risk_mod
+        monkeypatch.setattr(
+            risk_mod, "_trade_routed_address",
+            lambda trade: risk_mod._UNRESOLVABLE_ROUTE,
+        )
+        alerts: list[tuple] = []
+        monkeypatch.setattr(
+            risk_mod, "log_activity",
+            lambda level, source, message, *a, **k: alerts.append((level, source, message)),
+        )
+
+        result = reconcile_all_books()
+
+        # (a) LOUD, not silent: an error-level risk alert names the trade + cause.
+        assert any(
+            lvl == "error" and src == "risk" and "T-UNRES-1" in msg
+            for (lvl, src, msg) in alerts
+        ), alerts
+        # The trade is flagged in the merged result and stays OPEN (never guessed
+        # into a pass that could have ghost-closed it).
+        assert "T-UNRES-1" in (result.get("unresolvable_route_trade_ids") or [])
+        assert result.get("unresolvable_route_reresolved_count") == 0
+        with get_db() as conn:
+            row = conn.execute("SELECT status FROM trades WHERE id = 'T-UNRES-1'").fetchone()
+        assert dict(row)["status"] == "OPEN"
+
+    def test_recovered_route_reconciles_in_catch_up_pass(self, forven_db, monkeypatch):
+        # confirm_count=1: isolate the routing catch-up from the empty-read streak
+        # guard (RECONCILE-6) so the recovered pass sweeps on its first empty read.
+        _books_settings(reconcile_empty_read_confirm_count=1)
+        _seed_open_trade("T-UNRES-2", "BTC", "short", "scalp", "short")
+        monkeypatch.setattr(
+            "forven.exchange.risk._snapshot_exchange_state", self._empty_snapshot
+        )
+        from forven.exchange import risk as risk_mod
+
+        # Settings read is DOWN during the per-book passes + the re-check (so the
+        # trade is excluded and the alert fires), then RECOVERS for the end-of-cycle
+        # re-resolution — the catch-up pass then reconciles it against exchange truth.
+        # The unresolvable alert fires exactly once, AFTER the re-check loop and
+        # BEFORE the re-resolution; use it to flip the read back up deterministically
+        # (independent of how many book passes ran).
+        real_route = risk_mod._trade_routed_address
+        state = {"down": True}
+
+        def _routed(trade):
+            if state["down"]:
+                return risk_mod._UNRESOLVABLE_ROUTE
+            return real_route(trade)
+
+        def _log_activity(level, source, message, *a, **k):
+            if level == "error" and source == "risk" and "T-UNRES-2" in str(message):
+                state["down"] = False  # settings read recovered
+
+        monkeypatch.setattr(risk_mod, "_trade_routed_address", _routed)
+        monkeypatch.setattr(risk_mod, "log_activity", _log_activity)
+
+        result = reconcile_all_books()
+
+        # The re-resolution recovered the route, so a catch-up pass ran and the
+        # ghost (empty snapshot) was reconciled — the trade is no longer bare OPEN.
+        assert result.get("unresolvable_route_reresolved_count") == 1
+        with get_db() as conn:
+            row = conn.execute("SELECT status FROM trades WHERE id = 'T-UNRES-2'").fetchone()
+        assert dict(row)["status"] != "OPEN"
+
+
 class TestLongOnlyVolumeGateSurfacing:
     def test_status_note_explains_100k_volume_gate(self, forven_db):
         _books_settings(hyperliquid_short_book_address="")
