@@ -15,6 +15,7 @@ global.fetch = mockFetch;
 describe('assistant api client', () => {
 	beforeEach(() => {
 		mockFetch.mockReset();
+		window.localStorage.clear();
 	});
 	afterEach(() => {
 		vi.clearAllMocks();
@@ -65,6 +66,8 @@ describe('assistant api client', () => {
 	});
 
 	it('streamAssistantSend parses SSE incl. action_proposed and sends context', async () => {
+		window.localStorage.setItem('forven_api_key', 'assistant-api-key');
+		window.localStorage.setItem('forven_operator_key', 'assistant-operator-key');
 		const encoder = new TextEncoder();
 		const chunks = [
 			encoder.encode('data: {"type":"user_persisted"}\n\n'),
@@ -89,6 +92,9 @@ describe('assistant api client', () => {
 		const [url, init] = mockFetch.mock.calls[0];
 		expect(String(url)).toContain('/api/assistant/threads/as_1/send');
 		const body = JSON.parse(String((init as RequestInit).body));
+		const headers = (init as RequestInit).headers as Headers;
+		expect(headers.get('X-API-Key')).toBe('assistant-api-key');
+		expect(headers.get('X-Operator-Key')).toBe('assistant-operator-key');
 		expect(body.user_text).toBe('promote S1');
 		expect(body.allow_actions).toBe(true);
 		expect(body.page_context).toEqual({ route: '/lab', page_kind: 'lab' });

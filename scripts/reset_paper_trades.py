@@ -21,10 +21,7 @@ doesn't open a fresh trade mid-reset.
 from __future__ import annotations
 
 import argparse
-import shutil  # noqa: F401  (retained for callers/compat; backup now uses the sqlite3 backup API)
-import sqlite3
 import sys
-import time
 
 PAPER_TYPES = ("paper", "paper_challenger", "simulation")
 
@@ -61,7 +58,6 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     from forven.db import get_db
-    import forven.config as cfg
 
     types = list(PAPER_TYPES) + (["live"] if args.include_live else [])
 
@@ -78,22 +74,9 @@ def main(argv=None) -> int:
         print("\nDRY RUN — nothing deleted. Re-run with --apply to back up + delete.")
         return 0
 
-    db_path = str(cfg.FORVEN_DB)
-    backup = f"{db_path}.bak-{int(time.time())}"
-    # Online backup via SQLite's backup API — correct for a LIVE/WAL DB held open by the
-    # running daemon. A plain file copy (shutil.copy2) fails with PermissionError on the
-    # locked file (and would capture a torn WAL state mid-write); the backup API copies a
-    # consistent snapshot cooperatively while the daemon keeps running.
-    _src = sqlite3.connect(db_path)
-    try:
-        _dst = sqlite3.connect(backup)
-        try:
-            with _dst:
-                _src.backup(_dst)
-        finally:
-            _dst.close()
-    finally:
-        _src.close()
+    from forven.backups import create_managed_db_backup
+
+    backup = create_managed_db_backup("reset-paper-trades")
     print(f"\nBacked up DB -> {backup}")
 
     # Stamp the paper-book reset so the kernel's recording window restarts HERE — BEFORE any

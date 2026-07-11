@@ -1,5 +1,6 @@
 import type { OHLCVBar } from './data';
 import {
+	ApiOutcomeUnknownError,
 	fetchApi,
 } from './core';
 
@@ -25,6 +26,15 @@ export interface PaperPosition {
 	source?: string | null;
 	/** Direction book (Approach C sub-account) a live position routes to. */
 	book?: string | null;
+}
+
+const pendingManualOpenIntents = new Map<string, { fingerprint: string; key: string }>();
+
+function newIdempotencyKey(): string {
+	if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+		return crypto.randomUUID();
+	}
+	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 export interface PaperNetPosition {
@@ -352,17 +362,35 @@ export async function openManualPaperPosition(
 	sessionId: string,
 	options: OpenManualPaperPositionOptions
 ): Promise<PaperTradingSession> {
-	return fetchApi(`/paper/sessions/${sessionId}/open-position`, {
-		method: 'POST',
-		body: JSON.stringify({
-			direction: options.direction,
-			size: options.size ?? null,
-			risk_pct: options.riskPct ?? null,
-			leverage: options.leverage ?? 1,
-			stop_loss_price: options.stopLossPrice ?? null,
-			take_profit_price: options.takeProfitPrice ?? null,
-		}),
-	});
+	const body = {
+		direction: options.direction,
+		size: options.size ?? null,
+		risk_pct: options.riskPct ?? null,
+		leverage: options.leverage ?? 1,
+		stop_loss_price: options.stopLossPrice ?? null,
+		take_profit_price: options.takeProfitPrice ?? null,
+	};
+	const fingerprint = JSON.stringify(body);
+	const existing = pendingManualOpenIntents.get(sessionId);
+	const intent = existing?.fingerprint === fingerprint
+		? existing
+		: { fingerprint, key: newIdempotencyKey() };
+	pendingManualOpenIntents.set(sessionId, intent);
+
+	try {
+		const result = await fetchApi<PaperTradingSession>(`/paper/sessions/${sessionId}/open-position`, {
+			method: 'POST',
+			headers: { 'Idempotency-Key': intent.key },
+			body: JSON.stringify(body),
+		});
+		pendingManualOpenIntents.delete(sessionId);
+		return result;
+	} catch (error) {
+		if (!(error instanceof ApiOutcomeUnknownError)) {
+			pendingManualOpenIntents.delete(sessionId);
+		}
+		throw error;
+	}
 }
 
 // Set/clear (price=null) the absolute stop-loss on the open position

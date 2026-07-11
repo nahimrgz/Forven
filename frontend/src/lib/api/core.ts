@@ -303,6 +303,21 @@ export class ApiError extends Error {
 	}
 }
 
+export class ApiOutcomeUnknownError extends Error {
+	method: string;
+	endpoint: string;
+
+	constructor(method: string, endpoint: string) {
+		super(
+			`${method} ${endpoint} lost its network response. The operation may have completed; ` +
+				'check current state before trying again.',
+		);
+		this.name = 'ApiOutcomeUnknownError';
+		this.method = method;
+		this.endpoint = endpoint;
+	}
+}
+
 export function isNotFoundError(error: unknown): boolean {
 	if (error instanceof ApiError) return error.status === 404;
 	if (!(error instanceof Error)) return false;
@@ -362,6 +377,8 @@ function parseErrorPayload(raw: string): { detail: string; payload: unknown } {
 
 export async function fetchApi<T>(endpoint: string, options?: RequestInit & { timeoutMs?: number }): Promise<T> {
 	const { timeoutMs, ...restOptions } = (options ?? {}) as RequestInit & { timeoutMs?: number };
+	const method = String(restOptions.method ?? 'GET').toUpperCase();
+	const canRetryAcrossBases = ['GET', 'HEAD', 'OPTIONS'].includes(method);
 	const headers = new Headers(restOptions?.headers);
 	const authHeaders = buildAuthHeaders();
 	for (const [key, value] of Object.entries(authHeaders)) {
@@ -406,14 +423,16 @@ export async function fetchApi<T>(endpoint: string, options?: RequestInit & { ti
 			if (error instanceof ApiError) {
 				throw error;
 			}
-			if (isRetryableNetworkError(error)) {
-				if (!isLast) {
-					continue;
-				}
-			}
-			if (isLast) {
+			if (!isRetryableNetworkError(error)) {
 				throw error;
 			}
+			if (!canRetryAcrossBases) {
+				throw new ApiOutcomeUnknownError(method, endpoint);
+			}
+			if (!isLast) {
+				continue;
+			}
+			throw error;
 		}
 	}
 
@@ -421,6 +440,57 @@ export async function fetchApi<T>(endpoint: string, options?: RequestInit & { ti
 		throw lastError;
 	}
 	throw new Error('Request failed');
+}
+
+/**
+ * Open a streaming API response with the same base discovery and authentication
+ * as fetchApi. Streaming mutations deliberately use one resolved base: retrying
+ * after a lost response could duplicate the request while its outcome is unknown.
+ */
+export async function fetchApiStream(
+	endpoint: string,
+	options: RequestInit & { timeoutMs?: number },
+): Promise<Response> {
+	const { timeoutMs, ...restOptions } = options;
+	const method = String(restOptions.method ?? 'GET').toUpperCase();
+	const headers = new Headers(restOptions.headers);
+	for (const [key, value] of Object.entries(buildAuthHeaders())) {
+		if (value && !headers.has(key)) headers.set(key, value);
+	}
+	const isFormData = typeof FormData !== 'undefined' && restOptions.body instanceof FormData;
+	if (!isFormData && !headers.has('Content-Type')) {
+		headers.set('Content-Type', 'application/json');
+	}
+
+	await detectActiveApiBase();
+	const base = ACTIVE_API_BASE;
+	const requestPath = getRequestPath(base, endpoint);
+	const requestUrl = /^https?:\/\//.test(requestPath) ? requestPath : `${base}${requestPath}`;
+	let response: Response;
+	try {
+		response = await fetchWithLimit(requestUrl, {
+			...restOptions,
+			headers,
+			...(timeoutMs != null ? { timeoutMs } : {}),
+		});
+	} catch (error) {
+		if (isRetryableNetworkError(error) && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+			throw new ApiOutcomeUnknownError(method, endpoint);
+		}
+		throw error;
+	}
+	if (!response.ok) {
+		const rawError = typeof response.text === 'function'
+			? await response.text().catch(() => '')
+			: '';
+		const parsed = parseErrorPayload(rawError);
+		throw new ApiError(
+			response.status,
+			parsed.detail || response.statusText || `HTTP ${response.status}`,
+			parsed.payload,
+		);
+	}
+	return response;
 }
 
 // Health check

@@ -1349,6 +1349,65 @@ def test_manage_positions_marks_trade_pending_reconcile_when_open_execution_fail
     assert any("PENDING open ETH" in action for action in actions)
 
 
+def test_confirmed_fill_persistence_failure_keeps_risk_slot_reserved(monkeypatch):
+    signal_updates = {}
+    released = {"called": False}
+
+    monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [])
+    monkeypatch.setattr(scanner_mod, "can_open", lambda **_kwargs: (True, 0.01, "ok"))
+    monkeypatch.setattr(
+        scanner_mod,
+        "calculate_position_size",
+        lambda **_kwargs: (0.5, {"method": "atr"}),
+    )
+    monkeypatch.setattr(
+        scanner_mod,
+        "_open_trade_db",
+        lambda *_args, **_kwargs: "E-FILL-PERSIST-1",
+    )
+    monkeypatch.setattr(scanner_mod, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scanner_mod, "log_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scanner_mod,
+        "_execute_direct",
+        lambda **_kwargs: {"entry_price": 2001.0, "fill_persistence_failed": True},
+    )
+    monkeypatch.setattr(
+        scanner_mod,
+        "_update_trade_signal_data",
+        lambda trade_id, updates: signal_updates.update({"trade_id": trade_id, **updates}) or True,
+    )
+    monkeypatch.setattr(
+        scanner_mod,
+        "release",
+        lambda _trade_id: released.update({"called": True}),
+    )
+    monkeypatch.setattr(scanner_mod, "_paper_stage_local_execution_only_enabled", lambda: False)
+    monkeypatch.setattr(scanner_mod, "_paper_test_mode_enabled", lambda: False)
+    monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
+
+    actions = manage_positions(
+        "S-FILL-PERSIST",
+        {
+            "asset": "ETH",
+            "stage": "paper",
+            "params": {
+                "risk_pct": 0.01,
+                "leverage": 1.0,
+                "stop_loss_pct": 2.0,
+                "take_profit_pct": 4.0,
+            },
+        },
+        {"price": 2000.0, "entry_signal": True, "exit_signal": False},
+        account_equity=10_000.0,
+    )
+
+    assert released["called"] is False
+    assert signal_updates["entry_finalization_state"] == "reconcile_required"
+    assert signal_updates["open_execution_failure_reason"] == scanner_mod._CONFIRMED_FILL_PERSISTENCE_ERROR
+    assert any("PENDING open ETH" in action for action in actions)
+
+
 def test_scan_asset_group_stamps_last_bar_time(monkeypatch):
     df = _ohlcv_from_close([100.0, 101.0, 102.0])
     monkeypatch.setattr(scanner_mod, "fetch_candles", lambda *_args, **_kwargs: df)

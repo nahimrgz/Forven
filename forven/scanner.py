@@ -79,6 +79,7 @@ _ENTRY_SIGNAL_STATE_KEY = "scanner_entry_signal_state"
 _ASSET_ENTRY_STATE_KEY = "scanner_asset_entry_state"
 _CERTIFIED_PAPER_FAMILIES = set(EXECUTION_CERTIFIED_FAMILIES)
 _LAST_STRATEGY_LOAD_DIAGNOSTICS: dict[str, dict] = {}
+_CONFIRMED_FILL_PERSISTENCE_ERROR = "confirmed exchange fill awaiting local persistence reconciliation"
 # DATA-3: cover the FULL canonical timeframe set (data.TIMEFRAME_MS). The bar-width
 # lookups for closed-bar trimming and the stale-feed gate do `.get(tf, 3600)`; an
 # incomplete table silently used a 1h width for any unlisted timeframe (e.g. a 2h bar
@@ -3144,16 +3145,16 @@ def _signed_slippage_bps(signal_price: float, fill_price: float, side: str) -> f
     return ((signal_price - fill_price) / signal_price) * 1e4
 
 
-def _update_trade_signal_data(trade_id: str, updates: dict) -> None:
+def _update_trade_signal_data(trade_id: str, updates: dict) -> bool:
     """Merge auxiliary signal metadata into an existing trade row."""
     if not trade_id or not isinstance(updates, dict) or not updates:
-        return
+        return False
 
     try:
         with get_db() as conn:
             row = conn.execute("SELECT signal_data FROM trades WHERE id = ?", (trade_id,)).fetchone()
             if not row:
-                return
+                return False
 
             raw = row["signal_data"]
             if isinstance(raw, str):
@@ -3171,11 +3172,13 @@ def _update_trade_signal_data(trade_id: str, updates: dict) -> None:
                 "UPDATE trades SET signal_data = ? WHERE id = ?",
                 (json.dumps(signal_data), str(trade_id)),
             )
-    except Exception:
-        return
+        return True
+    except Exception as exc:
+        log.error("Could not persist signal metadata for trade %s: %s", trade_id, exc)
+        return False
 
 
-def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_price: float | None = None, exchange_order_id: str | None = None, filled_size: float | None = None, mark_price: float | None = None) -> None:
+def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_price: float | None = None, exchange_order_id: str | None = None, filled_size: float | None = None, mark_price: float | None = None) -> bool:
     """Update a trade row with fill details from direct execution.
 
     `filled_size` is the size the exchange actually filled (an IOC entry can
@@ -3198,7 +3201,7 @@ def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_
                 (trade_id,),
             ).fetchone()
             if not row:
-                return
+                return False
 
             direction = (row["direction"] or "long").lower()
             signal_data_raw = row["signal_data"]
@@ -3237,6 +3240,9 @@ def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_
                 signal_data.pop("pending_open_reconcile", None)
                 signal_data.pop("pending_open_reconcile_at", None)
                 signal_data.pop("open_execution_failure_reason", None)
+                signal_data.pop("fill_persistence_failed", None)
+                signal_data["entry_finalization_state"] = "finalized_direct"
+                signal_data["entry_finalized_at"] = get_now().isoformat()
                 ref_price = signal_price if signal_price not in (None, 0) else row["signal_entry_price"]
                 if signal_price not in (None, 0):
                     updates.append("signal_entry_price = ?")
@@ -3264,15 +3270,103 @@ def _update_trade_fill(trade_id: str, fill_price: float, fill_kind: str, signal_
                         updates.append("exit_lag_bps = COALESCE(?, exit_lag_bps)")
                         values.append(_signed_slippage_bps(float(ref_price), float(mark_price), side))
             else:
-                return
+                return False
 
             updates.append("signal_data = ?")
             values.append(json.dumps(signal_data))
             values.append(str(trade_id))
             values_sql = ", ".join(updates)
             conn.execute(f"UPDATE trades SET {values_sql} WHERE id = ?", values)
-    except Exception:
-        return
+        return True
+    except Exception as exc:
+        log.error("Could not persist %s fill for trade %s: %s", fill_kind, trade_id, exc)
+        return False
+
+
+def _persist_live_entry_fill(
+    trade_id: str,
+    fill_price: float,
+    *,
+    signal_price: float | None,
+    exchange_order_id: str | None,
+    filled_size: float | None,
+    mark_price: float | None,
+    attempts: int = 3,
+) -> bool:
+    """Persist a confirmed live entry fill with a short, bounded retry window."""
+    attempt_count = max(1, int(attempts))
+    for attempt in range(1, attempt_count + 1):
+        if _update_trade_fill(
+            trade_id,
+            fill_price,
+            "entry",
+            signal_price=signal_price,
+            exchange_order_id=exchange_order_id,
+            filled_size=filled_size,
+            mark_price=mark_price,
+        ):
+            return True
+        if attempt < attempt_count:
+            time.sleep(0.05 * attempt)
+    return False
+
+
+def _emit_live_execution_critical(
+    event_type: str,
+    *,
+    trade_id: str,
+    title: str,
+    summary: str,
+    body: str,
+    dedupe_prefix: str,
+) -> None:
+    """Best-effort critical operator notification for post-fill safety faults."""
+    try:
+        from forven.notifications import emit_notification
+
+        emit_notification(
+            event_type,
+            severity="critical",
+            source="scanner",
+            title=title,
+            summary=summary,
+            body=body,
+            dedupe_key=f"{dedupe_prefix}:{trade_id}",
+        )
+    except Exception as exc:
+        log.error("Could not emit critical %s notification for trade %s: %s", event_type, trade_id, exc)
+
+
+def _pause_after_live_fill_persistence_failure(
+    *, trade_id: str, asset: str, direction: str, error: str
+) -> None:
+    """Block further opens after an exchange fill cannot be committed locally."""
+    try:
+        from forven.system_pause import set_system_paused
+
+        set_system_paused(True, paused_at=get_now().isoformat())
+    except Exception as exc:
+        log.critical("Could not persist system pause after fill-write failure for %s: %s", trade_id, exc)
+
+    log.critical(
+        "%s %s entry filled at the exchange but local persistence failed for trade=%s; "
+        "new opens are paused pending reconciliation: %s",
+        asset,
+        direction,
+        trade_id,
+        error,
+    )
+    _emit_live_execution_critical(
+        "trade_fill_persistence_failed",
+        trade_id=trade_id,
+        title=f"Live fill persistence failed ({asset})",
+        summary=(
+            f"{asset} {direction} filled at the exchange but could not be committed locally; "
+            "new opens were paused pending reconciliation."
+        ),
+        body=f"trade={trade_id}: {error}",
+        dedupe_prefix="fill_persistence_failed",
+    )
 
 
 def _fail_unfilled_open_trade(trade_id: str | None, reason: str | None) -> None:
@@ -3631,15 +3725,27 @@ def _execute_direct(
                     asset, direction, trade_id, size, filled_size_f,
                 )
             if fill is not None:
-                _update_trade_fill(
+                _fill_persisted = _persist_live_entry_fill(
                     trade_id,
                     fill,
-                    "entry",
                     signal_price=price,
                     exchange_order_id=exchange_order_id,
                     filled_size=filled_size_f,
                     mark_price=result.get("mid"),
                 )
+                if not _fill_persisted:
+                    order_meta["pending_open_reconcile"] = True
+                    order_meta["pending_open_reconcile_at"] = get_now().isoformat()
+                    order_meta["fill_persistence_failed"] = True
+                    order_meta["entry_finalization_state"] = "reconcile_required"
+                    result["fill_persistence_failed"] = True
+                    if not is_sim_active():
+                        _pause_after_live_fill_persistence_failure(
+                            trade_id=trade_id,
+                            asset=asset,
+                            direction=direction,
+                            error="entry fill write failed after 3 attempts",
+                        )
             if exchange_order_id is not None and "entry_exchange_order_id" not in order_meta:
                 order_meta["entry_exchange_order_id"] = exchange_order_id
             if order_meta:
@@ -3657,9 +3763,16 @@ def _execute_direct(
                 _prot_kwargs = {"testnet": testnet}
                 if vault_address:
                     _prot_kwargs["vault_address"] = vault_address
+                _protection_size = (
+                    filled_size_f
+                    if filled_size_f is not None and filled_size_f > 0
+                    else float(size)
+                )
                 if "stop" in _protective_failed and stop_loss is not None:
                     try:
-                        _ps = place_protective_stop(asset, direction, size, float(stop_loss), **_prot_kwargs)
+                        _ps = place_protective_stop(
+                            asset, direction, _protection_size, float(stop_loss), **_prot_kwargs
+                        )
                         if isinstance(_ps, dict) and not _ps.get("error") and _ps.get("stop_order_id"):
                             _update_trade_signal_data(trade_id, {
                                 "exchange_stop_order_id": str(_ps["stop_order_id"]),
@@ -3672,23 +3785,36 @@ def _execute_direct(
                                 "[%s] %s entry FILLED but stop leg rejected AND re-arm failed (trade=%s): %s — "
                                 "periodic reconcile will retry", strat_id, asset, trade_id, _err,
                             )
-                            try:
-                                from forven.notifications import emit_notification
-                                emit_notification(
-                                    "trade_protective_unarmed", severity="critical", source="scanner",
-                                    title=f"Live position temporarily UNPROTECTED ({asset})",
-                                    summary=f"{asset} {direction} entry filled but the protective stop could not be armed; reconcile will retry.",
-                                    body=f"trade={trade_id}: {_err}",
-                                    dedupe_key=f"protective_unarmed:{trade_id}",
-                                )
-                            except Exception:
-                                pass
+                            _emit_live_execution_critical(
+                                "trade_protective_unarmed",
+                                trade_id=trade_id,
+                                title=f"Live position temporarily UNPROTECTED ({asset})",
+                                summary=(
+                                    f"{asset} {direction} entry filled but the protective stop could not "
+                                    "be armed; reconcile will retry."
+                                ),
+                                body=f"trade={trade_id}: {_err}",
+                                dedupe_prefix="protective_unarmed",
+                            )
                     except Exception as _exc:
                         _update_trade_signal_data(trade_id, {"protective_stop_unarmed": True})
                         log.error("[%s] re-arm stop after rejected bracket leg raised for %s trade=%s: %s", strat_id, asset, trade_id, _exc)
+                        _emit_live_execution_critical(
+                            "trade_protective_unarmed",
+                            trade_id=trade_id,
+                            title=f"Live position temporarily UNPROTECTED ({asset})",
+                            summary=(
+                                f"{asset} {direction} entry filled but protective-stop re-arming raised; "
+                                "reconcile will retry."
+                            ),
+                            body=f"trade={trade_id}: {_exc}",
+                            dedupe_prefix="protective_unarmed",
+                        )
                 if "take_profit" in _protective_failed and take_profit is not None:
                     try:
-                        _tp = place_take_profit(asset, direction, size, float(take_profit), **_prot_kwargs)
+                        _tp = place_take_profit(
+                            asset, direction, _protection_size, float(take_profit), **_prot_kwargs
+                        )
                         if isinstance(_tp, dict) and not _tp.get("error") and _tp.get("take_profit_order_id"):
                             _update_trade_signal_data(trade_id, {
                                 "exchange_take_profit_order_id": str(_tp["take_profit_order_id"]),
@@ -4271,7 +4397,7 @@ def manage_positions(
             )
             return True, None
         try:
-            _execute_direct(
+            result = _execute_direct(
                 action="open",
                 trade_id=trade_id,
                 strat_id=strat_id,
@@ -4283,6 +4409,8 @@ def manage_positions(
                 take_profit=take_profit,
                 leverage=p.get("leverage", 1.0),
             )
+            if isinstance(result, dict) and result.get("fill_persistence_failed"):
+                return False, _CONFIRMED_FILL_PERSISTENCE_ERROR
             return True, None
         except Exception as e:
             log.error("Direct open failed for %s %s: %s", strat_id, trade_asset, e)
@@ -4972,6 +5100,7 @@ def manage_positions(
                 signal_data["data_source"] = "local"
             signal_data["execution_venue"] = "hyperliquid"
             signal_data["execution_mode"] = execution_type
+            signal_data["entry_finalization_state"] = "order_pending"
 
             resolved_leverage = float(p.get("leverage", 1.0) or 1.0)
             # Pass book only when direction books are active, so the books-off
@@ -5066,6 +5195,7 @@ def manage_positions(
                         "pending_open_reconcile": True,
                         "pending_open_reconcile_at": get_now().isoformat(),
                         "open_execution_failure_reason": open_error,
+                        "entry_finalization_state": "reconcile_required",
                     },
                 )
                 # M2: free the risk slot immediately so a failed open doesn't
@@ -5074,7 +5204,8 @@ def manage_positions(
                 # order actually filled); _rebuild_portfolio_positions skips
                 # re-adding this position while it's pending_open_reconcile
                 # without an exchange order id, so the release is durable.
-                release(str(trade_id))
+                if open_error != _CONFIRMED_FILL_PERSISTENCE_ERROR:
+                    release(str(trade_id))
                 log.warning(
                     "[%s] OPEN execution failed; keeping local trade %s open pending reconcile",
                     strat_id,

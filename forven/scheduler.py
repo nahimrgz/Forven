@@ -2187,21 +2187,9 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             await _run_sync_job(run_overnight_summary_job, lookback)
             return "ok", None
 
-        # Shell command execution
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-
-        if proc.returncode != 0:
-            error = stderr.decode()[:500]
-            log.error("Job %s failed: %s", job_name, error)
-            return "error", error
-
-        log.info("Job %s completed successfully", job_name)
-        return "ok", None
+        error = f"Unknown scheduler job kind: {kind or '<missing>'}"
+        log.error("Job %s rejected: %s", job_name, error)
+        return "error", error
 
     except asyncio.TimeoutError:
         log.error("Job %s timed out", job_name)

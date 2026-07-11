@@ -2254,6 +2254,73 @@ def _persist_trade_protection_metadata(conn, trade_id: str, protection: dict[str
     )
 
 
+def _finalize_matched_open_trade(conn, trade: dict, position: dict) -> dict | None:
+    """Commit exchange-authoritative entry fields for one matched OPEN trade.
+
+    This closes the post-fill crash/write-failure gap: protection reconciliation
+    previously matched the real position but left a stale requested size and entry
+    price in SQLite indefinitely.
+    """
+    trade_id = str(trade.get("id") or "").strip()
+    entry_price = _coerce_positive_float(position.get("entry_price"))
+    position_size = _coerce_positive_float(position.get("size"))
+    if not trade_id or entry_price is None or position_size is None:
+        return None
+
+    signal_data = parse_trade_signal_data(trade.get("signal_data"))
+    previous_state = str(signal_data.get("entry_finalization_state") or "").strip() or None
+    previous_entry = _coerce_positive_float(trade.get("fill_entry_price"))
+    previous_size = _coerce_positive_float(trade.get("size"))
+    needs_finalization = bool(
+        signal_data.get("pending_open_reconcile")
+        or signal_data.get("fill_persistence_failed")
+        or previous_state in {"order_pending", "reconcile_required"}
+        or previous_entry is None
+        or previous_size is None
+        or abs(previous_entry - entry_price) > max(1e-9, entry_price * 1e-9)
+        or abs(previous_size - position_size) > max(1e-9, position_size * 1e-9)
+    )
+    if not needs_finalization:
+        return None
+
+    finalized_at = get_now().isoformat()
+    for stale_key in (
+        "pending_open_reconcile",
+        "pending_open_reconcile_at",
+        "open_execution_failure_reason",
+        "fill_persistence_failed",
+    ):
+        signal_data.pop(stale_key, None)
+    signal_data["filled_size"] = float(position_size)
+    signal_data["entry_finalization_state"] = "finalized_reconciled"
+    signal_data["entry_finalized_at"] = finalized_at
+    signal_data["entry_reconciled_at"] = finalized_at
+
+    conn.execute(
+        "UPDATE trades SET entry_price = ?, fill_entry_price = ?, size = ?, signal_data = ? "
+        "WHERE id = ? AND status = 'OPEN'",
+        (
+            float(entry_price),
+            float(entry_price),
+            float(position_size),
+            json.dumps(signal_data),
+            trade_id,
+        ),
+    )
+    conn.execute(
+        "UPDATE portfolio_positions SET entry_price = ? WHERE trade_id = ?",
+        (float(entry_price), trade_id),
+    )
+    return {
+        "type": "entry_finalized",
+        "trade_id": trade_id,
+        "asset": str(position.get("asset") or trade.get("asset") or "").strip().upper(),
+        "previous_state": previous_state,
+        "entry_price": float(entry_price),
+        "filled_size": float(position_size),
+    }
+
+
 def _repair_position_protection(
     position: dict,
     *,
@@ -2644,6 +2711,8 @@ def _insert_recovered_trade(
         signal_data["data_source"] = "local"
     signal_data["execution_venue"] = "hyperliquid"
     signal_data["execution_mode"] = "recovered"
+    signal_data["entry_finalization_state"] = "finalized_recovered"
+    signal_data["entry_finalized_at"] = get_now().isoformat()
 
     conn.execute(
         """
@@ -3059,6 +3128,14 @@ def reconcile_exchange_positions(
                         }
                     )
                 matched_open_trade = _first_item(local_trades) if len(local_trades) == 1 else None
+                if matched_open_trade:
+                    finalized_action = _finalize_matched_open_trade(conn, matched_open_trade, position)
+                    if finalized_action:
+                        resolved_actions.append(finalized_action)
+                        matched_open_trade = dict(matched_open_trade)
+                        matched_open_trade["entry_price"] = finalized_action["entry_price"]
+                        matched_open_trade["fill_entry_price"] = finalized_action["entry_price"]
+                        matched_open_trade["size"] = finalized_action["filled_size"]
                 _repair_kwargs = {"account_address": account_address} if account_address else {}
                 protection, open_orders = _repair_position_protection(
                     position,

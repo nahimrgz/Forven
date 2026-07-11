@@ -32,9 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
-import time
 
 
 def _load_paper_strategies(only: str | None) -> list[dict]:
@@ -88,12 +86,9 @@ def optimize_one(strat: dict, *, objective: str, max_risk: float, max_dd: float,
 
 
 def _backup_db() -> str:
-    import forven.config as cfg
+    from forven.backups import create_managed_db_backup
 
-    db_path = str(cfg.FORVEN_DB)
-    backup = f"{db_path}.bak-{int(time.time())}"
-    shutil.copy2(db_path, backup)
-    return backup
+    return str(create_managed_db_backup("assign-execution-profiles"))
 
 
 def _write_profile(strategy_id: str, profile: dict) -> None:

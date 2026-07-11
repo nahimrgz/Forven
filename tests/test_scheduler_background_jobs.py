@@ -433,6 +433,20 @@ def test_gauntlet_step_loop_runs_via_tracked_sync_job(monkeypatch, forven_db):
     assert captured["kwargs"].get("max_workflows") == 7
 
 
+def test_run_job_rejects_unknown_kind_without_shell_execution(forven_db):
+    job = {
+        "id": "unknown-kind",
+        "name": "Unknown kind",
+        "command": "echo must-not-run",
+        "payload": json.dumps({"kind": "not_registered"}),
+    }
+
+    status, error = asyncio.run(scheduler.run_job(job))
+
+    assert status == "error"
+    assert error == "Unknown scheduler job kind: not_registered"
+
+
 def test_tick_skips_due_gauntlet_job_while_zombie_thread_alive(monkeypatch, forven_db):
     """A due gauntlet_step_loop tick must NOT be claimed (not even via the
     stale takeover in _try_mark_job_running) while a previous tick's worker

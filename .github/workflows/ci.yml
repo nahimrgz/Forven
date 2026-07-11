@@ -87,6 +87,12 @@ jobs:
             tests/test_pipeline_hardening.py::test_evaluate_promotion_accepts_persisted_validation_artifacts_for_paper \
             tests/test_pipeline_hardening.py::test_evaluate_promotion_blocks_failed_required_verdict_tests_for_paper
 
+      - name: Run async runtime regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_daemon_price_freshness.py \
+            tests/test_loop_starvation_fixes.py
+
       # Data-engine regression gate — locks in the 2026-07 data hardening + edge-data
       # expansion (tail-append storage, perp canonicalization, causality shifts,
       # quality gates, fingerprints, symbol registry, basis/IV streams, kernel

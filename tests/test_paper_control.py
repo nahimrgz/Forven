@@ -488,7 +488,10 @@ def test_live_open_places_market_order_and_registers(forven_db, monkeypatch):
     registered = {}
     monkeypatch.setattr(pc.risk_mod, "register", lambda *a, **k: registered.update({"called": True}))
 
+    placed = {}
+
     def _fake_market(asset, side, size, stop_loss_price=None, take_profit_price=None, testnet=True, **kw):
+        placed.update(kw)
         return {
             "entry_price": 100.5,
             "filled_size": size,
@@ -498,7 +501,13 @@ def test_live_open_places_market_order_and_registers(forven_db, monkeypatch):
 
     monkeypatch.setattr(hl, "market_order", _fake_market)
 
-    pc.open_manual_position(STRATEGY_ID, direction="long", size=2.0, stop_loss_price=90.0)
+    pc.open_manual_position(
+        STRATEGY_ID,
+        direction="long",
+        size=2.0,
+        stop_loss_price=90.0,
+        idempotency_key="intent-123",
+    )
 
     from forven.db import get_db
 
@@ -513,6 +522,8 @@ def test_live_open_places_market_order_and_registers(forven_db, monkeypatch):
     assert sd["entry_exchange_order_id"] == "OID-ENTRY-NEW"
     assert sd["exchange_stop_order_id"] == "OID-STOP"
     assert sd["stop_loss_price"] == 90.0
+    assert sd["manual_open_idempotency_key"] == "intent-123"
+    assert placed["idempotency_key"] == "manual-open:intent-123"
     assert registered.get("called") is True
 
 

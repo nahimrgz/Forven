@@ -1004,17 +1004,17 @@ Crypto exchanges typically charge 0.1% (10 bps) per trade, meaning a round-trip 
 	initial_capital: {
 		id: 'initial_capital',
 		term: 'Initial Capital',
-		shortDescription: 'Base account size used by sizing and PnL calculations.',
+		shortDescription: 'Capital baseline for backtests, simulations, and legacy risk conversions.',
 		category: 'risk',
-		fullDescription: 'This value anchors position sizing and reported returns. Set it to realistic deployable capital, not an arbitrary number.',
+		fullDescription: 'This value anchors backtest and simulation sizing, reported returns, and legacy USD-to-percent risk conversions. It does not change the standardized per-strategy paper sandbox, which uses a fixed $10,000 benchmark.',
 		interpretations: [
 			{ range: '$1,000 - $100,000', label: 'Typical', color: 'green', description: 'Good starting range for paper/live validation.' },
 			{ range: '< $1,000', label: 'Small', color: 'yellow', description: 'Useful for testing, but sizing/noise can be distorted.' },
 			{ range: '> $100,000', label: 'Large', color: 'yellow', description: 'Use only if your real deployable capital is this high.' }
 		],
 		proTips: [
-			'Recommended: match this to real deployable capital within ±20%',
-			'Revisit this number before switching from paper to live'
+			'Recommended: match simulation capital to the scenario you are evaluating',
+			'Paper strategy comparisons stay normalized to the fixed $10,000 sandbox'
 		]
 	},
 	position_size_limit: {

@@ -17,6 +17,7 @@ global.fetch = mockFetch;
 describe('deepdive api client', () => {
 	beforeEach(() => {
 		mockFetch.mockReset();
+		window.localStorage.clear();
 	});
 	afterEach(() => {
 		vi.clearAllMocks();
@@ -68,6 +69,8 @@ describe('deepdive api client', () => {
 	});
 
 	it('streamDeepdiveSend parses SSE chunks and invokes callback per event', async () => {
+		window.localStorage.setItem('forven_api_key', 'deepdive-api-key');
+		window.localStorage.setItem('forven_operator_key', 'deepdive-operator-key');
 		// Build a fake stream that emits two SSE blocks across two reader chunks
 		const encoder = new TextEncoder();
 		const chunks = [
@@ -97,6 +100,9 @@ describe('deepdive api client', () => {
 		const [url, init] = mockFetch.mock.calls[0];
 		expect(String(url)).toContain('/api/deepdive/threads/dd_1/send');
 		expect((init as RequestInit).method).toBe('POST');
+		const headers = (init as RequestInit).headers as Headers;
+		expect(headers.get('X-API-Key')).toBe('deepdive-api-key');
+		expect(headers.get('X-Operator-Key')).toBe('deepdive-operator-key');
 		expect(JSON.parse(String((init as RequestInit).body))).toEqual({ user_text: 'hi' });
 	});
 

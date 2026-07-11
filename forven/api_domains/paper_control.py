@@ -552,6 +552,7 @@ def open_manual_position(
     leverage: float = 1.0,
     stop_loss_price=None,
     take_profit_price=None,
+    idempotency_key: str | None = None,
 ) -> dict:
     """Open a brand-new position by hand (paper: local; live: real market order)."""
     session = _resolve_session(session_id)
@@ -581,6 +582,7 @@ def open_manual_position(
             session_id, strategy_id, asset, norm_dir,
             size=size, risk_pct=risk_pct, leverage=lev,
             stop_loss_price=sl, take_profit_price=tp,
+            idempotency_key=idempotency_key,
         )
         return _refresh(session_id)
 
@@ -632,7 +634,7 @@ def open_manual_position(
 
 def _live_open(
     session_id, strategy_id, asset, direction, *, size, risk_pct, leverage,
-    stop_loss_price, take_profit_price,
+    stop_loss_price, take_profit_price, idempotency_key=None,
 ) -> None:
     """Open a real Hyperliquid position (gated), persist it, and register the slot."""
     risk_fraction = None
@@ -696,11 +698,17 @@ def _live_open(
         raise HTTPException(status_code=409, detail=f"Trading halted — {_halt_reason}")
 
     side = "buy" if direction == "long" else "sell"
+    normalized_idempotency_key = str(idempotency_key or "").strip()[:160] or None
     try:
         result = market_order(
             asset, side, float(resolved_size),
             stop_loss_price=stop_loss_price, take_profit_price=take_profit_price,
             testnet=testnet, vault_address=vault,
+            idempotency_key=(
+                f"manual-open:{normalized_idempotency_key}"
+                if normalized_idempotency_key
+                else None
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Exchange open failed: {exc}") from exc
@@ -719,6 +727,8 @@ def _live_open(
         "entry_exchange_order_id": str(entry_oid) if entry_oid is not None else None,
         "exchange_order_id": str(entry_oid) if entry_oid is not None else None,
     }
+    if normalized_idempotency_key:
+        signal_data["manual_open_idempotency_key"] = normalized_idempotency_key
     if stop_loss_price:
         signal_data["stop_loss_price"] = float(stop_loss_price)
         signal_data["stop_loss_source"] = "manual"
