@@ -1351,6 +1351,15 @@ def post_data_engine_backfill_plan() -> dict:
 _CATCHUP_STALL_COOLDOWN_SECS = 6 * 3600.0
 _catchup_stalled: dict[tuple[str, str], float] = {}
 
+# History window (calendar days) requested when BOOTSTRAPPING a brand-new
+# (symbol, timeframe) that has no catalog row yet. Matches the generation
+# universe's own seed default (coverage.backfill_universe / the global
+# DEFAULT_BACKTEST_DURATION_DAYS = 730), so a freshly-activated symbol lands with
+# the same ~2 years of history the quick-screen/backtest windows expect — a
+# thinner window would manufacture the "too-few-trades" rejections that the
+# demand-driven coverage machinery exists to prevent.
+_BOOTSTRAP_HISTORY_DAYS = 730
+
 
 def execute_data_engine_catchup(
     max_tasks: int = 10, *, cap: int = 50, deadline_seconds: float | None = None
@@ -1360,9 +1369,13 @@ def execute_data_engine_catchup(
 
     Pure (raises plain exceptions, never ``HTTPException``) so both the HTTP
     endpoint and the scheduled ``forven-data-engine-catchup`` auto-drain job can
-    call it. Uses ``backfill_ohlcv_gaps`` (reports bars_added + a no_recent_data
-    flag) so a series that genuinely can't advance is counted as ``failed`` rather
-    than silently reported as a green success.
+    call it. Gap-fill tasks (``stale`` / ``gaps``) use ``backfill_ohlcv_gaps``
+    (reports bars_added + a no_recent_data flag) so a series that genuinely can't
+    advance is counted as ``failed`` rather than silently reported as a green
+    success. ``bootstrap`` tasks — an active (symbol, timeframe) with no catalog
+    row — instead route to the demand-driven coverage machinery
+    (``ensure_coverage``), which backfill_ohlcv_gaps can't serve (it only extends
+    an EXISTING series, so a brand-new symbol is a 0-bar no-op there).
 
     ``deadline_seconds`` is a wall-clock budget: the batch stops gracefully once
     it is exceeded (returning partial progress; the next run continues the drain).
@@ -1432,7 +1445,7 @@ def execute_data_engine_catchup(
 
     from forven.data import backfill_ohlcv_gaps
 
-    executed = rows_added = failed = 0
+    executed = rows_added = failed = bootstrapped = 0
     deadline_hit = False
     results: list[dict] = []
     for t in batch:
@@ -1448,7 +1461,33 @@ def execute_data_engine_catchup(
             )
             break
         executed += 1
+        # A bootstrap task targets a brand-new (symbol, timeframe) with NO catalog
+        # row. backfill_ohlcv_gaps only EXTENDS an existing series — on a symbol
+        # with no stored bars it is a harmless 0-bar no-op, so history never
+        # actually lands. Route those to the demand-driven coverage machinery
+        # (ensure_coverage), which was built exactly to make a pair exist with
+        # enough history via an async submit_ingestion download.
+        is_bootstrap = str(getattr(t, "reason", "stale") or "") == "bootstrap"
         try:
+            if is_bootstrap:
+                added, kicked_off = _execute_bootstrap_task(t)
+                rows_added += added
+                if kicked_off:
+                    bootstrapped += 1
+                # A bootstrap is never a "stall": ensure_coverage degrades to
+                # "ready" (source exhausted / autobackfill disabled) rather than
+                # failing, so it must not enter the stall cooldown.
+                _catchup_stalled.pop((t.symbol, t.timeframe), None)
+                results.append(
+                    {
+                        "symbol": t.symbol,
+                        "timeframe": t.timeframe,
+                        "rows_added": added,
+                        "bootstrap": True,
+                        "backfilling": kicked_off,
+                    }
+                )
+                continue
             res = backfill_ohlcv_gaps(t.symbol, t.timeframe)
             added = int(res.get("bars_added") or 0)
             rows_added += added
@@ -1464,6 +1503,8 @@ def execute_data_engine_catchup(
                 {"symbol": t.symbol, "timeframe": t.timeframe, "rows_added": added, "stalled": stalled}
             )
         except Exception as exc:
+            # Per-task isolation: one unfetchable bootstrap / backfill must not
+            # abort the rest of the plan (mirror the existing gap-fill handling).
             failed += 1
             _catchup_stalled[(t.symbol, t.timeframe)] = time.monotonic()
             results.append({"symbol": t.symbol, "timeframe": t.timeframe, "error": str(exc)[:200]})
@@ -1471,14 +1512,20 @@ def execute_data_engine_catchup(
     try:
         from forven.data import _log_data_action
 
+        # Bootstraps kick off ASYNC downloads (submit_ingestion runs on the data
+        # thread pool), so their bars usually land on a LATER run — surfacing the
+        # bootstrap count keeps "+Y bars" honest instead of hiding an in-flight
+        # fetch as a silent 0-bar success.
+        bootstrap_note = f", {bootstrapped} bootstrapped" if bootstrapped else ""
         _log_data_action(
             "backfill",
             f"Executed Data Engine backfill plan: {executed} task(s), +{rows_added:,} bars, "
-            f"{failed} failed",
+            f"{failed} failed{bootstrap_note}",
             level="warning" if failed else "info",
             executed=executed,
             failed=failed,
             rows_added=rows_added,
+            bootstrapped=bootstrapped,
         )
     except Exception:
         pass
@@ -1489,9 +1536,46 @@ def execute_data_engine_catchup(
         "executed": executed,
         "rows_added": rows_added,
         "failed": failed,
+        "bootstrapped": bootstrapped,
         "deadline_hit": deadline_hit,
         "results": results[:50],
     }
+
+
+def _execute_bootstrap_task(task) -> tuple[int, bool]:
+    """Bootstrap a brand-new (symbol, timeframe) via the demand-driven coverage
+    machinery. Returns ``(bars_added, kicked_off)`` where ``bars_added`` is any
+    history that already landed for this series by the time we look (0 while an
+    async download is still in flight) and ``kicked_off`` is True when a fresh
+    async backfill was submitted / an in-flight one reused.
+
+    ensure_coverage is non-blocking: it submits the download onto the data thread
+    pool and returns immediately. So the honest bar count for THIS run is whatever
+    the run store already reports for the submitted ingestion (usually 0 — the
+    bars land on a later catch-up run, by which point the now-catalogued series
+    drains as an ordinary gap-fill task and its bars are counted there).
+    """
+    from forven.dataeng.coverage import ensure_coverage
+
+    source = str(getattr(task, "source", "") or "binance") or "binance"
+    res = ensure_coverage(
+        task.symbol, task.timeframe, _BOOTSTRAP_HISTORY_DAYS, exchange=source
+    )
+    kicked_off = str(res.get("status") or "") == "backfilling"
+
+    # Fold in any bars that already landed for the submitted ingestion. Pending /
+    # running downloads report 0 (nothing has landed yet) — honest, not a stall.
+    added = 0
+    run_id = res.get("run_id")
+    if run_id:
+        try:
+            from forven.data import get_ingestion_run
+
+            run = get_ingestion_run(str(run_id)) or {}
+            added = int(run.get("bars_new") or 0)
+        except Exception:
+            added = 0
+    return added, kicked_off
 
 
 def post_execute_data_engine_backfill(max_tasks: int = 10) -> dict:
