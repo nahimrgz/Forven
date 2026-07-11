@@ -10874,23 +10874,8 @@ def walk_forward(
     
 
 
-    if total_bars is not None and int(total_bars) < 420:
-        return {"error": f"Insufficient data for walk-forward: {int(total_bars)} bars requested (need 420+)"}
-    resolved_total_bars = max(int(total_bars), 420)
-
-    # Cap total bars for walk-forward to prevent excessive computation.
-    # For sub-hourly timeframes on large date ranges, the bar count can
-    # explode (e.g. 5m over 2 years ≈ 210K bars).  The bar-by-bar slow
-    # path is O(n) per split so 50K bars keeps runtime reasonable.
-    _WFA_MAX_BARS = 50_000
-    if resolved_total_bars > _WFA_MAX_BARS:
-        log.warning(
-            "Walk-forward capping bars from %d to %d for %s (%s)",
-            resolved_total_bars, _WFA_MAX_BARS, strategy_id, resolved_timeframe,
-        )
-        resolved_total_bars = _WFA_MAX_BARS
-
     # P25-1: WFA knobs from pipeline config (versioned, explicit), with settings fallback.
+    # Resolved BEFORE the minimum-bars gate — the window sizing below needs them.
     try:
         from forven.policy import load_pipeline_config as _load_wfa_config
         wfa_cfg = _load_wfa_config().get("walk_forward", {})
@@ -10907,12 +10892,20 @@ def walk_forward(
         else settings.get("walkforward_folds", wfa_cfg.get("n_folds", 5))
     )
 
+    resolved_total_bars = int(total_bars)
+
     # Trade-frequency-aware window floor (S05925): a defaulted window must give
     # every OOS fold a judgeable trade sample (wfa_min_fold_trades), or the fold
     # pass rate degenerates to coin flips — the stage calendar window handed a
     # ~3-trades/month 4h strategy folds of 1-3 OOS trades. Raise (never shrink)
     # the defaulted window to the recommendation; explicit caller windows are
     # untouched. The resolver caps itself at the same _WFA_MAX_BARS ceiling.
+    #
+    # This sizing MUST run before the minimum-bars gate below: at 1d the stage
+    # calendar window is bars==days, so a 365-day default is 365 bars — the old
+    # order returned "need 420+" before the lift could size 1d to its multi-year
+    # window, making every 1d strategy structurally un-promotable (2026-07-11:
+    # all five persisted "365 bars requested" WFA failures were 1d).
     if window_defaulted:
         try:
             from forven.wfa_window import recommended_wfa_window
@@ -10934,6 +10927,30 @@ def walk_forward(
                 resolved_total_bars = _rec_bars
         except Exception as exc:  # noqa: BLE001 — sizing must never break the run
             log.warning("WFA window recommendation failed for %s: %s", strategy_id, exc)
+        # Belt-and-braces: even if the recommender fails open, a DEFAULTED window
+        # is lifted to the fold floor rather than erroring — only explicit caller
+        # windows may fail the minimum-bars gate.
+        if resolved_total_bars < 420:
+            log.info(
+                "WFA window lifted to the 420-bar fold floor for %s (%s, was %d)",
+                strategy_id, resolved_timeframe, resolved_total_bars,
+            )
+            resolved_total_bars = 420
+
+    if resolved_total_bars < 420:
+        return {"error": f"Insufficient data for walk-forward: {int(resolved_total_bars)} bars requested (need 420+)"}
+
+    # Cap total bars for walk-forward to prevent excessive computation.
+    # For sub-hourly timeframes on large date ranges, the bar count can
+    # explode (e.g. 5m over 2 years ≈ 210K bars).  The bar-by-bar slow
+    # path is O(n) per split so 50K bars keeps runtime reasonable.
+    _WFA_MAX_BARS = 50_000
+    if resolved_total_bars > _WFA_MAX_BARS:
+        log.warning(
+            "Walk-forward capping bars from %d to %d for %s (%s)",
+            resolved_total_bars, _WFA_MAX_BARS, strategy_id, resolved_timeframe,
+        )
+        resolved_total_bars = _WFA_MAX_BARS
 
     resolved_fee_bps = float(
         fee_bps if fee_bps is not None
