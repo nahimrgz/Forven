@@ -1490,6 +1490,27 @@ def _robustness_outcome(
     }
 
 
+def _window_supports_wfa_folds(start: str, end: str, timeframe: str) -> bool:
+    """True when a dated window spans >= 420 bars at ``timeframe`` — the
+    walk-forward fold floor. The optimizer's validation window is an anti-leak
+    HOLDOUT sized for its own internal WFA (often ~30% of a short stage window);
+    forwarding one smaller than the floor to the persisted FULL-HISTORY
+    walk-forward can only ever error ('109 bars requested (need 420+)',
+    S06895's fourth run, 2026-07-12)."""
+    from datetime import datetime
+
+    from forven.api_core import _timeframe_to_minutes
+
+    try:
+        s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        minutes_per_bar = max(_timeframe_to_minutes(str(timeframe or "1h")), 1)
+        span_bars = (e - s).total_seconds() / 60.0 / minutes_per_bar
+        return span_bars >= 420
+    except Exception:  # noqa: BLE001 — unparseable window: let the runner decide
+        return True
+
+
 def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     row = _strategy_row(str(workflow.get("strategy_id") or ""))
     if not row:
@@ -1497,6 +1518,22 @@ def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
     settings = _workflow_settings(workflow)
     wf_cfg = settings.get("walk_forward") if isinstance(settings.get("walk_forward"), dict) else {}
     _selection_window, validation_window = _workflow_optimization_windows(workflow)
+    tf = str(row.get("timeframe") or "1h")
+    start_date = str(validation_window.get("start") or "").strip() or None
+    end_date = str(validation_window.get("end") or "").strip() or None
+    if start_date and end_date and not _window_supports_wfa_folds(start_date, end_date, tf):
+        # The persisted walk-forward is the FULL-HISTORY edge-existence test; the
+        # anti-leak validation on the optimizer's holdout already ran inside the
+        # optimizer itself. Fall back to the windowless trade-frequency-sized
+        # window (the path every successful WFA has used) rather than submitting
+        # a window that structurally cannot produce the fold floor.
+        log.info(
+            "walk_forward %s: optimizer validation window too small for folds at %s — "
+            "running full-history windowless WFA instead",
+            row["id"], tf,
+        )
+        start_date = None
+        end_date = None
     try:
         from forven.routers.robustness import WalkForwardBody
 
@@ -1504,11 +1541,11 @@ def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
             WalkForwardBody(
                 strategy_id=str(row["id"]),
                 symbol=str(row.get("symbol") or "BTC/USDT"),
-                timeframe=str(row.get("timeframe") or "1h"),
+                timeframe=tf,
                 n_splits=int(wf_cfg.get("n_folds") or 5),
                 train_ratio=float(wf_cfg.get("in_sample_pct") or 0.7),
-                start_date=str(validation_window.get("start") or "").strip() or None,
-                end_date=str(validation_window.get("end") or "").strip() or None,
+                start_date=start_date,
+                end_date=end_date,
                 as_of=_workflow_as_of(workflow),
             )
         )
