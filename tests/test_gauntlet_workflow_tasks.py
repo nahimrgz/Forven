@@ -523,3 +523,69 @@ def test_paper_promotion_gate_uses_unified_status_and_transition(forven_db, monk
     assert outcome["status"] == "passed"
     assert seen["strategy_id"] == strategy_id
     assert seen["target_stage"] == "paper"
+
+
+def test_run_walk_forward_drops_undersized_validation_window(forven_db, monkeypatch):
+    """The optimizer's validation window is an anti-leak holdout sized for its own
+    internal WFA; when it spans fewer than the 420-bar fold floor at the strategy's
+    timeframe, run_walk_forward must fall back to the windowless full-history path
+    instead of submitting a window that structurally cannot fold ('109 bars
+    requested (need 420+)', S06895's fourth run, 2026-07-12)."""
+    from datetime import datetime, timedelta, timezone
+
+    from forven.db import get_db
+    from forven.gauntlet import tasks as gtasks
+
+    sid = "S-WFWIN1"
+    now = datetime.now(timezone.utc)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, metrics, "
+            "status, owner, stage, stage_changed_at, created_at, updated_at) "
+            "VALUES (?, ?, 'rsi_momentum', 'BTC/USDT', '4h', '{}', '{}', 'gauntlet', 'brain', "
+            "'gauntlet', ?, ?, ?)",
+            (sid, sid, now.isoformat(), now.isoformat(), now.isoformat()),
+        )
+        conn.commit()
+
+    captured: dict = {}
+
+    def _fake_run_wf(body):
+        captured["start"] = body.start_date
+        captured["end"] = body.end_date
+        return {
+            "verdict": "PASS",
+            "splits": [
+                {"out_of_sample": {"sharpe": 1.0, "total_trades": 12}} for _ in range(5)
+            ],
+            "aggregate_oos": {"sharpe": 0.9, "total_trades": 60},
+        }
+
+    monkeypatch.setattr(gtasks, "_run_walk_forward", _fake_run_wf)
+    # ~18 days at 4h = ~109 bars — far below the 420-bar fold floor.
+    small_window = {
+        "start": (now - timedelta(days=18)).isoformat(),
+        "end": now.isoformat(),
+    }
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, small_window)
+    )
+
+    workflow = {"id": "gw-test-wfwin", "strategy_id": sid, "settings_snapshot_json": "{}"}
+    outcome = gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
+
+    assert captured.get("start") is None and captured.get("end") is None, (
+        f"undersized window must be dropped, got {captured}"
+    )
+    assert outcome["status"] == "passed"
+
+    # A window that DOES support folds is forwarded untouched.
+    big_window = {
+        "start": (now - timedelta(days=200)).isoformat(),
+        "end": now.isoformat(),
+    }
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, big_window)
+    )
+    gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
+    assert captured.get("start") == big_window["start"]
