@@ -225,7 +225,7 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     subsection: 'trading-mode-capital',
     backendSection: 'initial-capital',
     backendPath: 'initial_capital',
-    description: 'Starting equity used to size positions and compute paper P&L.',
+    description: 'Capital baseline for backtests, simulations, and legacy risk-limit conversions; the per-strategy paper sandbox uses a fixed $10,000 benchmark.',
     usedBy: ['forven.api_core', 'forven.bot', 'forven.simulation'],
   },
 

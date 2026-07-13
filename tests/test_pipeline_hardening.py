@@ -594,7 +594,12 @@ def test_transition_stage_keeps_paper_when_live_graduation_gate_fails(forven_db)
     assert transition["from"] == "paper"
     assert transition["to"] == "paper"
     assert transition["requested_to"] == "live_graduated"
-    assert "Insufficient paper duration" in str(transition["blocked_reason"])
+    # PR#60 (strict-live robustness battery) now fires BEFORE the paper-duration
+    # check: a paper->live promotion with no usable gauntlet verdict artifacts is
+    # blocked on absent robustness evidence, not on warm-up duration. The contract
+    # this test locks is unchanged — a not-ready promotion is blocked and stays
+    # paper — only the (correct, earlier) reason moved.
+    assert "Live gate" in str(transition["blocked_reason"])
 
     with get_db() as conn:
         row = conn.execute(
@@ -610,7 +615,7 @@ def test_transition_stage_keeps_paper_when_live_graduation_gate_fails(forven_db)
     assert row["status"] == "paper"
     assert event["from_state"] == "paper"
     assert event["to_state"] == "paper"
-    assert event["reason"].startswith("Gate failure: Insufficient paper duration:")
+    assert event["reason"].startswith("Gate failure: Live gate")
     details = json.loads(event["details_json"] or "{}")
     assert details["motion"] == "gate_failure"
     assert details["requested_stage"] == "live_graduated"
@@ -635,7 +640,10 @@ def test_brain_promote_strategy_returns_false_when_live_gate_blocks(forven_db):
     success, reason = brain_promote_strategy("s-brain-paper-blocked", "live_graduated")
 
     assert success is False
-    assert "paper" in reason.lower()
+    # PR#60 strict-live gate: no gauntlet verdict artifacts -> blocked on absent
+    # robustness evidence (fires before the warm-up checks). The contract is the
+    # block + stay-in-paper below, not the specific gate wording.
+    assert "live gate" in reason.lower()
 
     with get_db() as conn:
         row = conn.execute(
@@ -744,7 +752,10 @@ def test_gate_rejection_does_not_fetch_market_data(forven_db, monkeypatch):
     ok, reason = evaluate_promotion("s-reject-no-fetch", "paper", "live_graduated")
 
     assert ok is False
-    assert "paper" in reason.lower()
+    # The strategy has no gauntlet verdict artifacts, so the strict-live gate blocks
+    # it (PR#60); the exact reason is incidental to this test — the invariant is that
+    # rejection logging performed no market-data fetch.
+    assert "live gate" in reason.lower()
     assert fetch_calls == [], (
         f"gate rejection performed {len(fetch_calls)} market-data fetch(es); "
         "regime enrichment must be cache-only"
@@ -2622,6 +2633,62 @@ def test_research_recovery_on_edit_promotes_if_certified(forven_db):
     assert result.get("promoted") is True
     with get_db() as conn:
         row = conn.execute("SELECT stage FROM strategies WHERE id = 's-recov'").fetchone()
+    assert row["stage"] == "quick_screen"
+
+
+def test_research_recovery_reprobes_lookahead_and_parks_on_leak(forven_db, monkeypatch):
+    # LOOKAHEAD-REENTRY-1: recovery must re-run the causality probe every fresh
+    # strategy passes at intake. Certification + data-availability pass (valid
+    # rsi_momentum), but the lookahead re-probe reports a leak → recovery must
+    # NOT promote; the strategy stays research_only with a lookahead status_reason,
+    # classified as a quarantine (not a repeated-failure archive count).
+    from forven.brain import try_research_recovery
+    import forven.strategies.lookahead_probe as lookahead_probe
+
+    _insert_strategy("s-recov-leak", stage="research_only")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET type = 'rsi_momentum', params = ? WHERE id = 's-recov-leak'",
+            (json.dumps({"rsi_threshold": 30, "lookback_period": 14}),),
+        )
+
+    leak_reason = (
+        "Lookahead detected: vectorized signal at bar t=-20 changes when future "
+        "bars are withheld (long_entries) -- strategy reads future data; rejected"
+    )
+    monkeypatch.setattr(lookahead_probe, "detect_lookahead", lambda _obj: leak_reason)
+
+    result = try_research_recovery("s-recov-leak")
+    assert result.get("promoted") is False
+    assert "lookahead" in (result.get("reason") or "").lower()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT stage, status_reason FROM strategies WHERE id = 's-recov-leak'"
+        ).fetchone()
+    assert row["stage"] == "research_only"
+    assert (row["status_reason"] or "").startswith("lookahead_blocked:")
+    # Quarantine classification: a leak is a structural (tier2) quarantine.
+    assert "tier2:lookahead" in row["status_reason"]
+
+
+def test_research_recovery_promotes_when_lookahead_probe_passes(forven_db, monkeypatch):
+    # Same setup, but the re-probe reports no leak → recovery proceeds as before.
+    from forven.brain import try_research_recovery
+    import forven.strategies.lookahead_probe as lookahead_probe
+
+    _insert_strategy("s-recov-clean", stage="research_only")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET type = 'rsi_momentum', params = ? WHERE id = 's-recov-clean'",
+            (json.dumps({"rsi_threshold": 30, "lookback_period": 14}),),
+        )
+
+    monkeypatch.setattr(lookahead_probe, "detect_lookahead", lambda _obj: None)
+
+    result = try_research_recovery("s-recov-clean")
+    assert result.get("promoted") is True
+    with get_db() as conn:
+        row = conn.execute("SELECT stage FROM strategies WHERE id = 's-recov-clean'").fetchone()
     assert row["stage"] == "quick_screen"
 
 

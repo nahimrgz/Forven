@@ -1328,6 +1328,12 @@ POST_MIGRATION_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_id ON trades (strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades (strategy);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);
+-- Partial composite index for _has_open_book_routed_trades(), which runs on
+-- every settings mutation: SELECT 1 FROM trades WHERE status = 'OPEN' AND book
+-- IS NOT NULL AND book != '' AND book != 'main'. idx_trades_status alone forces
+-- a scan of all OPEN rows; this partial index restricts to OPEN rows and orders
+-- them by book so the residual book filters resolve without a full-open scan.
+CREATE INDEX IF NOT EXISTS idx_trades_open_book ON trades (status, book) WHERE status = 'OPEN';
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status);
 CREATE INDEX IF NOT EXISTS idx_tasks_type_status ON tasks (type, status);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks (status);
@@ -3686,6 +3692,31 @@ def kv_set(key: str, value):
             "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
             (key, json.dumps(value), _now()),
         )
+
+
+def kv_set_many(items: dict) -> None:
+    """Write several KV keys inside ONE transaction (all-or-nothing).
+
+    A settings mutation touches multiple KV keys (the main settings blob plus
+    the encrypted-secrets blob, or the pipeline payload plus its WIP-cap
+    mirrors). Persisting them via separate ``kv_set`` calls leaves a window
+    where a crash or lock failure between writes diverges enforcement from
+    display. Committing every touched key on a single connection closes that
+    window: either the whole logical mutation lands or none of it does.
+
+    Values are already-final Python objects (JSON-serializable). Callers that
+    encrypt secrets must pass the ENCRYPTED value here — this helper does not
+    transform values, it only serializes and writes them atomically.
+    """
+    if not items:
+        return
+    now = _now()
+    with get_db() as conn:
+        for key, value in items.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
+                (str(key), json.dumps(value), now),
+            )
 
 
 def live_equity_baseline_kv_key(strategy_id: str) -> str:
@@ -7066,7 +7097,7 @@ def auto_assign_best_symbol_timeframe(strategy_id: str) -> tuple[str, str] | Non
 
     with get_db() as conn:
         row = conn.execute(
-            "SELECT symbol, timeframe, name, type FROM strategies WHERE id = ?",
+            "SELECT symbol, timeframe, name, type, params FROM strategies WHERE id = ?",
             (strategy_id,),
         ).fetchone()
         if not row:
@@ -7076,6 +7107,33 @@ def auto_assign_best_symbol_timeframe(strategy_id: str) -> tuple[str, str] | Non
         old_timeframe = str(row["timeframe"] or "").strip().lower() or "1h"
         if old_symbol == best_symbol and old_timeframe == best_timeframe:
             return best_symbol, best_timeframe
+
+        # The author's declared timeframe (params._timeframe) is a contract. This
+        # reassigner scores rows from EVERY timeframe, so a dense off-declared
+        # history re-homes the strategy onto a context the sweep's prefer-declared
+        # bias just refused — S06895 run seven: gate passed at the declared 4h,
+        # this fired minutes later on old 1h rows, and the persisted walk-forward
+        # then ran (and merit-archived) at 1h. Timeframe changes for declared
+        # strategies belong to the sweep's quality-barred selection, not fitness
+        # shopping across contexts.
+        declared_tf = ""
+        try:
+            params_blob = json.loads(row["params"]) if row["params"] else {}
+            if isinstance(params_blob, dict):
+                declared_tf = str(params_blob.get("_timeframe") or "").strip().lower()
+        except Exception:
+            declared_tf = ""
+        if declared_tf and str(best_timeframe or "").strip().lower() != declared_tf:
+            log_activity(
+                "info",
+                "db.auto_assign_context",
+                (
+                    f"Auto-assign for {strategy_id} kept declared timeframe "
+                    f"{declared_tf} (fitness winner was {best_symbol} {best_timeframe})"
+                ),
+                {"strategy_id": strategy_id, "declared_timeframe": declared_tf},
+            )
+            return old_symbol, old_timeframe
 
         # Traded-asset freeze: never re-home a running paper/live strategy onto a
         # higher-scoring cross-asset sweep result — keep its promoted asset.
@@ -7487,41 +7545,94 @@ def log_pipeline_container_transition(
         )
 
 
+def _terminal_evidence_error(
+    strategy_id: str,
+    *,
+    require_fitness: bool,
+    no_metrics_msg: str,
+    invalid_json_msg: str,
+    no_perf_msg: str,
+) -> str:
+    """Shared ghost-protection core for terminal transitions: returns the
+    blocking error message, or "" when the strategy carries real evidence.
+    One definition so the archive and reject guards can never drift on what
+    counts as evidence."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT metrics FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+
+        if not row:
+            return f"Strategy {strategy_id} not found"
+
+        metrics_json = row[0]
+        if not metrics_json:
+            return no_metrics_msg
+
+        try:
+            metrics = json.loads(metrics_json) if isinstance(metrics_json, str) else metrics_json
+        except Exception:
+            return invalid_json_msg
+
+        if not isinstance(metrics, dict) or not metrics:
+            return no_metrics_msg
+
+        if require_fitness and metrics.get("fitness") is None:
+            return (
+                f"Strategy {strategy_id} has NULL fitness - archive REJECTED "
+                "(ghost container protection)"
+            )
+
+        # Critical performance metrics (handle both key name variants)
+        has_sharpe = metrics.get("sharpe") is not None or metrics.get("sharpe_ratio") is not None
+        has_return = metrics.get("total_return_pct") is not None or metrics.get("total_return") is not None
+        if not has_sharpe and not has_return:
+            return no_perf_msg
+
+        return ""
+
+
 def verify_fitness_before_archive(strategy_id: str) -> tuple[bool, str]:
     """
     Pre-Archival Metric Verification (Guardrail #1).
     REJECT archive if fitness is NULL or missing.
     Returns (can_archive, error_message).
     """
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT metrics FROM strategies WHERE id = ?",
-            (strategy_id,),
-        ).fetchone()
-        
-        if not row:
-            return False, f"Strategy {strategy_id} not found"
-        
-        metrics_json = row[0]
-        if not metrics_json:
-            return False, f"Strategy {strategy_id} has no metrics - archive REJECTED"
-        
-        try:
-            metrics = json.loads(metrics_json) if isinstance(metrics_json, str) else metrics_json
-        except Exception:
-            return False, f"Strategy {strategy_id} has invalid metrics JSON"
-        
-        fitness = metrics.get("fitness")
-        if fitness is None:
-            return False, f"Strategy {strategy_id} has NULL fitness - archive REJECTED (ghost container protection)"
-        
-        # Also check for critical metrics (handle both key name variants)
-        has_sharpe = metrics.get("sharpe") is not None or metrics.get("sharpe_ratio") is not None
-        has_return = metrics.get("total_return_pct") is not None or metrics.get("total_return") is not None
-        if not has_sharpe and not has_return:
-            return False, f"Strategy {strategy_id} has no valid performance metrics - archive REJECTED"
-        
-        return True, ""
+    error = _terminal_evidence_error(
+        strategy_id,
+        require_fitness=True,
+        no_metrics_msg=f"Strategy {strategy_id} has no metrics - archive REJECTED",
+        invalid_json_msg=f"Strategy {strategy_id} has invalid metrics JSON",
+        no_perf_msg=f"Strategy {strategy_id} has no valid performance metrics - archive REJECTED",
+    )
+    return (error == ""), error
+
+
+def verify_evidence_before_reject(strategy_id: str) -> tuple[bool, str]:
+    """Ghost protection for the `rejected` terminal, mirroring
+    verify_fitness_before_archive WITHOUT the fitness-key requirement: `rejected`
+    is reached by gate failures where metrics exist but no fitness was ever
+    scored, so demanding the fitness key would block legitimate merit rejects.
+    Blocks only rejects with NO metrics / NO performance evidence — a strategy
+    that never got a fair run (orphaned runtime, infra failure) must not be
+    terminally rejected on the absence of evidence.
+    Returns (can_reject, error_message)."""
+    error = _terminal_evidence_error(
+        strategy_id,
+        require_fitness=False,
+        no_metrics_msg=(
+            f"Strategy {strategy_id} has no metrics - terminal reject blocked (ghost protection)"
+        ),
+        invalid_json_msg=(
+            f"Strategy {strategy_id} has invalid metrics JSON - terminal reject blocked"
+        ),
+        no_perf_msg=(
+            f"Strategy {strategy_id} has no valid performance metrics - "
+            "terminal reject blocked (ghost protection)"
+        ),
+    )
+    return (error == ""), error
 
 
 def detect_ghost_containers() -> list[dict]:

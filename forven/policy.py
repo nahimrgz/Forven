@@ -16,6 +16,38 @@ from forven.util import normalize_stage
 
 log = logging.getLogger("forven.policy")
 
+
+class GateRejection(str):
+    """A gate-rejection reason string that carries its taxonomy code STRUCTURALLY.
+
+    Rejection reasons flow from ~84 ``return False, "<reason>"`` sites through the
+    gate-evaluation tuples into ``_log_gate_rejection_record``, which decides via
+    ``_check_repeated_failure_auto_archive`` whether the rejection COUNTS toward the
+    5-strike auto-archive or is EXEMPT (evidence-absence: tests not run, work in
+    flight, stale/pending artifacts). That decision historically rode on SUBSTRING
+    MATCHING of the human prose (``_extract_reason_code``) — so any reword of an
+    exempt rejection silently reclassified it as a COUNTING merit failure and
+    wrongly archived healthy strategies (S06127 fold-density 2026-07-06; the
+    source-reconciliation-pending case 2026-07-10).
+
+    This subclass is a drop-in ``str`` (wire-compatible with every f-string, DB
+    binding, ``.lower()`` and comparison downstream), so existing tuple consumers
+    are unaffected. Evidence-absence sites construct it with an explicit
+    ``reason_code=`` so classification travels with the value and never depends on
+    prose. Plain-string sites keep working through the text-matcher fallback in
+    ``_resolve_reason_code``. The tripwire test in tests/test_reason_code_drift.py
+    fails if an exempt rejection is reworded without carrying its code.
+    """
+
+    __slots__ = ("reason_code",)
+    reason_code: str | None
+
+    def __new__(cls, text: str, reason_code: str | None = None) -> "GateRejection":
+        obj = super().__new__(cls, text)
+        obj.reason_code = reason_code
+        return obj
+
+
 DEFAULT_PIPELINE_CONFIG = {
     # Active stance preset (relaxed | default | strict | custom). The Default preset
     # IS this DEFAULT_PIPELINE_CONFIG; relaxed/strict are deltas applied in
@@ -1054,6 +1086,53 @@ def _check_params_applied(strategy_id: str) -> tuple[bool, str]:
     return True, "Strategy params match optimization best params"
 
 
+def _latest_genuine_result_time(conn, strategy_id: str, result_type: str) -> str:
+    """Raw created_at of the newest row of ``result_type`` that actually
+    COMPLETED (not pending/errored/timed-out/restart-killed).
+
+    A non-result row measured nothing: letting it set an ordering/freshness
+    timestamp either spuriously invalidates every genuine run before it (a
+    restart-killed optimization vs a real walk_forward — the S06885 promotion
+    deadlock, 2026-07-11) or makes a stale surviving verdict look fresh (an
+    errored newer walk_forward masking that the verdict the gate actually reads
+    predates the optimization). Status/error are extracted in SQL — no
+    metric-blob fetch, no row cap; rows with unparseable JSON count as genuine,
+    matching the pre-fix readers. Returns "" when no genuine row exists.
+    """
+    rows = conn.execute(
+        """SELECT created_at,
+                  CASE WHEN json_valid(COALESCE(metrics_json, ''))
+                       THEN LOWER(TRIM(COALESCE(json_extract(metrics_json, '$.status'), '')))
+                       ELSE '' END AS m_status,
+                  CASE WHEN json_valid(COALESCE(metrics_json, ''))
+                       THEN TRIM(COALESCE(json_extract(metrics_json, '$.error'), ''))
+                       ELSE '' END AS m_error,
+                  CASE WHEN json_valid(COALESCE(config_json, ''))
+                       THEN LOWER(TRIM(COALESCE(json_extract(config_json, '$.status'), '')))
+                       ELSE '' END AS c_status,
+                  CASE WHEN json_valid(COALESCE(config_json, ''))
+                       THEN TRIM(COALESCE(json_extract(config_json, '$.error'), ''))
+                       ELSE '' END AS c_error
+           FROM backtest_results
+           WHERE strategy_id = ?
+             AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
+             AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+           ORDER BY datetime(created_at) DESC""",
+        (strategy_id, str(result_type or "").strip().lower()),
+    ).fetchall()
+    for row in rows:
+        metrics_blob = {"status": row["m_status"], "error": row["m_error"]}
+        config_blob = {"status": row["c_status"], "error": row["c_error"]}
+        if is_nonresult_validation_row(metrics_blob, config_blob):
+            continue
+        return str(row["created_at"] or "")
+    return ""
+
+
+def _latest_genuine_optimization_time(conn, strategy_id: str) -> str:
+    return _latest_genuine_result_time(conn, strategy_id, "optimization")
+
+
 def _check_confirmation_backtest(strategy_id: str) -> tuple[bool, str]:
     """Verify a full backtest exists that was run AFTER the latest optimization.
 
@@ -1061,18 +1140,9 @@ def _check_confirmation_backtest(strategy_id: str) -> tuple[bool, str]:
     backtest that was soft-deleted by quality gates still counts.
     """
     with get_db() as conn:
-        opt_row = conn.execute(
-            """SELECT created_at FROM backtest_results
-               WHERE strategy_id = ?
-                 AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = 'optimization'
-                 AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-               ORDER BY datetime(created_at) DESC LIMIT 1""",
-            (strategy_id,),
-        ).fetchone()
-        if not opt_row:
+        opt_time = _latest_genuine_optimization_time(conn, strategy_id)
+        if not opt_time:
             return False, "No optimization found — cannot verify confirmation backtest"
-
-        opt_time = str(opt_row["created_at"] or "")
         # Include trashed backtests — auto-trash quality gates should not
         # invalidate the fact that a confirmation backtest was run.
         bt_row = conn.execute(
@@ -1096,35 +1166,27 @@ def _check_artifact_ordering(strategy_id: str, required_types: list[str] | None 
     """Verify artifacts were created in the correct order:
     multi-TF backtests → optimization → confirmation backtest → validation tests.
     """
-    with get_db() as conn:
-        rows = conn.execute(
-            """SELECT LOWER(TRIM(COALESCE(result_type, 'backtest'))) AS rt,
-                      MAX(datetime(created_at)) AS latest
-               FROM backtest_results
-               WHERE strategy_id = ?
-                 AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-               GROUP BY LOWER(TRIM(COALESCE(result_type, 'backtest')))""",
-            (strategy_id,),
-        ).fetchall()
-
-    timestamps: dict[str, str] = {}
-    for row in rows:
-        rt = str(row["rt"] or "")
-        timestamps[rt] = str(row["latest"] or "")
-
-    opt_time = timestamps.get("optimization", "")
-
-    # Check ordering: optimization before validation tests
+    # Check ordering: optimization before validation tests. BOTH sides of the
+    # comparison must be GENUINE completed runs: a failed/restart-killed
+    # optimization would spuriously flag every earlier walk_forward as stale,
+    # and an errored newer validation row would make a stale surviving verdict
+    # look correctly ordered. Raw created_at strings compare consistently
+    # (same column, same writer).
     required = {
         _canonicalize_gauntlet_verdict_test(rt)
         for rt in (required_types or [])
         if str(rt or "").strip()
     }
     validation_types = sorted(required) if required else list(_GAUNTLET_VALIDATION_TYPES)
-    for vt in validation_types:
-        vt_time = timestamps.get(vt, "")
-        if vt_time and opt_time and vt_time < opt_time:
-            return False, f"Ordering violation: {vt} was run before optimization — re-run after optimization"
+    with get_db() as conn:
+        opt_time = _latest_genuine_optimization_time(conn, strategy_id)
+        for vt in validation_types:
+            vt_time = _latest_genuine_result_time(conn, strategy_id, vt)
+            if vt_time and opt_time and vt_time < opt_time:
+                return False, GateRejection(
+                    f"Ordering violation: {vt} was run before optimization — re-run after optimization",
+                    reason_code="stale_validation",
+                )
 
     return True, "Artifact ordering is correct"
 
@@ -1138,16 +1200,7 @@ def _check_validation_freshness(strategy_id: str, required_types: list[str] | No
     actual param edits), which caused fresh validation tests to appear stale.
     """
     with get_db() as conn:
-        opt_row = conn.execute(
-            """SELECT created_at FROM backtest_results
-               WHERE strategy_id = ?
-                 AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = 'optimization'
-                 AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-               ORDER BY datetime(created_at) DESC LIMIT 1""",
-            (strategy_id,),
-        ).fetchone()
-
-    baseline = str(opt_row["created_at"] or "") if opt_row else ""
+        baseline = _latest_genuine_optimization_time(conn, strategy_id)
 
     if not baseline:
         return True, "No optimization found — freshness check skipped"
@@ -1161,21 +1214,20 @@ def _check_validation_freshness(strategy_id: str, required_types: list[str] | No
     stale = []
     with get_db() as conn:
         for vt in validation_types:
-            row = conn.execute(
-                """SELECT created_at FROM backtest_results
-                   WHERE strategy_id = ?
-                     AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
-                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-                   ORDER BY datetime(created_at) DESC LIMIT 1""",
-                (strategy_id, vt),
-            ).fetchone()
-            if row and str(row["created_at"] or "") < baseline:
+            # Genuine rows only: an errored/timed-out newer re-run must not make
+            # the verdict the gate actually reads (an older genuine run) look
+            # fresh against the optimization baseline.
+            vt_time = _latest_genuine_result_time(conn, strategy_id, vt)
+            if vt_time and vt_time < baseline:
                 stale.append(vt)
 
     if stale:
         return (
             False,
-            f"Stale validation tests (run before latest optimization): {', '.join(stale)}",
+            GateRejection(
+                f"Stale validation tests (run before latest optimization): {', '.join(stale)}",
+                reason_code="stale_validation",
+            ),
         )
     return True, "All validation tests are fresh"
 
@@ -1221,8 +1273,11 @@ def _check_engine_artifact_freshness(strategy_id: str, required_types: list[str]
     if stale:
         return (
             False,
-            f"Validation artifacts predate the current engine version "
-            f"(v{BACKTEST_ENGINE_VERSION}) and are queued for re-validation: {', '.join(stale)}",
+            GateRejection(
+                f"Validation artifacts predate the current engine version "
+                f"(v{BACKTEST_ENGINE_VERSION}) and are queued for re-validation: {', '.join(stale)}",
+                reason_code="stale_engine_artifacts",
+            ),
         )
     return True, "All validation artifacts match the current engine version"
 
@@ -1288,8 +1343,11 @@ def _check_validation_in_flight(strategy_id: str, config: dict | None = None) ->
     if in_flight:
         return (
             False,
-            f"Validation in flight: {', '.join(in_flight)} still running — "
-            f"promotion deferred until the verdict lands",
+            GateRejection(
+                f"Validation in flight: {', '.join(in_flight)} still running — "
+                f"promotion deferred until the verdict lands",
+                reason_code="validation_in_flight",
+            ),
         )
     return True, "No validation tests in flight"
 
@@ -1308,8 +1366,11 @@ def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> t
     if missing:
         return (
             False,
-            f"Missing passing persisted artifact rows for: {', '.join(missing)}. "
-            f"Run or rerun these tests until the saved verdicts pass.",
+            GateRejection(
+                f"Missing passing persisted artifact rows for: {', '.join(missing)}. "
+                f"Run or rerun these tests until the saved verdicts pass.",
+                reason_code="missing_evidence",
+            ),
         )
     # Two-tier transparency: a walk_forward row can pass the PAPER tier (fold
     # pass-rate over judgeable folds) while its strict artifact verdict is FAIL
@@ -1476,7 +1537,10 @@ def _check_paper_duration(strategy_id: str) -> tuple:
         extra = {"current": days, "threshold": min_days, "direction": "gte", "unit": "days"}
         if days >= min_days:
             return True, f"Paper duration: {days}/{min_days} days", extra
-        return False, f"Insufficient paper duration: {days}/{min_days} days", extra
+        return False, GateRejection(
+            f"Insufficient paper duration: {days}/{min_days} days",
+            reason_code="insufficient_paper_evidence",
+        ), extra
     except Exception:
         return False, "Could not parse stage timestamp"
 
@@ -1521,7 +1585,10 @@ def _check_paper_trades(strategy_id: str) -> tuple:
     extra = {"current": total, "threshold": min_trades, "direction": "gte", "unit": "trades"}
     if total >= min_trades:
         return True, f"Paper trades: {total}/{min_trades}", extra
-    return False, f"Insufficient paper trades: {total}/{min_trades}", extra
+    return False, GateRejection(
+        f"Insufficient paper trades: {total}/{min_trades}",
+        reason_code="insufficient_paper_evidence",
+    ), extra
 
 
 def _check_paper_return(strategy_id: str) -> tuple:
@@ -2041,6 +2108,70 @@ def _validation_row_to_verdict_payload(result_type: str, metrics: dict, config: 
     return {"status": status, "passed": status == "pass", "verdict": verdict}
 
 
+_VALIDATION_PENDING_STATUSES = {"pending", "queued", "running", "started", "submitted"}
+_VALIDATION_NONRESULT_STATUSES = {
+    "failed", "error", "errored", "cancelled", "canceled", "timeout", "timed_out", "crashed",
+}
+
+
+def is_errored_validation_row(metrics_blob: object, config_blob: object) -> bool:
+    """True when a persisted validation row ERRORED (failed/timed-out/crashed or
+    carries an error string) — it measured nothing and must never be read as a
+    merit verdict. Excludes pending/running rows: use is_nonresult_validation_row
+    where in-flight rows must also be skipped."""
+    metrics = metrics_blob if isinstance(metrics_blob, dict) else {}
+    config = config_blob if isinstance(config_blob, dict) else {}
+    status = str(metrics.get("status") or config.get("status") or "").strip().lower()
+    error_text = str(metrics.get("error") or config.get("error") or "").strip()
+    return bool(error_text) or status in _VALIDATION_NONRESULT_STATUSES
+
+
+def is_nonresult_validation_row(metrics_blob: object, config_blob: object) -> bool:
+    """True when a persisted validation row is a NON-RESULT — pending, errored,
+    timed out, or crashed — i.e. it measured nothing and must never be read as a
+    merit verdict. Single source of truth shared by the paper-gate verdict
+    extractor and the robustness score recalculator so the two readers cannot
+    drift (the 2026-07-11 leak: the gate skipped errored rows but the score
+    recalc counted them as failed tests)."""
+    metrics = metrics_blob if isinstance(metrics_blob, dict) else {}
+    config = config_blob if isinstance(config_blob, dict) else {}
+    status = str(metrics.get("status") or config.get("status") or "").strip().lower()
+    if status in _VALIDATION_PENDING_STATUSES:
+        return True
+    return is_errored_validation_row(metrics, config)
+
+
+def is_nonresult_wfa_row(metrics_blob: object) -> bool:
+    """True when a COMPLETED walk_forward row EXPLICITLY measured nothing: an
+    empty splits list and zero OOS trades. Such a run carries no evidence in
+    either direction.
+
+    Distinct from is_nonresult_validation_row (errored/pending rows): this row
+    completes with status='succeeded' and no error — e.g. a run against an
+    orphaned runtime class emits zero signals and persists a 0-fold FAIL /
+    INSUFFICIENT verdict, which then displaces a genuine earlier pass as the
+    "latest" row (the S06885 case, 2026-07-11). Deliberately narrow:
+    - a re-run with REAL folds that genuinely fails must still displace an
+      older pass (degraded re-runs are never masked);
+    - a legacy verdict-only row (no `splits` key at all) is shape-unknown, not
+      measured-zero — its verdict stays honored;
+    - real-but-tiny folds keep the designed "insufficient evidence" handling."""
+    metrics = metrics_blob if isinstance(metrics_blob, dict) else {}
+    splits = metrics.get("splits")
+    if not isinstance(splits, list) or len(splits) > 0:
+        return False
+    aggregate_oos = metrics.get("aggregate_oos") if isinstance(metrics.get("aggregate_oos"), dict) else {}
+    oos_trades = (
+        metrics.get("total_oos_trades")
+        or metrics.get("oos_trades")
+        or aggregate_oos.get("total_trades")
+    )
+    try:
+        return float(oos_trades or 0.0) <= 0.0
+    except (TypeError, ValueError):
+        return True
+
+
 def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> tuple[dict[str, object], str | None]:
     from forven.engine_provenance import is_stale_engine_artifact
 
@@ -2081,18 +2212,50 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             """,
             (strategy_id,),
         ).fetchall()
+        current_params_row = conn.execute(
+            "SELECT params FROM strategies WHERE id = ?", (strategy_id,)
+        ).fetchone()
+
+    # Parse configs ONCE (reused by both the preference partition and the main
+    # loop — this extractor runs per strategy per gate evaluation).
+    parsed_rows: list[tuple[object, dict]] = []
+    for result_row in rows:
+        config_blob = _parse_json_blob(result_row["config_json"], {})
+        if not isinstance(config_blob, dict):
+            config_blob = {}
+        parsed_rows.append((result_row, config_blob))
+
+    # Prefer rows validated against the strategy's CURRENT params (the fingerprint
+    # is stamped into each row's config at submission; see gauntlet/status.py's
+    # staleness display). First-per-type-wins below then means "newest genuine
+    # current-params verdict, else newest genuine verdict" — a re-run scored on
+    # since-changed params cannot displace a current-params verdict. Unstamped
+    # legacy rows stay eligible as the fallback (never cry wolf on old history).
+    try:
+        from forven.util import params_fingerprint
+
+        current_params_hash = params_fingerprint(
+            current_params_row["params"] if current_params_row else None
+        )
+    except Exception:
+        current_params_hash = None
+    if current_params_hash:
+        matching = []
+        others = []
+        for pair in parsed_rows:
+            stamped = str(pair[1].get("params_hash") or "").strip()
+            (matching if stamped == current_params_hash else others).append(pair)
+        if matching:
+            parsed_rows = matching + others
 
     stale_engine_types: set[str] = set()
-    for result_row in rows:
+    for result_row, config_blob in parsed_rows:
         normalized_type = _canonicalize_gauntlet_verdict_test(result_row["result_type"])
         if normalized_type in payloads or normalized_type in stale_engine_types:
             continue
         metrics_blob = _parse_json_blob(result_row["metrics_json"], {})
-        config_blob = _parse_json_blob(result_row["config_json"], {})
         if not isinstance(metrics_blob, dict):
             metrics_blob = {}
-        if not isinstance(config_blob, dict):
-            config_blob = {}
         # A verdict produced by a DIFFERENT engine version must never be compared
         # against fresh numbers. It CLAIMS its test type (so an even-older row or
         # the cached fallback blob cannot sneak in as the verdict) but contributes
@@ -2132,25 +2295,26 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             )
             stale_engine_types.add(normalized_type)
             continue
-        status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
-        if status in {"pending", "queued", "running", "started", "submitted"}:
+        # A PENDING or ERRORED validation job is a NON-RESULT, not a quality verdict —
+        # skip it. Example: a walk_forward that could not run because "lookback (210)
+        # exceeds available bars per split (84)" on an incompatible (e.g.
+        # stale-container 1d) timeframe, a worker crash, a timeout, or a data gap. Such
+        # a row carries status='failed'/'error' + an `error` string and NO
+        # splits/verdict. Reading it as a verdict turns a missing run into a PHANTOM
+        # merit FAIL — folds default to 0 ("Walk-forward has 0 folds" S00552 reject),
+        # trades to 0 (degenerate reject) — which then ARCHIVES a strategy whose
+        # genuine (succeeded) validation on the correct timeframe actually passed (the
+        # S03523 case: a valid 5-fold BTC-1h walk_forward existed, but the errored
+        # BTC-1d row drove the gate). Genuine PASS/FAIL verdicts use status='succeeded'
+        # with splits + a verdict and carry NO error field, so they are unaffected.
+        if is_nonresult_validation_row(metrics_blob, config_blob):
             continue
-        # An ERRORED validation job is a NON-RESULT, not a quality verdict — skip it
-        # exactly like a pending one. Example: a walk_forward that could not run because
-        # "lookback (210) exceeds available bars per split (84)" on an incompatible
-        # (e.g. stale-container 1d) timeframe, a worker crash, or a data gap. Such a row
-        # carries status='failed'/'error' + an `error` string and NO splits/verdict.
-        # Reading it as a verdict turns a missing run into a PHANTOM merit FAIL — folds
-        # default to 0 ("Walk-forward has 0 folds" S00552 reject), trades to 0
-        # (degenerate reject) — which then ARCHIVES a strategy whose genuine (succeeded)
-        # validation on the correct timeframe actually passed (the S03523 case: a valid
-        # 5-fold BTC-1h walk_forward existed, but the errored BTC-1d row drove the gate).
-        # Genuine PASS/FAIL verdicts use status='succeeded' with splits + a verdict and
-        # carry NO error field, so they are unaffected.
-        error_text = str(metrics_blob.get("error") or config_blob.get("error") or "").strip()
-        if error_text or status in {
-            "failed", "error", "errored", "cancelled", "canceled", "timeout", "timed_out", "crashed",
-        }:
+        # A COMPLETED walk_forward with an explicitly EMPTY splits list and 0 OOS
+        # trades measured nothing (e.g. an orphaned-runtime re-run emitting zero
+        # signals). Skip it like an errored row so the newest GENUINE verdict
+        # surfaces; a re-run with real folds that fails still displaces an older
+        # pass, and legacy verdict-only rows (no splits key) stay honored.
+        if normalized_type == "walk_forward" and is_nonresult_wfa_row(metrics_blob):
             continue
         payload = _validation_row_to_verdict_payload(normalized_type, metrics_blob, config_blob)
         legitimacy_payload = dict(config_blob)
@@ -2323,9 +2487,10 @@ def _evaluate_source_divergence_gate(strategy_id: str, general_settings: Any) ->
 
     def _missing(reason: str) -> tuple[bool, str]:
         if block_when_missing:
-            return False, (
+            return False, GateRejection(
                 f"Source reconciliation pending ({reason}) — divergence not yet "
-                f"computed for {symbol} {timeframe}"
+                f"computed for {symbol} {timeframe}",
+                reason_code="source_reconciliation_pending",
             )
         return True, f"source reconciliation unavailable ({reason}) — allowing"
 
@@ -2641,6 +2806,13 @@ def _extract_reason_code(reason_text: str) -> str:
     # threshold still counts below.
     if "source reconciliation pending" in text or "source reconciliation unavailable" in text:
         return "source_reconciliation_pending"
+    # "Gauntlet missing (verdict evidence|required verdict tests)": absence of a
+    # persisted verdict, not a walk-forward MERIT reject. Matched before the "walk"
+    # +"forward" branch below, which would otherwise text-match the test-name list
+    # (e.g. "...: walk_forward") to the COUNTING wfa_reject code. Live sites carry
+    # missing_evidence structurally; this protects historical prose-only DB rows.
+    if "missing" in text and "verdict" in text:
+        return "missing_evidence"
     if "divergence" in text:
         return "source_divergence_reject"
     if "overfit" in text:
@@ -2687,6 +2859,20 @@ def _extract_reason_code(reason_text: str) -> str:
     return "gate_reject"
 
 
+def _resolve_reason_code(reason: str) -> str:
+    """Resolve a rejection's taxonomy code, preferring a STRUCTURAL code.
+
+    A :class:`GateRejection` carries its code from the rejection site, so an
+    evidence-absence classification never depends on prose matching (goal 1/2).
+    Plain strings — including historical ``gate_rejections`` DB rows, which store
+    prose only — fall back to the ``_extract_reason_code`` text matcher (goal 4).
+    """
+    code = getattr(reason, "reason_code", None)
+    if code:
+        return code
+    return _extract_reason_code(str(reason))
+
+
 def _load_metrics_snapshot_for_rejection(strategy_id: str) -> dict | None:
     """Load a compact metrics snapshot for rejection logging."""
     try:
@@ -2714,7 +2900,9 @@ def _log_gate_rejection_record(strategy_id: str, gate: str, reason_text: str, co
     """P0-2/P3-1: Log structured gate rejection with failure taxonomy fields."""
     from forven.engine_provenance import BACKTEST_ENGINE_VERSION
 
-    reason_code = _extract_reason_code(reason_text)
+    # Prefer the structural code carried by a GateRejection (exempt-class rejections
+    # never re-parse prose); fall back to text matching for plain strings.
+    reason_code = _resolve_reason_code(reason_text)
     metrics_snapshot = _load_metrics_snapshot_for_rejection(strategy_id)
     # Provenance: which engine produced the numbers this rejection judged. Lets
     # triage distinguish "rejected by the current engine" from "rejected on
@@ -3643,14 +3831,9 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
 
     metrics = _load_metrics_blob(row)
     if not metrics:
-        # Evidence-of-record for this strategy's quick-screen run may exist in the
-        # gauntlet step history even though strategies.metrics was never updated
-        # (see _load_quick_screen_step_metrics docstring) — check before declaring
-        # "no metrics available", which mislabels a real merit failure AND exempts
-        # it from the repeated-failure auto-archive counter.
-        metrics = _load_quick_screen_step_metrics(strategy_id)
-    if not metrics:
-        return False, "No quick-screen metrics available"
+        return False, GateRejection(
+            "No quick-screen metrics available", reason_code="no_metrics_error"
+        )
 
     # Fast sanity check: reject strategies with zero trades (can't produce signals)
     total_trades = int(metrics.get("total_trades", 0) or 0)
@@ -3783,7 +3966,12 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
         return False, reason
 
     # === S00552 GUARDRAIL 4: Win Rate Trap Detection (WR > 60% but PF < 1.0) ===
-    win_rate = float(out_of_sample.get("win_rate", out_of_sample.get("winRate", 0.0)) or 0.0)
+    # WIN-RATE-UNIT-1: compute_metrics emits win_rate as a 0-1 RATIO, but legacy
+    # blobs may carry it as percent points (57.0). Normalize to percent points so
+    # the > 60% comparisons below fire for EITHER stored unit (values <= 1.0 are
+    # scaled x100 as ratios; > 1.0 are already percent). Without this the ratio
+    # form (0.79) never trips the > 60.0 guards — a silent lookahead escape hatch.
+    win_rate = _to_percent_points(out_of_sample.get("win_rate", out_of_sample.get("winRate", 0.0)))
     min_pf = min(is_pf, oos_pf) if has_distinct_oos else is_pf
     if has_distinct_oos and win_rate > 60.0 and min_pf < 1.0:
         return False, f"S00552 REJECT: Win rate trap detected - WR {win_rate:.1f}% but PF {min_pf:.2f} < 1.0 (likely curve-fitted)"
@@ -4026,7 +4214,10 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     if artifact_counts["optimization"] <= 0 and artifact_counts["walk_forward"] <= 0:
         return (
             False,
-            "Gauntlet requires at least one persisted optimization or walk-forward run before promotion to paper",
+            GateRejection(
+                "Gauntlet requires at least one persisted optimization or walk-forward run before promotion to paper",
+                reason_code="artifacts_pending",
+            ),
         )
     inflight_ok, inflight_msg = _check_validation_in_flight(strategy_id, config)
     if not inflight_ok:
@@ -4043,7 +4234,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
 
     metrics = _load_metrics_blob(row)
     if not metrics:
-        return False, "No gauntlet metrics available"
+        return False, GateRejection(
+            "No gauntlet metrics available", reason_code="no_metrics_error"
+        )
 
     target_metrics = _unwrap_metrics_dict(metrics.get("out_of_sample", metrics))
 
@@ -4177,9 +4370,10 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             # trade-frequency-aware default window (forven.wfa_window) makes the
             # re-run produce judgeable folds.
             _min_fold_trades_msg = int((rob_thresholds or {}).get("wfa_min_fold_trades", 5) or 5)
-            return False, (
+            return False, GateRejection(
                 "S00552 BLOCK: walk-forward window insufficient — no OOS fold reached "
-                f"{_min_fold_trades_msg} trades; re-run WFA on the trade-frequency-aware window"
+                f"{_min_fold_trades_msg} trades; re-run WFA on the trade-frequency-aware window",
+                reason_code="wfa_window_insufficient",
             )
         # F4(b): at the paper gate the WFA fold-consistency floor fires whenever
         # walk_forward actually ran — narrowing required_tests must NOT disable a
@@ -4198,9 +4392,10 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             # above (only N-of-min judgeable folds instead of zero): actionable
             # re-run, not a merit failure — taxonomy maps it to the counter-exempt
             # wfa_window_insufficient code.
-            return False, (
+            return False, GateRejection(
                 f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum "
-                f"{wfa_thresholds['min_folds']}; re-run WFA on the trade-frequency-aware window"
+                f"{wfa_thresholds['min_folds']}; re-run WFA on the trade-frequency-aware window",
+                reason_code="wfa_window_insufficient",
             )
         # Single source of truth for the WFA fold-pass-rate floor: the same
         # robustness_thresholds.wfa_fold_pass_rate_min the composite scorer uses
@@ -4315,10 +4510,16 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     available_tests = set(verdict_payloads)
     if not available_tests:
         missing = ", ".join(sorted(required_tests))
-        return False, f"Gauntlet missing verdict evidence for required tests: {missing}"
+        return False, GateRejection(
+            f"Gauntlet missing verdict evidence for required tests: {missing}",
+            reason_code="missing_evidence",
+        )
     missing = sorted(required_tests.difference(available_tests))
     if missing:
-        return False, f"Gauntlet missing required verdict tests: {', '.join(missing)}"
+        return False, GateRejection(
+            f"Gauntlet missing required verdict tests: {', '.join(missing)}",
+            reason_code="missing_evidence",
+        )
     failing = sorted(
         test_name
         for test_name in required_tests
@@ -4436,13 +4637,17 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
         except Exception:
             started = None
     if started is None:
-        return False, (
+        return False, GateRejection(
             "Paper stage entry time unknown (stage_changed_at missing or unparseable) — "
-            "failing closed: paper duration and trade-evidence window cannot be verified"
+            "failing closed: paper duration and trade-evidence window cannot be verified",
+            reason_code="insufficient_paper_evidence",
         )
     days_in_stage = (datetime.now(timezone.utc) - started).days
     if days_in_stage < min_days:
-        return False, f"Insufficient paper duration: {days_in_stage}/{min_days} days"
+        return False, GateRejection(
+            f"Insufficient paper duration: {days_in_stage}/{min_days} days",
+            reason_code="insufficient_paper_evidence",
+        )
 
     params: list[object] = [strategy_id, stage_since]
     where_since = " AND datetime(closed_at) >= datetime(?)"
@@ -4478,7 +4683,10 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     )
 
     if total_trades < min_trades:
-        return False, f"Insufficient paper sample: {total_trades}/{min_trades} closed trades"
+        return False, GateRejection(
+            f"Insufficient paper sample: {total_trades}/{min_trades} closed trades",
+            reason_code="insufficient_paper_evidence",
+        )
 
     # === S00152: Load and validate backtest metrics for overfitting guardrails ===
     # Only evaluate these once the strategy has accumulated sufficient forward paper evidence.

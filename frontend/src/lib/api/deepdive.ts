@@ -1,4 +1,4 @@
-import { ACTIVE_API_BASE, API_BASE, fetchApi } from './core';
+import { fetchApi, fetchApiStream } from './core';
 
 export type DeepdiveThread = {
 	id: string;
@@ -55,26 +55,17 @@ export async function listDeepdiveMessages(threadId: string): Promise<DeepdiveMe
 	return resp.messages;
 }
 
-function resolveStreamBase(): string {
-	// In test env ACTIVE_API_BASE is '/api'; in browser it's a discovered absolute URL.
-	// fetchApi uses ACTIVE_API_BASE for its requests; mirror that so SSE URLs match what tests expect.
-	const base = (ACTIVE_API_BASE && ACTIVE_API_BASE.trim()) || API_BASE;
-	return base.endsWith('/') ? base.slice(0, -1) : base;
-}
-
 export async function streamDeepdiveSend(
 	threadId: string,
 	userText: string,
 	onEvent: (event: DeepdiveStreamEvent) => void,
 ): Promise<void> {
-	const url = `${resolveStreamBase()}/deepdive/threads/${encodeURIComponent(threadId)}/send`;
-	const r = await fetch(url, {
+	const r = await fetchApiStream(`/deepdive/threads/${encodeURIComponent(threadId)}/send`, {
 		method: 'POST',
-		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({ user_text: userText }),
 	});
-	if (!r.ok || !r.body) {
-		throw new Error(`deepdive send failed: ${r.status}`);
+	if (!r.body) {
+		throw new Error('deepdive send failed: response stream missing');
 	}
 	const reader = r.body.getReader();
 	const decoder = new TextDecoder();

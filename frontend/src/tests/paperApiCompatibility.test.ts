@@ -64,6 +64,27 @@ describe('paper compatibility API client', () => {
 		expect(methods.every((method) => method === 'POST')).toBe(true);
 	});
 
+	it('reuses the manual-open idempotency key after an ambiguous response', async () => {
+		const sessionId = 'compat:strategy:S00002';
+		const options = { direction: 'long' as const, size: 1, stopLossPrice: 95 };
+		mockFetch
+			.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ id: sessionId }),
+			});
+
+		await expect(openManualPaperPosition(sessionId, options)).rejects.toThrow(
+			'operation may have completed',
+		);
+		await openManualPaperPosition(sessionId, options);
+
+		const firstHeaders = (mockFetch.mock.calls[0][1] as RequestInit).headers as Headers;
+		const secondHeaders = (mockFetch.mock.calls[1][1] as RequestInit).headers as Headers;
+		expect(firstHeaders.get('Idempotency-Key')).toBeTruthy();
+		expect(secondHeaders.get('Idempotency-Key')).toBe(firstHeaders.get('Idempotency-Key'));
+	});
+
 	it('rejects unsupported replay controls before fetch', async () => {
 		await expect(replayStep('compat:strategy:S00001')).rejects.toThrow('not supported');
 		await expect(replaySeek('compat:strategy:S00001', 4)).rejects.toThrow('not supported');

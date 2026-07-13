@@ -720,32 +720,45 @@ def optimize_strategy(
     if resolved_param_space is None:
         resolved_param_space = _get_param_space(strategy_id, strategy_type, base_params)
     if not resolved_param_space:
-        # Distinguish the two failure modes so the user gets an actionable error:
-        #   (a) the strategy type is an orphan — no class, no param family →
-        #       the entire strategy is broken, not just the Robustness tab.
-        #   (b) the class exists but doesn't expose `parameter_space()` and the
-        #       type isn't in the hardcoded `defaults` dict → missing param space.
-        from forven.strategies.params import is_known_runtime_type
+        from forven.strategies.sandbox_proxy import is_sandbox_only_type
 
-        if not is_known_runtime_type(strategy_type):
+        if is_sandbox_only_type(strategy_type):
+            # Sandbox-only strategy with no worker-captured _parameter_space:
+            # _get_param_space's documented fallback is the DEGENERATE space — a
+            # single grid evaluation of the author's stored params through the
+            # worker (math.prod over zero axes is 1). The orphan error below is
+            # for types the parent SHOULD be able to resolve; an imported class
+            # is worker-held BY DESIGN, and erroring here blocked every such
+            # strategy's validation_optimization step until retries exhausted
+            # and the workflow failed (S06895, 2026-07-12).
+            resolved_param_space = {}
+        else:
+            # Distinguish the two failure modes so the user gets an actionable error:
+            #   (a) the strategy type is an orphan — no class, no param family →
+            #       the entire strategy is broken, not just the Robustness tab.
+            #   (b) the class exists but doesn't expose `parameter_space()` and the
+            #       type isn't in the hardcoded `defaults` dict → missing param space.
+            from forven.strategies.params import is_known_runtime_type
+
+            if not is_known_runtime_type(strategy_type):
+                return {
+                    "error": (
+                        f"Strategy type '{strategy_type}' has no registered runtime class "
+                        "and is not a known param family. This strategy is an orphan: "
+                        "it cannot be optimized, overlaid on charts, or promoted to live. "
+                        "Either register a class for this TYPE_NAME under "
+                        "forven/strategies/custom/, or archive the strategy."
+                    )
+                }
             return {
                 "error": (
-                    f"Strategy type '{strategy_type}' has no registered runtime class "
-                    "and is not a known param family. This strategy is an orphan: "
-                    "it cannot be optimized, overlaid on charts, or promoted to live. "
-                    "Either register a class for this TYPE_NAME under "
-                    "forven/strategies/custom/, or archive the strategy."
+                    f"No parameter space defined for '{strategy_type}'. The runtime class "
+                    "exists but does not expose a `parameter_space()` method, and there is "
+                    "no entry in the optimizer defaults. Add a `parameter_space()` method "
+                    "to the strategy class (recommended) or an entry to "
+                    "forven/strategies/optimizer.py:_get_param_space defaults."
                 )
             }
-        return {
-            "error": (
-                f"No parameter space defined for '{strategy_type}'. The runtime class "
-                "exists but does not expose a `parameter_space()` method, and there is "
-                "no entry in the optimizer defaults. Add a `parameter_space()` method "
-                "to the strategy class (recommended) or an entry to "
-                "forven/strategies/optimizer.py:_get_param_space defaults."
-            )
-        }
 
     log.info("Optimizing %s (%s on %s)", strategy_id, strategy_type, asset)
 
@@ -893,7 +906,14 @@ def optimize_strategy(
         "strategy_id": strategy_id,
         "asset": asset,
         "strategy_type": strategy_type,
-        "best_params": best["params"],
+        # A degenerate grid (zero axes — e.g. a sandbox-only strategy with no
+        # captured _parameter_space) records no per-axis overrides, so
+        # best["params"] is {}. Report the evaluated FULL params as best then:
+        # "no better params found; best = the author's stored params". An empty
+        # best_params here left the persisted row unreadable to the gauntlet's
+        # _best_params_from_optimization_payload, which resubmitted the
+        # optimization forever (S06895's third run, 2026-07-12).
+        "best_params": best["params"] or dict(best_full_params or {}),
         "best_full_params": best_full_params,
         "best_execution_controls": best.get("execution_controls") or {},
         "best_execution_profile": best_execution_controls,

@@ -435,6 +435,50 @@ def _quick_screen_defer_to_optimization() -> bool:
         return False
 
 
+def _declared_tf_metrics_for_judgment(
+    strategy_id: str,
+    timeframe: str,
+    *,
+    params: dict[str, Any] | None,
+    since: str | None,
+    as_of: str | None,
+) -> dict[str, Any]:
+    """Newest current-artifact backtest metrics at the DECLARED timeframe, for the
+    quick-screen gate to JUDGE (never persist) when the sweep selector returned the
+    declared context unmeasured. Degenerate rows are eligible here on purpose: a
+    sparse declared slice is judged on its own numbers by the gate (whose
+    testing_mode deferral and downstream full-history robustness do the real
+    vetting) instead of the strategy being judged on an off-declared context or on
+    stale stored metrics. Returns {} when no current row exists at that timeframe."""
+    from forven.db import get_db
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT result_id, timeframe, metrics_json, config_json, created_at
+            FROM backtest_results
+            WHERE strategy_id = ?
+              AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = 'backtest'
+              AND LOWER(TRIM(COALESCE(timeframe, ''))) = ?
+              AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+            ORDER BY datetime(created_at) DESC
+            """,
+            (strategy_id, str(timeframe or "").strip().lower()),
+        ).fetchall()
+    for row in rows:
+        if params is not None and not _current_sweep_artifact(
+            row,
+            params=params,
+            since=since,
+            as_of=as_of,
+        ):
+            continue
+        metrics = _loads(row["metrics_json"], {})
+        if isinstance(metrics, dict) and metrics:
+            return metrics
+    return {}
+
+
 def run_quick_screen_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     settings = _workflow_settings(workflow)
     quick_cfg = settings.get("quick_screen") if isinstance(settings.get("quick_screen"), dict) else {}
@@ -457,12 +501,14 @@ def run_quick_screen_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dic
         row = _strategy_row(strategy_id)
         fallback_tf = str(row.get("timeframe") or "") if row else ""
         row_params = _loads((row or {}).get("params"), {})
+        since = str(workflow.get("created_at") or "").strip() or None
+        as_of = _workflow_as_of(workflow)
         best_tf, _best_result_id, best_metrics = _best_sweep_result(
             strategy_id,
             fallback_tf or "1h",
             params=row_params if isinstance(row_params, dict) else {},
-            since=str(workflow.get("created_at") or "").strip() or None,
-            as_of=_workflow_as_of(workflow),
+            since=since,
+            as_of=as_of,
         )
         if best_metrics:
             metrics = best_metrics
@@ -470,6 +516,53 @@ def run_quick_screen_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dic
             # brain guardrails (which read strategies.metrics) judge the best timeframe,
             # and every downstream step (optimization/confirmation/paper) runs on it.
             _persist_quick_screen_winner(strategy_id, best_tf, best_metrics)
+        elif str(best_tf or "").strip().lower() != (fallback_tf or "1h").strip().lower():
+            # The selector returned the DECLARED timeframe UNMEASURED: its slice was
+            # degenerate/absent and every off-declared survivor was negative. Judging
+            # screen_metrics here (produced on the stored, off-declared timeframe)
+            # would recreate the off-declared merit-fail one layer above the selector
+            # that just refused it (S06895 re-adjudication, 2026-07-11: gate failed
+            # on the 1h screen run after the selector correctly refused to crown 1h).
+            declared_metrics = _declared_tf_metrics_for_judgment(
+                strategy_id,
+                str(best_tf),
+                params=row_params if isinstance(row_params, dict) else {},
+                since=since,
+                as_of=as_of,
+            )
+            if declared_metrics:
+                # Judge the declared slice WITHOUT persisting it: it missed the
+                # degeneracy floor, so it must not contaminate strategies.metrics.
+                # The gate's own checks (and the testing_mode deferral) decide, and
+                # the full-history robustness suite remains the real judge downstream.
+                metrics = declared_metrics
+            else:
+                submit_note = "resubmitted declared-timeframe backtest"
+                try:
+                    from forven.api_core import BacktestSubmitBody, stage_backtest_duration_days
+
+                    _submit_backtest(
+                        BacktestSubmitBody(
+                            strategy_id=str(row["id"]) if row else strategy_id,
+                            strategy_name=(row or {}).get("name"),
+                            symbol=(row or {}).get("symbol") or "BTC/USDT",
+                            timeframe=str(best_tf),
+                            params=row_params if isinstance(row_params, dict) else {},
+                            duration_days=stage_backtest_duration_days("timeframe_sweep"),
+                            as_of=as_of,
+                        ),
+                        skip_auto_trash=True,
+                    )
+                except Exception as submit_exc:  # noqa: BLE001 — retry loop handles it
+                    submit_note = f"declared-timeframe resubmission failed: {submit_exc}"
+                return {
+                    "status": "blocked_runtime",
+                    "message": (
+                        f"declared-timeframe ({best_tf}) evidence missing — declared slice "
+                        f"absent and all off-declared contexts negative; {submit_note}"
+                    ),
+                    "retryable": True,
+                }
     except Exception as exc:  # noqa: BLE001 - enhancement must never break the gate
         log.warning(
             "quick_screen_gate: best-of-N selection failed for %s, using quick_screen result: %s",
@@ -714,7 +807,17 @@ def _best_sweep_result(
     author-declared/default timeframe. ``run_quick_screen_gate`` uses it (since the
     timeframe_sweep now runs before the gate, definition v3) and so does
     ``run_validation_optimization``. Rows with empty metrics are ignored; if none are
-    usable the fallback timeframe is returned with no result and empty metrics."""
+    usable the fallback timeframe is returned with no result and empty metrics.
+
+    Prefer-declared bias: the declared timeframe (``fallback_tf``) is the reference
+    context. A NON-declared timeframe wins the crown only when it beats the declared
+    context's score AND carries positive Sharpe — a negative off-declared context must
+    never displace the author's timeframe (S06895, 2026-07-11: the declared-4h row
+    missed the degeneracy floor by one trade and the strategy was crowned, judged,
+    and merit-archived on a Sharpe −2.40 1h context it never declared). When the
+    declared row exists but is degeneracy-skipped and every survivor is negative,
+    the declared context is returned rather than crowning a negative one. A genuinely
+    better positive off-declared timeframe still wins — the enhancement stands."""
     from forven.db import get_db
 
     with get_db() as conn:
@@ -730,9 +833,21 @@ def _best_sweep_result(
         ).fetchall()
 
     best_tf = str(fallback_tf or "1h").strip() or "1h"
+    # The author's declaration comes from the IMMUTABLE params (_timeframe) when
+    # available: strategies.timeframe (fallback_tf) is overwritten by
+    # _persist_quick_screen_winner, so after one legitimate crowning a re-sweep
+    # reading only the column would defend the previously-crowned timeframe
+    # instead of the author's.
+    declared_display = (
+        str((params or {}).get("_timeframe") or "").strip() or best_tf
+    )
+    declared_tf = declared_display.lower()
     best_result_id: str | None = None
     best_metrics: dict[str, Any] = {}
     best_score = float("-inf")
+    best_sharpe = float("-inf")
+    declared_score = float("-inf")
+    declared_pick: tuple[str, str | None, dict[str, Any]] | None = None
     # Least-degenerate fallback, used ONLY if no context clears the validity floor —
     # so a strategy that genuinely can't trade anywhere is judged (and failed) on its
     # most-traded context, never crowned by a lucky 4-trade slice.
@@ -763,11 +878,31 @@ def _best_sweep_result(
         if is_degenerate_backtest_metrics(metrics):
             continue
         score = sharpe * 10.0 + min(trades, 100.0) * 0.01 + total_return * 0.01
+        if tf.lower() == declared_tf and score > declared_score:
+            declared_score = score
+            declared_pick = (tf, rid, metrics)
         if score > best_score:
             best_score = score
+            best_sharpe = float(sharpe)
             best_tf, best_result_id, best_metrics = tf, rid, metrics
+    # No context cleared the validity floor: judge on the most-traded context
+    # (never crowned by a lucky slice — see fb comment above).
     if best_score == float("-inf"):
         return fb_tf, fb_result_id, fb_metrics
+    # Prefer-declared bias (see docstring). Declared rows join the same global
+    # max, so when the winner is off-declared the load-bearing quality bar is
+    # POSITIVE Sharpe (the score comparison only breaks exact ties).
+    if declared_pick is not None and best_tf.lower() != declared_tf:
+        if not (best_score > declared_score and best_sharpe > 0.0):
+            return declared_pick
+    if declared_pick is None and best_sharpe <= 0.0:
+        # Every survivor is negative and the declared context is unmeasured
+        # (absent or degeneracy-skipped): return the declared timeframe
+        # UNMEASURED — no result id, no metrics — so the caller's gate takes the
+        # retryable missing-evidence path instead of judging/persisting a
+        # context the author never declared, or contaminating strategies.metrics
+        # with a degenerate lucky slice.
+        return declared_display, None, {}
     return best_tf, best_result_id, best_metrics
 
 
@@ -1123,10 +1258,48 @@ def run_confirmation_backtest(workflow: dict[str, Any], step: dict[str, Any]) ->
         return _classify_exception(exc)
     if not isinstance(response, dict):
         return {"status": "blocked_runtime", "message": "confirmation backtest returned invalid response", "retryable": True}
+    confirmation_metrics = (
+        response.get("metrics")
+        if isinstance(response.get("metrics"), dict)
+        else _load_result_metrics(response.get("result_id"))
+    )
+    # When the strategy row carries NO performance metrics — the quick-screen gate
+    # deliberately does not persist a degeneracy-skipped declared-TF slice — promote
+    # this confirmation run's metrics as the canonical blob: it is the
+    # POST-optimization run at the declared timeframe over the full IS+OOS window,
+    # exactly the sample the paper (capital) gate needs to judge. Without it the
+    # gate fails closed with "no trade-count metric" despite eleven green steps
+    # (S06895, 2026-07-12). Rows that already carry performance metrics (the normal
+    # sweep-winner path) are left untouched.
+    try:
+        if isinstance(confirmation_metrics, dict) and confirmation_metrics:
+            from forven.policy import _resolve_full_sample_trade_count
+
+            current_blob = _loads(
+                (_strategy_row(str(row["id"])) or {}).get("metrics"), {}
+            )
+            if not isinstance(current_blob, dict):
+                current_blob = {}
+            if _resolve_full_sample_trade_count(current_blob) is None:
+                # Overlay the existing blob (robustness score fields written by
+                # _recalculate_robustness_score) so the backfill adds performance
+                # metrics without erasing the validation bookkeeping.
+                merged = dict(confirmation_metrics)
+                merged.update(current_blob)
+                _persist_quick_screen_winner(
+                    str(row["id"]),
+                    str(row.get("timeframe") or "1h"),
+                    merged,
+                )
+    except Exception as exc:  # noqa: BLE001 — canonical-metrics backfill is best-effort
+        log.warning(
+            "confirmation_backtest: canonical-metrics backfill failed for %s: %s",
+            row.get("id"), exc,
+        )
     return {
         "status": "passed",
         "result_id": response.get("result_id"),
-        "metrics": response.get("metrics") if isinstance(response.get("metrics"), dict) else _load_result_metrics(response.get("result_id")),
+        "metrics": confirmation_metrics,
         "execution_profile_selection": profile_selection,
     }
 
@@ -1355,6 +1528,27 @@ def _robustness_outcome(
     }
 
 
+def _window_supports_wfa_folds(start: str, end: str, timeframe: str) -> bool:
+    """True when a dated window spans >= 420 bars at ``timeframe`` — the
+    walk-forward fold floor. The optimizer's validation window is an anti-leak
+    HOLDOUT sized for its own internal WFA (often ~30% of a short stage window);
+    forwarding one smaller than the floor to the persisted FULL-HISTORY
+    walk-forward can only ever error ('109 bars requested (need 420+)',
+    S06895's fourth run, 2026-07-12)."""
+    from datetime import datetime
+
+    from forven.api_core import _timeframe_to_minutes
+
+    try:
+        s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        minutes_per_bar = max(_timeframe_to_minutes(str(timeframe or "1h")), 1)
+        span_bars = (e - s).total_seconds() / 60.0 / minutes_per_bar
+        return span_bars >= 420
+    except Exception:  # noqa: BLE001 — unparseable window: let the runner decide
+        return True
+
+
 def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     row = _strategy_row(str(workflow.get("strategy_id") or ""))
     if not row:
@@ -1362,6 +1556,22 @@ def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
     settings = _workflow_settings(workflow)
     wf_cfg = settings.get("walk_forward") if isinstance(settings.get("walk_forward"), dict) else {}
     _selection_window, validation_window = _workflow_optimization_windows(workflow)
+    tf = str(row.get("timeframe") or "1h")
+    start_date = str(validation_window.get("start") or "").strip() or None
+    end_date = str(validation_window.get("end") or "").strip() or None
+    if start_date and end_date and not _window_supports_wfa_folds(start_date, end_date, tf):
+        # The persisted walk-forward is the FULL-HISTORY edge-existence test; the
+        # anti-leak validation on the optimizer's holdout already ran inside the
+        # optimizer itself. Fall back to the windowless trade-frequency-sized
+        # window (the path every successful WFA has used) rather than submitting
+        # a window that structurally cannot produce the fold floor.
+        log.info(
+            "walk_forward %s: optimizer validation window too small for folds at %s — "
+            "running full-history windowless WFA instead",
+            row["id"], tf,
+        )
+        start_date = None
+        end_date = None
     try:
         from forven.routers.robustness import WalkForwardBody
 
@@ -1369,11 +1579,11 @@ def run_walk_forward(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
             WalkForwardBody(
                 strategy_id=str(row["id"]),
                 symbol=str(row.get("symbol") or "BTC/USDT"),
-                timeframe=str(row.get("timeframe") or "1h"),
+                timeframe=tf,
                 n_splits=int(wf_cfg.get("n_folds") or 5),
                 train_ratio=float(wf_cfg.get("in_sample_pct") or 0.7),
-                start_date=str(validation_window.get("start") or "").strip() or None,
-                end_date=str(validation_window.get("end") or "").strip() or None,
+                start_date=start_date,
+                end_date=end_date,
                 as_of=_workflow_as_of(workflow),
             )
         )

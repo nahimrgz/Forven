@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 
 from forven import api_core as core
 from forven.api_domains import paper as paper_domain
@@ -121,7 +121,11 @@ def partial_close_paper_position(session_id: str, body: core.PaperPartialCloseBo
 
 
 @router.post("/api/paper/sessions/{session_id}/open-position")
-def open_paper_position(session_id: str, body: core.PaperOpenPositionBody):
+def open_paper_position(
+    session_id: str,
+    body: core.PaperOpenPositionBody,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
     return paper_control_domain.open_manual_position(
         session_id,
         direction=body.direction,
@@ -130,6 +134,7 @@ def open_paper_position(session_id: str, body: core.PaperOpenPositionBody):
         leverage=body.leverage,
         stop_loss_price=body.stop_loss_price,
         take_profit_price=body.take_profit_price,
+        idempotency_key=idempotency_key,
     )
 
 

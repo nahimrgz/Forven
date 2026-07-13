@@ -315,6 +315,87 @@ def _get_failed_open_window_hours(settings: dict) -> float:
     return max(0.0, hours)
 
 
+# RETRY-STORM-2: in-memory fallback for the failed-open cooldown. The DB FAILED
+# mark is what the cooldown query below reads; if that write is dropped (a busy /
+# locked DB while the scanner is hammering it), the trade never shows FAILED, the
+# cooldown never engages, and the scanner re-submits a REAL order every tick — a
+# retry-storm against the exchange with possible duplicate exposure. So the
+# failure-marking path (scanner._fail_unfilled_open_trade) ALSO records the failed
+# open here, keyed by (strategy, asset, direction) -> last-failure timestamp, and
+# this cooldown check consults it alongside the DB. It only holds within this
+# process (a restart both wipes it AND re-reads the DB), which is exactly the
+# window the DB write was meant to cover. Bounded: expired entries are pruned on
+# every read/write so the map can't grow without bound.
+_FAILED_OPEN_INMEM_COOLDOWN: dict[tuple[str, str, str], datetime] = {}
+_FAILED_OPEN_INMEM_LOCK = threading.Lock()
+# Absolute cap so a pathological churn of distinct keys can't grow the map even
+# before any entry expires; oldest entries are evicted first.
+_FAILED_OPEN_INMEM_MAX_ENTRIES = 512
+
+
+def _failed_open_inmem_key(strategy: str, asset: str, direction: str) -> tuple[str, str, str]:
+    return (
+        str(strategy or "").strip(),
+        str(asset or "").strip().upper(),
+        str(direction or "long").strip().lower() or "long",
+    )
+
+
+def _prune_failed_open_inmem(now: datetime, window_seconds: float) -> None:
+    """Drop entries older than the cooldown window (caller holds the lock)."""
+    if window_seconds <= 0:
+        _FAILED_OPEN_INMEM_COOLDOWN.clear()
+        return
+    stale = [
+        key for key, ts in _FAILED_OPEN_INMEM_COOLDOWN.items()
+        if (now - ts).total_seconds() > window_seconds
+    ]
+    for key in stale:
+        _FAILED_OPEN_INMEM_COOLDOWN.pop(key, None)
+    # Hard cap: evict oldest first if the live set is still too large.
+    if len(_FAILED_OPEN_INMEM_COOLDOWN) > _FAILED_OPEN_INMEM_MAX_ENTRIES:
+        for key, _ts in sorted(_FAILED_OPEN_INMEM_COOLDOWN.items(), key=lambda kv: kv[1])[
+            : len(_FAILED_OPEN_INMEM_COOLDOWN) - _FAILED_OPEN_INMEM_MAX_ENTRIES
+        ]:
+            _FAILED_OPEN_INMEM_COOLDOWN.pop(key, None)
+
+
+def register_failed_open_inmem_cooldown(
+    strategy: str, asset: str, direction: str, *, when: datetime | None = None
+) -> None:
+    """RETRY-STORM-2: record a failed live open in the process-local cooldown map.
+
+    Called by the failure-marking path when the durable DB FAILED mark could not be
+    confirmed, so the cooldown still holds within this process. Safe to call even
+    when the DB write DID succeed (belt-and-braces) — the DB and in-memory paths
+    dedupe on the same window. No-op for an empty strategy/asset."""
+    key = _failed_open_inmem_key(strategy, asset, direction)
+    if not key[0] or not key[1]:
+        return
+    ts = when or get_now()
+    with _FAILED_OPEN_INMEM_LOCK:
+        # Prune against a generous window (the longest cooldown/breaker lookback we
+        # might reasonably use) so the map stays bounded regardless of settings.
+        _prune_failed_open_inmem(ts, 24 * 3600.0)
+        _FAILED_OPEN_INMEM_COOLDOWN[key] = ts
+
+
+def _failed_open_inmem_remaining_minutes(
+    strategy: str, asset: str, direction: str, cooldown_minutes: float, now: datetime
+) -> float:
+    """Minutes still to wait per the in-memory cooldown (0 if none / expired)."""
+    if cooldown_minutes <= 0:
+        return 0.0
+    key = _failed_open_inmem_key(strategy, asset, direction)
+    with _FAILED_OPEN_INMEM_LOCK:
+        _prune_failed_open_inmem(now, cooldown_minutes * 60.0)
+        ts = _FAILED_OPEN_INMEM_COOLDOWN.get(key)
+    if ts is None:
+        return 0.0
+    elapsed_minutes = (now - ts).total_seconds() / 60.0
+    return max(cooldown_minutes - elapsed_minutes, 0.0)
+
+
 def _is_strategy_in_failed_open_cooldown(
     strategy: str, asset: str, direction: str, settings: dict
 ) -> tuple[bool, str | None]:
@@ -343,29 +424,36 @@ def _is_strategy_in_failed_open_cooldown(
     if cooldown_minutes <= 0 and (max_attempts <= 0 or window_hours <= 0):
         return False, None
 
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT COALESCE(NULLIF(closed_at, ''), created_at) AS failed_at,
-                   failure_reason
-            FROM trades
-            WHERE status = 'FAILED'
-              AND (
-                COALESCE(NULLIF(strategy_id, ''), strategy) = ?
-                OR strategy = ?
-              )
-              AND UPPER(COALESCE(asset, '')) = ?
-              AND LOWER(COALESCE(direction, 'long')) = ?
-              AND COALESCE(execution_type, 'live') NOT IN ('paper', 'paper_challenger', 'simulation')
-            ORDER BY failed_at DESC
-            LIMIT 50
-            """,
-            (normalized_strategy, normalized_strategy, normalized_asset, normalized_direction),
-        ).fetchall()
-    if not rows:
-        return False, None
-
     now = get_now()
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(NULLIF(closed_at, ''), created_at) AS failed_at,
+                       failure_reason
+                FROM trades
+                WHERE status = 'FAILED'
+                  AND (
+                    COALESCE(NULLIF(strategy_id, ''), strategy) = ?
+                    OR strategy = ?
+                  )
+                  AND UPPER(COALESCE(asset, '')) = ?
+                  AND LOWER(COALESCE(direction, 'long')) = ?
+                  AND COALESCE(execution_type, 'live') NOT IN ('paper', 'paper_challenger', 'simulation')
+                ORDER BY failed_at DESC
+                LIMIT 50
+                """,
+                (normalized_strategy, normalized_strategy, normalized_asset, normalized_direction),
+            ).fetchall()
+    except Exception:
+        # RETRY-STORM-2: if even READING the FAILED rows fails (locked/busy DB), fall
+        # through to the in-memory cooldown rather than treating the strategy as clear.
+        log.warning(
+            "failed-open cooldown: DB read failed for %s %s %s; relying on in-memory cooldown",
+            normalized_strategy, normalized_asset, normalized_direction, exc_info=True,
+        )
+        rows = []
+
     lookback_hours = max(window_hours, cooldown_minutes / 60.0)
     failures: list[datetime] = []
     last_reason: str | None = None
@@ -386,6 +474,18 @@ def _is_strategy_in_failed_open_cooldown(
         if last_reason is None:
             last_reason = str(trade.get("failure_reason") or "").strip() or None
     if not failures:
+        # RETRY-STORM-2: the durable FAILED mark may have been dropped (busy DB).
+        # Consult the process-local fallback so a failed open still cools down.
+        inmem_remaining = _failed_open_inmem_remaining_minutes(
+            normalized_strategy, normalized_asset, normalized_direction, cooldown_minutes, now
+        )
+        if inmem_remaining > 0:
+            return True, (
+                f"Failed-open cooldown for {normalized_strategy}: a recent live open on "
+                f"{normalized_asset} {normalized_direction} FAILED (in-memory fallback — the "
+                f"durable failure mark could not be persisted). Wait {inmem_remaining:.1f}m "
+                "before retrying."
+            )
         return False, None
 
     reason_suffix = f" Last exchange error: {last_reason}" if last_reason else ""
@@ -1776,23 +1876,14 @@ def _extract_close_price(result: object) -> float | None:
 def _close_residual_size(result: object, fallback_requested: float) -> float:
     """M8: unfilled size left after a (no-error) close response.
 
-    Returns 0.0 when the fill size is unknown (don't over-escalate) or when only
-    dust remains. Used by the kill-switch to roll a partial fill into the next,
-    wider slippage tier instead of declaring a partial 'closed'.
+    An unknown fill size is the full requested residual.  Reduce-only retries
+    cannot reverse the position, while assuming an ambiguous response completed
+    can make the kill-switch close local state around real venue exposure.
     """
-    if not isinstance(result, dict):
-        return 0.0
-    filled = result.get("filled_size")
-    if filled is None:
-        return 0.0  # unknown fill -> assume complete (preserve prior behavior)
-    try:
-        req = result.get("requested_size")
-        req_f = float(req) if req is not None else float(fallback_requested)
-        residual = req_f - abs(float(filled))
-    except (TypeError, ValueError):
-        return 0.0
-    dust = max(1e-9, abs(req_f) * 1e-6)
-    return residual if residual > dust else 0.0
+    from forven.execution_results import parse_close_receipt
+
+    receipt = parse_close_receipt(result, fallback_requested)
+    return receipt.residual_size
 
 
 def _close_result_error(result: object) -> str | None:
@@ -2152,6 +2243,73 @@ def _persist_trade_protection_metadata(conn, trade_id: str, protection: dict[str
         "UPDATE trades SET signal_data = ? WHERE id = ?",
         (json.dumps(signal_data), normalized_trade_id),
     )
+
+
+def _finalize_matched_open_trade(conn, trade: dict, position: dict) -> dict | None:
+    """Commit exchange-authoritative entry fields for one matched OPEN trade.
+
+    This closes the post-fill crash/write-failure gap: protection reconciliation
+    previously matched the real position but left a stale requested size and entry
+    price in SQLite indefinitely.
+    """
+    trade_id = str(trade.get("id") or "").strip()
+    entry_price = _coerce_positive_float(position.get("entry_price"))
+    position_size = _coerce_positive_float(position.get("size"))
+    if not trade_id or entry_price is None or position_size is None:
+        return None
+
+    signal_data = parse_trade_signal_data(trade.get("signal_data"))
+    previous_state = str(signal_data.get("entry_finalization_state") or "").strip() or None
+    previous_entry = _coerce_positive_float(trade.get("fill_entry_price"))
+    previous_size = _coerce_positive_float(trade.get("size"))
+    needs_finalization = bool(
+        signal_data.get("pending_open_reconcile")
+        or signal_data.get("fill_persistence_failed")
+        or previous_state in {"order_pending", "reconcile_required"}
+        or previous_entry is None
+        or previous_size is None
+        or abs(previous_entry - entry_price) > max(1e-9, entry_price * 1e-9)
+        or abs(previous_size - position_size) > max(1e-9, position_size * 1e-9)
+    )
+    if not needs_finalization:
+        return None
+
+    finalized_at = get_now().isoformat()
+    for stale_key in (
+        "pending_open_reconcile",
+        "pending_open_reconcile_at",
+        "open_execution_failure_reason",
+        "fill_persistence_failed",
+    ):
+        signal_data.pop(stale_key, None)
+    signal_data["filled_size"] = float(position_size)
+    signal_data["entry_finalization_state"] = "finalized_reconciled"
+    signal_data["entry_finalized_at"] = finalized_at
+    signal_data["entry_reconciled_at"] = finalized_at
+
+    conn.execute(
+        "UPDATE trades SET entry_price = ?, fill_entry_price = ?, size = ?, signal_data = ? "
+        "WHERE id = ? AND status = 'OPEN'",
+        (
+            float(entry_price),
+            float(entry_price),
+            float(position_size),
+            json.dumps(signal_data),
+            trade_id,
+        ),
+    )
+    conn.execute(
+        "UPDATE portfolio_positions SET entry_price = ? WHERE trade_id = ?",
+        (float(entry_price), trade_id),
+    )
+    return {
+        "type": "entry_finalized",
+        "trade_id": trade_id,
+        "asset": str(position.get("asset") or trade.get("asset") or "").strip().upper(),
+        "previous_state": previous_state,
+        "entry_price": float(entry_price),
+        "filled_size": float(position_size),
+    }
 
 
 def _repair_position_protection(
@@ -2544,6 +2702,8 @@ def _insert_recovered_trade(
         signal_data["data_source"] = "local"
     signal_data["execution_venue"] = "hyperliquid"
     signal_data["execution_mode"] = "recovered"
+    signal_data["entry_finalization_state"] = "finalized_recovered"
+    signal_data["entry_finalized_at"] = get_now().isoformat()
 
     conn.execute(
         """
@@ -2959,6 +3119,14 @@ def reconcile_exchange_positions(
                         }
                     )
                 matched_open_trade = _first_item(local_trades) if len(local_trades) == 1 else None
+                if matched_open_trade:
+                    finalized_action = _finalize_matched_open_trade(conn, matched_open_trade, position)
+                    if finalized_action:
+                        resolved_actions.append(finalized_action)
+                        matched_open_trade = dict(matched_open_trade)
+                        matched_open_trade["entry_price"] = finalized_action["entry_price"]
+                        matched_open_trade["fill_entry_price"] = finalized_action["entry_price"]
+                        matched_open_trade["size"] = finalized_action["filled_size"]
                 _repair_kwargs = {"account_address": account_address} if account_address else {}
                 protection, open_orders = _repair_position_protection(
                     position,
@@ -3428,6 +3596,91 @@ def reconcile_all_books(
         exchange_open += int(p.get("exchange_open") or 0)
         synced = synced and bool(p.get("synced"))
 
+    # UNRESOLVABLE-ROUTE-1: an OPEN book-stamped trade whose route resolves to
+    # _UNRESOLVABLE_ROUTE (a locked/unreadable settings read in _trade_routed_address)
+    # is EXCLUDED from every pass above — its own book's and master's — by the scope
+    # filter. That is correct (mis-scoping into master would ghost-close a real
+    # sub-account position), but silent: if that account's position is liquidated or
+    # closed while settings reads fail, the DB trade stays OPEN indefinitely and
+    # nobody knows. Fail LOUD, not silent — re-check the OPEN book-stamped trades now
+    # and surface any that are still unroutable, then try ONE fresh re-resolution +
+    # catch-up pass in case the settings read has recovered.
+    unresolved_ids: list[str] = []
+    reresolved_addresses: set[str | None] = set()
+    try:
+        with get_db() as conn:
+            open_booked = conn.execute(
+                "SELECT * FROM trades WHERE status = 'OPEN' AND book IS NOT NULL AND book != ''"
+            ).fetchall()
+        for _row in open_booked:
+            _trade = dict(_row)
+            if _trade_routed_address(_trade) == _UNRESOLVABLE_ROUTE:
+                _tid = str(_trade.get("id") or "").strip()
+                if _tid:
+                    unresolved_ids.append(_tid)
+    except Exception:
+        log.debug("Unresolvable-route re-check failed", exc_info=True)
+
+    if unresolved_ids:
+        log.error(
+            "Reconcile: %d OPEN book-stamped trade(s) have an UNRESOLVABLE route "
+            "(settings read failure) and were skipped by every pass — %s. A close/"
+            "liquidation on those accounts would go unreconciled until the settings "
+            "read recovers.",
+            len(unresolved_ids), ", ".join(unresolved_ids),
+        )
+        log_activity(
+            "error",
+            "risk",
+            (
+                f"Reconcile could not route {len(unresolved_ids)} open trade(s) "
+                f"({', '.join(unresolved_ids)}) — settings read failure left them "
+                f"OUT of every reconcile pass. A close/liquidation on those accounts "
+                f"is currently invisible; will retry route resolution."
+            ),
+            {"unresolvable_route_trade_ids": unresolved_ids},
+        )
+
+        # ONE fresh re-resolution: the settings read may have recovered since the
+        # per-book passes ran. Collect the accounts these trades now route to and run
+        # a scoped catch-up pass for each; a trade that resolves cleanly this time is
+        # reconciled normally. A trade still unroutable stays flagged (surfaced above).
+        try:
+            with get_db() as conn:
+                catchup_rows = conn.execute(
+                    f"SELECT * FROM trades WHERE id IN ({','.join('?' for _ in unresolved_ids)})",
+                    tuple(unresolved_ids),
+                ).fetchall()
+            for _row in catchup_rows:
+                _addr = _trade_routed_address(dict(_row))
+                if _addr != _UNRESOLVABLE_ROUTE:
+                    reresolved_addresses.add(_addr)
+        except Exception:
+            log.debug("Unresolvable-route re-resolution failed", exc_info=True)
+
+        catchup_passes: list[dict] = []
+        for _addr in reresolved_addresses:
+            _label = address_labels.get(_addr)
+            catchup_passes.append(
+                reconcile_exchange_positions(
+                    testnet,
+                    adopt_missing_in_sqlite=False,
+                    recovery_batch_id=recovery_batch_id,
+                    account_address=_addr,
+                    book_label=_label,
+                    open_orders=None,
+                )
+            )
+        for _p in catchup_passes:
+            if not isinstance(_p, dict) or _p.get("error"):
+                synced = False
+                continue
+            merged_discrepancies.extend(_p.get("discrepancies") or [])
+            merged_informational.extend(_p.get("informational") or [])
+            merged_adopted.extend(_p.get("adopted_positions") or [])
+            merged_actions.extend(_p.get("resolved_actions") or [])
+            synced = synced and bool(_p.get("synced"))
+
     merged = {
         "sqlite_open": sqlite_open,
         "exchange_open": exchange_open,
@@ -3438,8 +3691,11 @@ def reconcile_all_books(
         "resolved_actions": merged_actions,
         "synced": synced,
         "testnet": bool(testnet),
-        "per_book_passes": len(passes),
+        "per_book_passes": len(passes) + len(reresolved_addresses),
     }
+    if unresolved_ids:
+        merged["unresolvable_route_trade_ids"] = unresolved_ids
+        merged["unresolvable_route_reresolved_count"] = len(reresolved_addresses)
     if unreachable_books:
         merged["degraded"] = True
         merged["unreachable_books"] = unreachable_books
@@ -3599,7 +3855,7 @@ def _get_live_risk_state() -> dict:
         return dict(state) if isinstance(state, dict) else dict(default_state)
 
 
-def update_equity(account_equity: float, source: str = "exchange") -> dict:
+def update_equity(account_equity: float, source: str = "exchange", *, rebaseline: bool = False) -> dict:
     """Update equity tracking. Call this every daemon tick.
 
     Updates the high-water mark, checks drawdown kill-switch,
@@ -3608,6 +3864,15 @@ def update_equity(account_equity: float, source: str = "exchange") -> dict:
     Args:
         account_equity: Current account equity in USD.
         source: "exchange" for real exchange data, "paper" for paper-mode fallback.
+        rebaseline: DRAIN-1. When the caller has already established that this
+            (lower) equity reflects an INTENTIONAL operator drain of at-risk
+            capital — not a trading loss — re-anchor the HWM / daily-start to it
+            (same mechanism as a basis change) so the step-down cannot compute a
+            phantom drawdown and trip the kill-switch. Never lifts an already-fired
+            daily-loss halt. The caller (daemon's book-aware read) only sets this
+            after a confirmed consecutive-clean-zero streak, so a genuine loss —
+            which arrives as a lower-but-nonzero clean read — still flows through
+            as drawdown.
 
     Returns:
         {
@@ -3621,7 +3886,7 @@ def update_equity(account_equity: float, source: str = "exchange") -> dict:
         }
     """
     with _RISK_STATE_LOCK:
-        return _update_equity_locked(account_equity, source)
+        return _update_equity_locked(account_equity, source, rebaseline=rebaseline)
 
 
 def _recompute_daily_halt_from_equity(account_equity: float) -> bool:
@@ -3802,7 +4067,7 @@ def _rejected_equity_result(state: dict, reason: str) -> dict:
     }
 
 
-def _update_equity_locked(account_equity: float, source: str) -> dict:
+def _update_equity_locked(account_equity: float, source: str, *, rebaseline: bool = False) -> dict:
     state = _get_risk_state()
     prev_last_equity = float(state.get("last_equity") or 0.0)  # KS-CACHE-LOG: detect sharp accepted moves
 
@@ -3901,6 +4166,35 @@ def _update_equity_locked(account_equity: float, source: str) -> dict:
         if _initial_live_connect:
             state["daily_loss_halt"] = False
             state["daily_loss_halt_date"] = None
+        kv_set_best_effort(
+            sim_kv_key("daily_risk"),
+            {"date": today, "start_equity": account_equity},
+            timeout_seconds=_RISK_WRITE_TIMEOUT_SECONDS,
+        )
+
+    # DRAIN-1: an INTENTIONAL operator drain/defund of a real-capital wallet is a
+    # step-down in at-risk capital, NOT a trading loss. Without this, the accepted
+    # lower equity computes a large drawdown against the pre-drain HWM and trips a
+    # false kill-switch (either immediately or when the substitution cache clears at
+    # restart). Re-anchor the HWM / daily-start to the drained equity — same as a
+    # basis change — but NEVER lift an already-fired daily-loss halt (RISK-STATE-1).
+    # Only honored for real-capital bases: a paper/sim "drain" has no live meaning.
+    # The caller gates this behind a confirmed consecutive-clean-zero streak, so a
+    # genuine loss (a lower-but-nonzero clean read) never sets rebaseline and still
+    # flows through the drawdown math below.
+    if rebaseline and _is_real_capital_equity_source(source) and hwm > 0 and account_equity < hwm:
+        log.warning(
+            "Equity re-baselined for an ACCEPTED wallet DRAIN (source=%s): HWM $%.2f -> $%.2f, "
+            "daily start reset (operator defund, not a drawdown).",
+            source, hwm, account_equity,
+        )
+        log_activity("warning", "risk", (
+            f"Re-baselined equity for an accepted wallet drain ({source}): "
+            f"HWM ${hwm:,.2f} -> ${account_equity:,.2f}, daily start reset. "
+            "Kill-switch / daily-halt unchanged; a drain is not a drawdown."
+        ))
+        hwm = account_equity
+        state["high_water_mark"] = hwm
         kv_set_best_effort(
             sim_kv_key("daily_risk"),
             {"date": today, "start_equity": account_equity},
@@ -4146,6 +4440,38 @@ def close_all_positions() -> list[dict]:
             strategy_ids = open_strategy_by_asset.get(coin.upper(), [])
             strategy_id = _first_item(strategy_ids) if len(strategy_ids) == 1 else None
             trade_ids = open_trade_ids_by_asset.get(coin.upper(), [])
+
+            # KS-TIMEOUT-1: stamp pending_close_reconcile on this asset's trade rows
+            # BEFORE the exchange close. The daemon wraps this whole call in a hard
+            # timeout (RISK_CLOSE_TIMEOUT_SECONDS): if it fires after the exchange
+            # close SUCCEEDS but before the post-loop close_trade_record runs, the
+            # row would otherwise stay a bare OPEN with no marker — and the
+            # reconciler would ghost-close it at the reconcile-time mid, fabricating
+            # PnL on the emergency path. Marking first means a timeout at ANY point
+            # leaves the trade carrying the marker; the reconciler then re-verifies
+            # against exchange truth (recovers the true exit from the fill ledger,
+            # guarded by the empty-read streak) instead of guessing a mid. A
+            # confirmed close runs close_trade_record below, which SUPERSEDES the
+            # marker (it pops every pending_close_* key). Best-effort: a failed
+            # pre-mark must not abort the flatten — the FAILED-close path re-marks
+            # with the richer error metadata at the fallback below.
+            preclose_marked_at = get_now().isoformat()
+            for trade_id in trade_ids:
+                try:
+                    mark_trade_pending_close_reconcile(
+                        trade_id,
+                        close_reason="kill_switch",
+                        close_price_source="kill_switch_close",
+                        requested_at=preclose_marked_at,
+                        extra_signal_data={
+                            "kill_switch_close_preclose_marked_at": preclose_marked_at,
+                        },
+                    )
+                except Exception as _premark_exc:
+                    log.error(
+                        "Kill-switch could not pre-mark trade %s pending-close for %s: %s",
+                        trade_id, coin, _premark_exc,
+                    )
 
             log.warning("Kill-switch closing: %s %.4f %s", side, size, coin)
             close_response = None

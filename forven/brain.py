@@ -29,6 +29,7 @@ from forven.db import (
     format_prefixed_id,
     _extract_numeric_suffix,
     update_display_id,
+    verify_evidence_before_reject,
     verify_fitness_before_archive,
     log_pipeline_container_transition,
 )
@@ -203,6 +204,13 @@ def _gauntlet_entry_guardrails(strategy_id: str, metrics: dict) -> tuple[bool, s
         robustness = robustness * 100.0
     if max_drawdown is not None and abs(max_drawdown) <= 1.0:
         max_drawdown = max_drawdown * 100.0
+    # WIN-RATE-UNIT-1: compute_metrics emits win_rate as a 0-1 RATIO, but legacy
+    # blobs may carry it as percent points (79.0). Normalize to percent points so
+    # Guard 6's "> 70%" tail-risk comparison fires for EITHER stored unit; the
+    # ratio form (0.79) would otherwise never exceed 70 and silently pass a
+    # curve-fitted high-win-rate strategy into the gauntlet.
+    if win_rate is not None and abs(win_rate) <= 1.0:
+        win_rate = win_rate * 100.0
 
     # Guard 1: Hard Sanity Check on IS Sharpe. Was a hardcoded 0.3 auto-reject that
     # no Settings knob could relax; now wired to gauntlet.hard_min_is_sharpe
@@ -2003,7 +2011,14 @@ def transition_stage(
                 # leave the strategy non-canonical but still active.
                 clear_canonical_on_commit = True
 
-        # Guardrail #1: Verify fitness before archive (skip for force-bypass)
+        # Guardrail #1: Verify evidence before a terminal transition (skip for
+        # force-bypass). `rejected` is just as terminal as `archived` — without a
+        # guard a strategy that never produced metrics (orphaned runtime, infra
+        # failure) gets a no-evidence terminal reject (the S06890 case, 2026-07-11).
+        # `rejected` uses the evidence-only variant (no fitness-key requirement —
+        # gate-failure rejects legitimately carry metrics but no scored fitness).
+        # Real losing metrics still reject normally; a stuck no-metrics strategy is
+        # reaped by the 7-day quick_screen stale sweep.
         if normalized_target == "archived" and not force:
             can_archive, error_msg = verify_fitness_before_archive(strategy_id)
             if not can_archive:
@@ -2020,6 +2035,13 @@ def transition_stage(
                 details={"reason": reason, "actor": actor},
                 conn=conn,
             )
+        elif normalized_target == "rejected" and not force:
+            can_reject, error_msg = verify_evidence_before_reject(strategy_id)
+            if not can_reject:
+                return _record_blocked_transition(
+                    block_reason=error_msg,
+                    motion="archive_rejected_ghost_protection",
+                )
         elif normalized_target == "archived":
             event_reason = _build_retirement_reason(
                 current_stage=current_stage,
@@ -2317,6 +2339,49 @@ def transition_stage(
             except Exception:
                 log.warning(
                     "Failed to reset stale gauntlet workflow(s) for %s entering quick_screen",
+                    strategy_id,
+                    exc_info=True,
+                )
+
+        # Timeframe hygiene on a genuine RESTORE (terminal -> quick_screen): the
+        # re-evaluation must start on the AUTHOR'S declared timeframe. Prior runs
+        # can leave a hijacked timeframe column (sweep winner, fitness reassigner
+        # pre-#85), and the fresh quick-screen then RUNS on the wrong context —
+        # writing wrong-context metrics that the overfitting guardrails read and
+        # reject (S06895 run eight: restored with a residual 1h column, screened
+        # at 1h, Gate1 rejected on the fresh 1h Sharpe while the declared-4h
+        # evidence was positive). Stale METRICS need no handling here — the stage
+        # UPDATE below already NULLs them via reset_terminal_metrics. Same conn,
+        # atomic with the stage change; best-effort.
+        if normalized_target == "quick_screen" and str(current_stage or "").strip().lower() in (
+            "archived", "rejected", "backtest_failed", "failed",
+        ):
+            try:
+                hygiene_row = conn.execute(
+                    "SELECT params, timeframe FROM strategies WHERE id = ?",
+                    (strategy_id,),
+                ).fetchone()
+                declared_tf = ""
+                if hygiene_row:
+                    try:
+                        params_blob = json.loads(hygiene_row["params"]) if hygiene_row["params"] else {}
+                        if isinstance(params_blob, dict):
+                            declared_tf = str(params_blob.get("_timeframe") or "").strip().lower()
+                    except Exception:
+                        declared_tf = ""
+                current_tf = str(hygiene_row["timeframe"] or "").strip().lower() if hygiene_row else ""
+                if declared_tf and declared_tf != current_tf:
+                    conn.execute(
+                        "UPDATE strategies SET timeframe = ?, updated_at = ? WHERE id = ?",
+                        (declared_tf, now, strategy_id),
+                    )
+                    log.info(
+                        "Restore hygiene for %s: timeframe %s -> %s (author-declared)",
+                        strategy_id, current_tf, declared_tf,
+                    )
+            except Exception:
+                log.warning(
+                    "Restore timeframe hygiene failed for %s (continuing)",
                     strategy_id,
                     exc_info=True,
                 )
@@ -4062,6 +4127,38 @@ def run_gauntlet_backtest_migration():
     kv_set(flag_key, True)
 
 
+def _reentry_lookahead_reason(strategy_id: str, strategy_type: str, params: dict) -> str | None:
+    """Return a rejection reason if the strategy reads future bars, else None.
+
+    Lifecycle re-entry (research recovery) safety net: the lookahead / data-leak
+    probe runs at registration intake but not on re-entry, so a recovered
+    strategy would otherwise skip the causality check every fresh strategy passes.
+
+    Preserves the PR#60 rejection/inconclusive split established in
+    ``detect_lookahead``: a leak (or a strategy-authoring fault raised inside the
+    strategy's own module) returns a reason string (REJECTION); a probe
+    INFRASTRUCTURE fault returns None (INCONCLUSIVE), so an environmental crash
+    never converts a recoverable strategy into a rejection.
+
+    Fail-OPEN on resolution/instantiation faults: if the class can't be resolved
+    or built here (a probe-side fault, not a strategy fault), return None so
+    recovery is never blocked on this net's own bug — mirrors
+    ``gauntlet.engine._strategy_reproducibly_crashes``.
+    """
+    try:
+        from forven.strategies.backtest import _resolve_strategy_class
+        from forven.strategies.lookahead_probe import detect_lookahead
+
+        cls = _resolve_strategy_class(strategy_type)
+        if cls is None:
+            return None
+        probe = cls(strategy_id, params if isinstance(params, dict) else {})
+        return detect_lookahead(probe)
+    except Exception:  # never block a recovery on a probe-infrastructure fault
+        log.debug("Research recovery lookahead re-probe inconclusive for %s", strategy_id, exc_info=True)
+        return None
+
+
 def try_research_recovery(strategy_id: str) -> dict:
     """Re-certify a research_only strategy and promote to quick_screen if it passes.
 
@@ -4132,7 +4229,36 @@ def try_research_recovery(strategy_id: str) -> dict:
             )
         return {"promoted": False, "reason": block_reason}
 
-    # Certification + data availability passed — promote via transition_stage
+    # LOOKAHEAD-REENTRY-1: the lookahead / data-leak probe runs at registration
+    # intake but NOT on lifecycle re-entry — so a strategy parked to research_only
+    # and later recovered would re-enter quick_screen WITHOUT the causality check
+    # that gates first-time entry. A future-bar leak (e.g. .shift(-1)) makes both
+    # IS and OOS slices amazing, defeating the overfit/win-rate-trap detectors, so
+    # the probe is the primary catch. Re-probe here, at the same choke point that
+    # already re-runs certification + data availability, so recovery cannot smuggle
+    # a leaking strategy past a check every fresh strategy must pass.
+    lookahead_reason = _reentry_lookahead_reason(strategy_id, strategy_type, params)
+    if lookahead_reason:
+        # A leak / strategy-authoring fault is a QUARANTINE reason, not a
+        # repeated-failure archive count — park with a tier-classified reason,
+        # mirroring the certification-failure branch above. Probe INFRASTRUCTURE
+        # faults never reach here: detect_lookahead returns None for them, so an
+        # environmental probe crash stays inconclusive/retryable (recovery is
+        # re-attempted on the next sweep) rather than becoming a rejection.
+        from forven.strategies.certification import classify_failure_tier
+        tier, canonical = classify_failure_tier(lookahead_reason)
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE strategies SET status_reason = ? WHERE id = ?",
+                (f"lookahead_blocked:tier{tier}:{canonical}", strategy_id),
+            )
+        log.warning(
+            "Research recovery: NOT reviving %s — lookahead re-probe rejected: %s",
+            strategy_id, lookahead_reason,
+        )
+        return {"promoted": False, "reason": lookahead_reason}
+
+    # Certification + data availability + causality passed — promote via transition_stage
     result = transition_stage(
         strategy_id=strategy_id,
         target_stage="quick_screen",

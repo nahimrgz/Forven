@@ -1,4 +1,4 @@
-import { ACTIVE_API_BASE, API_BASE, fetchApi } from './core';
+import { fetchApi, fetchApiStream } from './core';
 import type { PageContext } from '$lib/stores/pageContext';
 
 export type AssistantThread = {
@@ -102,11 +102,6 @@ export async function setAssistantCostCap(capUsd: number): Promise<number> {
 	return r.cap_usd;
 }
 
-function resolveStreamBase(): string {
-	const base = (ACTIVE_API_BASE && ACTIVE_API_BASE.trim()) || API_BASE;
-	return base.endsWith('/') ? base.slice(0, -1) : base;
-}
-
 export async function streamAssistantSend(
 	threadId: string,
 	userText: string,
@@ -114,18 +109,16 @@ export async function streamAssistantSend(
 	onEvent: (event: AssistantStreamEvent) => void,
 	allowActions = true,
 ): Promise<void> {
-	const url = `${resolveStreamBase()}/assistant/threads/${encodeURIComponent(threadId)}/send`;
-	const r = await fetch(url, {
+	const r = await fetchApiStream(`/assistant/threads/${encodeURIComponent(threadId)}/send`, {
 		method: 'POST',
-		headers: { 'content-type': 'application/json' },
 		body: JSON.stringify({
 			user_text: userText,
 			page_context: pageContext ?? null,
 			allow_actions: allowActions,
 		}),
 	});
-	if (!r.ok || !r.body) {
-		throw new Error(`assistant send failed: ${r.status}`);
+	if (!r.body) {
+		throw new Error('assistant send failed: response stream missing');
 	}
 	const reader = r.body.getReader();
 	const decoder = new TextDecoder();

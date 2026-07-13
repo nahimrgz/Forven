@@ -11,7 +11,7 @@ from forven.dataeng.settings import (
 )
 
 
-def _task(symbol: str, timeframe: str, stream: str = "candles"):
+def _task(symbol: str, timeframe: str, stream: str = "candles", reason: str = "stale"):
     return SimpleNamespace(
         source="binance",
         market="futures",
@@ -21,6 +21,7 @@ def _task(symbol: str, timeframe: str, stream: str = "candles"):
         start_ts=0,
         end_ts=0,
         permanent=False,
+        reason=reason,
     )
 
 
@@ -264,3 +265,200 @@ def test_catchup_deadline_stops_batch_gracefully(monkeypatch):
     out2 = data_domain.execute_data_engine_catchup(max_tasks=5)
     assert out2["executed"] == 5
     assert out2["deadline_hit"] is False
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap-reason routing: an active (symbol, timeframe) with NO catalog row
+# emits reason="bootstrap" (PR #71 planner side). backfill_ohlcv_gaps only
+# EXTENDS an existing series, so a brand-new symbol is a 0-bar no-op there; the
+# executor must instead route bootstrap tasks to the demand-driven coverage
+# machinery (ensure_coverage), account for them honestly, and isolate failures.
+# ---------------------------------------------------------------------------
+
+
+def _patch_bootstrap(monkeypatch, ensure_coverage, *, ingestion_runs=None):
+    """Route through ensure_coverage/get_ingestion_run without touching the network.
+
+    ``ensure_coverage`` is patched at its definition site (forven.dataeng.coverage)
+    so the executor's local import picks up the stub. ``get_ingestion_run`` returns
+    a stored bars_new so the accounting-folds-landed-bars path is exercised.
+
+    The unrelated ``ensure_universe_coverage`` pre-stage (which the executor also
+    runs, and which itself fans out over ensure_coverage) is stubbed to a no-op so
+    the assertions see ONLY the per-task bootstrap routing under test.
+    """
+    monkeypatch.setattr("forven.dataeng.coverage.ensure_coverage", ensure_coverage)
+    monkeypatch.setattr("forven.dataeng.coverage.ensure_universe_coverage", lambda *a, **k: [])
+    runs = ingestion_runs or {}
+    monkeypatch.setattr("forven.data.get_ingestion_run", lambda rid: runs.get(str(rid)))
+
+
+def test_bootstrap_task_routes_to_ensure_coverage_not_gap_fill(monkeypatch):
+    """A bootstrap task must NOT hit backfill_ohlcv_gaps (a 0-bar no-op on a
+    symbol with no stored bars) — it routes to ensure_coverage instead."""
+    tasks = [_task("NEW-USDT", "1h", reason="bootstrap")]
+
+    gap_calls: list = []
+
+    def fake_backfill(symbol, timeframe, **kwargs):  # must never be called
+        gap_calls.append((symbol, timeframe))
+        return {"bars_added": 0, "no_recent_data": False}
+
+    ec_calls: list = []
+
+    def fake_ensure(symbol, timeframe, required_days, *, exchange="binance"):
+        ec_calls.append((symbol, timeframe, required_days, exchange))
+        return {"status": "backfilling", "run_id": "run-boot", "symbol": symbol}
+
+    _patch_executor(monkeypatch, tasks, fake_backfill)
+    _patch_bootstrap(monkeypatch, fake_ensure)
+
+    result = data_domain.execute_data_engine_catchup(max_tasks=10)
+
+    assert gap_calls == []  # gap-fill path never used for a bootstrap
+    assert len(ec_calls) == 1
+    sym, tf, days, exch = ec_calls[0]
+    assert (sym, tf, exch) == ("NEW-USDT", "1h", "binance")
+    assert days == data_domain._BOOTSTRAP_HISTORY_DAYS == 730  # 2y seed window
+    assert result["executed"] == 1
+    assert result["bootstrapped"] == 1
+    assert result["failed"] == 0
+
+
+def test_bootstrap_folds_landed_bars_into_rows_added(monkeypatch):
+    """When the submitted ingestion has already landed N bars, the run reports N
+    (the current no-op path reported 0)."""
+    tasks = [_task("NEW-USDT", "1h", reason="bootstrap")]
+
+    def fake_ensure(symbol, timeframe, required_days, *, exchange="binance"):
+        return {"status": "backfilling", "run_id": "run-42", "symbol": symbol}
+
+    _patch_executor(monkeypatch, tasks, lambda s, t, **k: {"bars_added": 0})
+    _patch_bootstrap(
+        monkeypatch, fake_ensure, ingestion_runs={"run-42": {"bars_new": 17}}
+    )
+
+    result = data_domain.execute_data_engine_catchup(max_tasks=10)
+    assert result["rows_added"] == 17  # landed bars reported, not a silent 0
+    assert result["bootstrapped"] == 1
+
+
+def test_bootstrap_in_flight_reports_zero_bars_but_counts_bootstrapped(monkeypatch):
+    """An async download still in flight (bars_new==0) is honestly reported as 0
+    bars but is NOT a stall — it counts as a kicked-off bootstrap, not a failure."""
+    tasks = [_task("NEW-USDT", "1h", reason="bootstrap")]
+
+    def fake_ensure(symbol, timeframe, required_days, *, exchange="binance"):
+        return {"status": "backfilling", "run_id": "run-pending", "symbol": symbol}
+
+    _patch_executor(monkeypatch, tasks, lambda s, t, **k: {"bars_added": 0})
+    _patch_bootstrap(
+        monkeypatch, fake_ensure, ingestion_runs={"run-pending": {"bars_new": 0}}
+    )
+
+    result = data_domain.execute_data_engine_catchup(max_tasks=10)
+    assert result["rows_added"] == 0
+    assert result["bootstrapped"] == 1
+    assert result["failed"] == 0
+    # A bootstrap never enters the stall cooldown (ensure_coverage degrades to
+    # "ready", it does not "fail" like a delisted gap-fill series).
+    assert ("NEW-USDT", "1h") not in data_domain._catchup_stalled
+
+
+def test_bootstrap_ready_source_exhausted_is_not_a_stall(monkeypatch):
+    """ensure_coverage returning "ready" (source has no more history / autobackfill
+    disabled) is executed-but-0, never counted as failed."""
+    tasks = [_task("NEW-USDT", "1h", reason="bootstrap")]
+
+    def fake_ensure(symbol, timeframe, required_days, *, exchange="binance"):
+        return {"status": "ready", "coverage_days": 0.0, "symbol": symbol}
+
+    _patch_executor(monkeypatch, tasks, lambda s, t, **k: {"bars_added": 0})
+    _patch_bootstrap(monkeypatch, fake_ensure)
+
+    result = data_domain.execute_data_engine_catchup(max_tasks=10)
+    assert result["executed"] == 1
+    assert result["bootstrapped"] == 0  # nothing kicked off
+    assert result["rows_added"] == 0
+    assert result["failed"] == 0
+
+
+def test_failing_bootstrap_does_not_abort_the_rest_of_the_plan(monkeypatch):
+    """A raising ensure_coverage (unfetchable symbol) is isolated: it counts as
+    one failure and the remaining tasks still execute."""
+    tasks = [
+        _task("BAD-USDT", "1h", reason="bootstrap"),
+        _task("GOOD-USDT", "1h", reason="bootstrap"),
+        _task("STALE-USDT", "1h"),  # ordinary gap-fill still runs after
+    ]
+
+    gap_calls: list = []
+
+    def fake_backfill(symbol, timeframe, **kwargs):
+        gap_calls.append(symbol)
+        return {"bars_added": 4, "no_recent_data": False}
+
+    def fake_ensure(symbol, timeframe, required_days, *, exchange="binance"):
+        if symbol == "BAD-USDT":
+            raise RuntimeError("exchange unavailable")
+        return {"status": "backfilling", "run_id": "run-good", "symbol": symbol}
+
+    _patch_executor(monkeypatch, tasks, fake_backfill)
+    _patch_bootstrap(
+        monkeypatch, fake_ensure, ingestion_runs={"run-good": {"bars_new": 9}}
+    )
+
+    result = data_domain.execute_data_engine_catchup(max_tasks=10)
+    assert result["executed"] == 3  # all three attempted despite the raise
+    assert result["failed"] == 1  # only BAD-USDT
+    assert result["bootstrapped"] == 1  # GOOD-USDT kicked off
+    assert result["rows_added"] == 13  # 9 (bootstrap) + 4 (gap-fill)
+    assert gap_calls == ["STALE-USDT"]  # gap-fill path reached after the failure
+
+
+def test_bootstrap_count_surfaces_in_activity_log(monkeypatch):
+    """The activity-log line reports the bootstrap count so an async fetch isn't
+    hidden as a silent 0-bar success."""
+    tasks = [_task("NEW-USDT", "1h", reason="bootstrap")]
+
+    def fake_ensure(symbol, timeframe, required_days, *, exchange="binance"):
+        return {"status": "backfilling", "run_id": "run-boot", "symbol": symbol}
+
+    logged: list = []
+
+    def fake_log(action, message, **kwargs):
+        logged.append((message, kwargs))
+
+    _patch_executor(monkeypatch, tasks, lambda s, t, **k: {"bars_added": 0})
+    _patch_bootstrap(monkeypatch, fake_ensure)
+    monkeypatch.setattr("forven.data._log_data_action", fake_log)
+
+    data_domain.execute_data_engine_catchup(max_tasks=10)
+
+    assert len(logged) == 1
+    message, kwargs = logged[0]
+    assert "1 bootstrapped" in message
+    assert kwargs.get("bootstrapped") == 1
+
+
+def test_non_bootstrap_tasks_are_unaffected(monkeypatch):
+    """Regression: stale/gaps tasks still flow through backfill_ohlcv_gaps and
+    never invoke ensure_coverage."""
+    tasks = [_task("BTC-USDT", "1h"), _task("ETH-USDT", "4h", reason="gaps")]
+
+    calls: list = []
+
+    def fake_backfill(symbol, timeframe, **kwargs):
+        calls.append(symbol)
+        return {"bars_added": 6, "no_recent_data": False}
+
+    def fake_ensure(*a, **k):  # must never be called
+        raise AssertionError("ensure_coverage called for a non-bootstrap task")
+
+    _patch_executor(monkeypatch, tasks, fake_backfill)
+    _patch_bootstrap(monkeypatch, fake_ensure)
+
+    result = data_domain.execute_data_engine_catchup(max_tasks=10)
+    assert calls == ["BTC-USDT", "ETH-USDT"]
+    assert result["rows_added"] == 12
+    assert result["bootstrapped"] == 0

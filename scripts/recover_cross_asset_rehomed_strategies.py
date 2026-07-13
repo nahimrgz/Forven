@@ -28,9 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -99,7 +97,6 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="cap how many to recover (0 = no cap)")
     args = ap.parse_args()
 
-    from forven.config import FORVEN_DB
     from forven.db import get_db
 
     only = {s.strip() for s in args.ids.split(",") if s.strip()}
@@ -144,8 +141,9 @@ def main() -> int:
         print("\nNothing to recover.")
         return 0
 
-    backup = f"{FORVEN_DB}.bak.recover.{int(time.time())}"
-    shutil.copy2(FORVEN_DB, backup)
+    from forven.backups import create_managed_db_backup
+
+    backup = create_managed_db_backup("recover-cross-asset-rehomed-strategies")
     print(f"\nDB backed up to {backup}")
 
     from forven.brain import transition_stage

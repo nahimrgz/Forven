@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as api from '../lib/api';
-import { LONG_TIMEOUT_MS } from '../lib/api/core';
+import { ApiOutcomeUnknownError, fetchApi, LONG_TIMEOUT_MS } from '../lib/api/core';
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -859,6 +859,16 @@ describe('API Client', () => {
 	});
 
 	describe('Error Handling', () => {
+		it('does not retry a mutation after a network-level failure', async () => {
+			mockFetch.mockRejectedValue(new TypeError('Failed to fetch'));
+
+			await expect(fetchApi('/tasks', {
+				method: 'POST',
+				body: JSON.stringify({ name: 'one-shot' }),
+			})).rejects.toBeInstanceOf(ApiOutcomeUnknownError);
+			expect(mockFetch).toHaveBeenCalledTimes(1);
+		});
+
 		it('should handle network errors', async () => {
 			mockFetch.mockRejectedValue(new Error('Network error'));
 

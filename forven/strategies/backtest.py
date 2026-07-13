@@ -61,7 +61,16 @@ import pandas as pd
 from forven.db import create_strategy_container, get_db, init_db, next_container_id
 
 
-from forven.regime import HIGH_VOL, RANGE_BOUND, TREND_DOWN, TREND_UP, _classify, resolve_regime_gate
+from forven.regime import (
+    HIGH_VOL,
+    RANGE_BOUND,
+    TREND_DOWN,
+    TREND_UP,
+    _classify,
+    regime_atr_ratio_at,
+    regime_atr_ratio_series,
+    resolve_regime_gate,
+)
 
 
 from forven.scanner import (
@@ -368,11 +377,14 @@ def _isolated_backtest_worker(
             trade_mode=trade_mode,
             execution_controls=execution_controls, initial_capital=initial_capital,
             asset=asset, resolved_timeframe=resolved_timeframe,
+            include_funding=include_funding,
         )
     except Exception as e:
         return {"error": f"Indicator execution failed during in-sample: {_describe_signal_walk_error(e)}"}
 
     if include_funding:
+        # Kernel-path trades were already funded in-walk (funding-aware kelly) and are
+        # skipped here; legacy/slow-path trades are funded now — single application either way.
         is_trades, _ = _apply_funding_to_trades(is_trades, is_df, leverage, resolved_timeframe)
 
     is_equity_curve = _build_equity_curve_from_trades(is_trades, is_df, initial_capital)
@@ -392,6 +404,7 @@ def _isolated_backtest_worker(
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
                 asset=asset, resolved_timeframe=resolved_timeframe,
+                include_funding=include_funding,
             ),
             oos_start_timestamp,
         )
@@ -401,6 +414,7 @@ def _isolated_backtest_worker(
     if include_funding:
         # entry_bar indexes into oos_context_df (the warmup-padded slice the walk
         # ran on), not oos_df, so funding must be looked up against that frame.
+        # Kernel-funded trades are skipped inside _apply_funding_to_trades (single application).
         oos_trades, _ = _apply_funding_to_trades(oos_trades, oos_context_df, leverage, resolved_timeframe)
 
     oos_equity_curve = _build_equity_curve_from_trades(
@@ -462,17 +476,29 @@ def _isolated_walk_forward_worker(
     """
     strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_strategy_type)
-    # Load only the registry slice this walk-forward needs: built-in strategies skip
-    # the ~12s custom-module import+AST-scan that full discover() pays on every spawn.
-    cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
-    if cls:
-        try:
-            strategy_obj = cls(strategy_id, params)
-        except Exception as e:
-            return {"error": f"Failed to instantiate strategy: {e}"}
+    from forven.strategies.sandbox_proxy import SandboxOnlyStrategy, is_sandbox_only_type
 
-    if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
-        return {"error": f"Unknown strategy type: {original_strategy_type}"}
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: NEVER resolve/instantiate its real
+        # class in this process. Build the non-executing proxy — run_strategy_execution
+        # force-routes its signal generation to the locked-down sandbox worker. Same
+        # branch as _isolated_backtest_worker; its absence here made every sandbox
+        # strategy's persisted walk-forward error "Unknown strategy type" once the
+        # robustness path resolved the namespaced runtime_type (S06895, 2026-07-12).
+        strategy_obj = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        checker = None
+    else:
+        # Load only the registry slice this walk-forward needs: built-in strategies skip
+        # the ~12s custom-module import+AST-scan that full discover() pays on every spawn.
+        cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
+        if cls:
+            try:
+                strategy_obj = cls(strategy_id, params)
+            except Exception as e:
+                return {"error": f"Failed to instantiate strategy: {e}"}
+
+        if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
+            return {"error": f"Unknown strategy type: {original_strategy_type}"}
 
     splits = []
     all_oos_trades = []
@@ -525,6 +551,7 @@ def _isolated_walk_forward_worker(
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
                 asset=asset, resolved_timeframe=resolved_timeframe,
+                include_funding=include_funding,
             )
             if include_funding:
                 is_trades, _ = _apply_funding_to_trades(
@@ -553,6 +580,7 @@ def _isolated_walk_forward_worker(
                     trade_mode=trade_mode,
                     execution_controls=execution_controls, initial_capital=initial_capital,
                     asset=asset, resolved_timeframe=resolved_timeframe,
+                    include_funding=include_funding,
                 ),
                 oos_boundary,
             )
@@ -5902,16 +5930,11 @@ def _precompute_regimes(df: pd.DataFrame) -> pd.Series:
     h, low_p, c = df["high"], df["low"], df["close"]
 
 
-    tr = pd.concat([(h - low_p), (h - c.shift()).abs(), (low_p - c.shift()).abs()], axis=1).max(axis=1)
-
-
-    atr_current = tr.rolling(14).mean()
-
-
-    atr_avg = tr.rolling(44).mean().shift(14)
-
-
-    atr_ratio = (atr_current / atr_avg.clip(lower=1e-9)).fillna(1.0)
+    # v5: shared regime ATR-ratio baseline (14-bar recent vs 30-bar lagged) so a bar
+    # classifies to the SAME regime here, in robustness, and in the live detector. The
+    # signal-walk previously used a 44-bar baseline (the odd one out) — see
+    # forven.regime.regime_atr_ratio_series.
+    atr_ratio = regime_atr_ratio_series(h, low_p, c).fillna(1.0)
 
 
 
@@ -6477,6 +6500,30 @@ def _hours_per_bar(timeframe: str) -> float:
     return 1.0
 
 
+def _build_funding_context(
+    df: "pd.DataFrame",
+    leverage: float,
+    timeframe: str | None,
+) -> "_kernel.FundingContext | None":
+    """Build the per-bar funding series the kernel accrues in-walk (funding-aware kelly).
+
+    Returns None when the frame carries no ``funding_rate`` column, so the kernel stays
+    price-only and the caller's post-walk :func:`_apply_funding_to_trades` still marks the
+    result funding-incomplete (unchanged behaviour). When present, the ``rates`` array is
+    the raw per-bar funding rate (NaN preserved so a missing bar surfaces as
+    funding-incomplete, exactly like the post-walk pass's window.isna() check).
+
+    Sign/scale are applied inside the kernel's ``_accrue_funding_gross`` to mirror
+    :func:`_apply_funding_to_trades` bit-for-bit (verified by
+    tests/test_funding_kelly_single_application).
+    """
+    if df is None or "funding_rate" not in getattr(df, "columns", []):
+        return None
+    rates = df["funding_rate"].to_numpy(dtype=float)  # NaN preserved for incomplete bars
+    hours = _hours_per_bar(str(timeframe or "1h"))
+    return _kernel.FundingContext(rates=rates, hours_per_bar=float(hours))
+
+
 def _apply_funding_to_trades(
     trades: list[dict],
     df: "pd.DataFrame",
@@ -6520,6 +6567,13 @@ def _apply_funding_to_trades(
     lev = max(float(leverage), 0.0)
     all_complete = True
     for t in trades:
+        # SINGLE-APPLICATION INVARIANT: a trade the kernel already funded in-walk carries
+        # ``_funding_from_kernel``. Never re-apply funding to it — just honor its stamped
+        # completeness so the aggregate all_complete flag stays correct.
+        if t.get("_funding_from_kernel"):
+            if not bool(t.get("funding_complete", True)):
+                all_complete = False
+            continue
         entry_bar = max(int(t.get("entry_bar", 0)), 0)
         bars_held = max(int(t.get("bars_held", 0)), 0)
         if bars_held <= 0:
@@ -7446,10 +7500,18 @@ def run_strategy_execution(
     strategy_type: str | None = None,
     symbol: str | None = None,
     timeframe: str | None = None,
+    include_funding: bool = False,
 ) -> "_kernel.KernelResult | None":
     """The ONE signals→regime-mask→kernel pipeline, shared by the backtest's
     vectorized walk and the live/paper scanner so paper reproduces the backtest by
     SHARING this code rather than re-implementing it.
+
+    ``include_funding`` (backtest opt-in; default False): when True and the frame carries
+    a ``funding_rate`` column, the kernel accrues perp funding INSIDE the walk (so kelly
+    evidence is funding-aware and each trade's PnL carries funding), and every kernel trade
+    is stamped so the post-walk :func:`_apply_funding_to_trades` skips it — funding is
+    applied exactly once. The scanner leaves it False and applies funding post-walk on the
+    returned trades as before, so its behaviour is unchanged.
 
     Resolves the strategy's vectorized signals (``generate_signals``), applies the
     regime gate, resolves the execution profile (or the default 1% fraction sizing),
@@ -7561,11 +7623,16 @@ def run_strategy_execution(
     intrabar_resolver = None
     if symbol and timeframe and str(timeframe) != "1m" and _intrabar_resolution_enabled():
         intrabar_resolver = _build_intrabar_resolver(symbol, str(timeframe), d.index)
+    # Fund the kernel walk in-line (backtest opt-in) so kelly sizing sees funding-adjusted
+    # returns instead of price-only ones (which biased high-funding strategies to size UP).
+    # Built from THIS frame (d) so the per-bar array aligns positionally with the walk; the
+    # scanner passes include_funding=False and keeps its post-walk funding pass.
+    funding_context = _build_funding_context(d, leverage, timeframe) if include_funding else None
     return _kernel.simulate(
         d, signals, warmup, leverage,
         regimes=regime_series, round_trip_drag=drag, trade_mode=trade_mode,
         allowed_modes=_allowed_modes_for(trade_mode), ec=ec, initial_capital=initial_capital,
-        intrabar_resolver=intrabar_resolver,
+        intrabar_resolver=intrabar_resolver, funding=funding_context,
     )
 
 
@@ -9937,6 +10004,12 @@ def _compute_basic_metrics(
             "sortino": 0,
 
 
+            "trade_sharpe": 0,
+
+
+            "trade_sortino": 0,
+
+
             "max_drawdown_pct": 0,
 
 
@@ -10040,10 +10113,15 @@ def _compute_basic_metrics(
         bars_per_year = _BARS_PER_YEAR.get(timeframe, 8760)
 
 
+    # --- Trade-based (EVENT) Sharpe/Sortino ----------------------------------------
+    # mean/std of PER-TRADE pnls, annualized by sqrt(trades_per_year). Preserved as
+    # trade_sharpe/trade_sortino (some diagnostics/DSR want the event series). When an
+    # equity curve is available the bar-level CALENDAR Sharpe below supersedes these as
+    # the primary `sharpe`/`sortino`; otherwise the event value stays `sharpe`.
     mean_return = 0.0
 
 
-    sharpe = 0.0
+    trade_sharpe = 0.0
 
 
     if len(pnls) > 1:
@@ -10061,10 +10139,10 @@ def _compute_basic_metrics(
         if std_return > _RATIO_EPSILON:
 
 
-            sharpe = (mean_return / std_return) * np.sqrt(trades_per_year)
+            trade_sharpe = (mean_return / std_return) * np.sqrt(trades_per_year)
 
 
-    sharpe = _clamp_ratio(sharpe)
+    trade_sharpe = _clamp_ratio(trade_sharpe)
 
 
     # Sharpe is annualized via sqrt(trades_per_year); on a short window with
@@ -10077,10 +10155,10 @@ def _compute_basic_metrics(
 
 
 
-    # Sortino ratio (only penalizes downside deviation)
+    # Sortino ratio (only penalizes downside deviation) — trade-based (EVENT) form.
 
 
-    sortino = 0.0
+    trade_sortino = 0.0
 
 
     if len(pnls) > 1:
@@ -10100,10 +10178,42 @@ def _compute_basic_metrics(
         if downside_std > _RATIO_EPSILON:
 
 
-            sortino = (mean_return / downside_std) * np.sqrt(trades_per_year)
+            trade_sortino = (mean_return / downside_std) * np.sqrt(trades_per_year)
 
 
-    sortino = _clamp_ratio(sortino)
+    trade_sortino = _clamp_ratio(trade_sortino)
+
+
+    # --- Bar-level (CALENDAR) Sharpe/Sortino from the MTM equity curve --------------
+    # v5: when an equity curve is available, compute Sharpe/Sortino from per-BAR returns
+    # of consecutive curve equity points, annualized by sqrt(bars_per_year). This is a
+    # calendar Sharpe: FLAT bars (no open position, equity unchanged → return 0) are part
+    # of the return series by design, so a sparse-trading strategy's bar-Sharpe is
+    # typically LOWER than its event Sharpe (the flat bars dilute the mean and shrink the
+    # std). It is comparable across trade cadences, unlike the event Sharpe. The
+    # trade-based values are preserved as trade_sharpe/trade_sortino below.
+    bar_sharpe: float | None = None
+    bar_sortino: float | None = None
+    if ledger_points and len(ledger_points) > 2:
+        eq = np.array([max(float(p.get("equity") or 0.0), 0.0) for p in ledger_points], dtype=float)
+        prev = eq[:-1]
+        # Per-bar simple return; guard bars where prior equity is ~0 (ruin) → 0 return so
+        # a wiped-out curve doesn't inject spurious ±inf into the series.
+        bar_returns = np.where(prev > _RATIO_EPSILON, (eq[1:] - prev) / np.where(prev > 0.0, prev, 1.0), 0.0)
+        if bar_returns.size >= 2:
+            bmean = float(np.mean(bar_returns))
+            bstd = float(np.std(bar_returns))
+            ann = float(np.sqrt(bars_per_year))
+            # Division-by-zero guard for an all-flat (or single-value) curve.
+            bar_sharpe = _clamp_ratio((bmean / bstd) * ann) if bstd > _RATIO_EPSILON else 0.0
+            downside_b = np.minimum(bar_returns, 0.0)
+            bdown = float(np.sqrt(np.sum(downside_b ** 2) / bar_returns.size))
+            bar_sortino = _clamp_ratio((bmean / bdown) * ann) if bdown > _RATIO_EPSILON else 0.0
+
+    # Primary metrics: bar-level calendar values when a curve exists, else the trade-based
+    # (event) values (legacy fallback path — nothing breaks for metric-only callers).
+    sharpe = bar_sharpe if bar_sharpe is not None else trade_sharpe
+    sortino = bar_sortino if bar_sortino is not None else trade_sortino
 
 
 
@@ -10177,6 +10287,15 @@ def _compute_basic_metrics(
 
 
         "sortino": round(float(sortino), 3),
+
+
+        # Trade-based (event) Sharpe/Sortino preserved for diagnostics/DSR — equals
+        # `sharpe`/`sortino` on the legacy no-curve path, differs when the bar-level
+        # calendar value is primary. See the bar-level block above.
+        "trade_sharpe": round(float(trade_sharpe), 3),
+
+
+        "trade_sortino": round(float(trade_sortino), 3),
 
 
         "max_drawdown_pct": round(float(max_drawdown), 5),
@@ -10463,37 +10582,10 @@ def _detect_entry_regime(window) -> str:
 
 
 
-        tr = np.maximum.reduce([
-
-
-            (high - low).to_numpy(),
-
-
-            (high - close.shift()).abs().to_numpy(),
-
-
-            (low - close.shift()).abs().to_numpy(),
-
-
-        ])
-
-
-        atr_current = float(np.nanmean(tr[-14:]))
-
-
-        if len(tr) > 44:
-
-
-            atr_avg = float(np.nanmean(tr[-44:-14]))
-
-
-        else:
-
-
-            atr_avg = atr_current
-
-
-        atr_ratio = atr_current / atr_avg if atr_avg > 0 else 1.0
+        # v5: shared regime ATR-ratio baseline (14-bar recent vs 30-bar lagged) so a bar
+        # classifies identically here, in the signal-walk, and in the live detector.
+        # See forven.regime.regime_atr_ratio_at.
+        atr_ratio = regime_atr_ratio_at(high, low, close, default=1.0)
 
 
 
@@ -10770,29 +10862,44 @@ def walk_forward(
         # here so every WFA caller (gauntlet run_walk_forward passes no window) honors it.
         duration_days = stage_backtest_duration_days("walk_forward", settings)
         minutes_per_bar = max(_timeframe_to_minutes(resolved_timeframe), 1)
-        total_bars = (duration_days * 24 * 60) // minutes_per_bar
+        if start_date or end_date:
+            # A DATED window (the gauntlet passes the optimizer's validation
+            # window) sizes by the SPAN: the loader slices by the dates, so a
+            # stage-days bar count is unrelated to the data actually loaded —
+            # it made the pre-load floor read a 3-year 1d span as "365 requested
+            # bars" and error before loading. The post-load len(df) check stays
+            # authoritative for what the lake really returned.
+            try:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                def _parse_wfa_date(value: object) -> _dt | None:
+                    text = str(value or "").strip()
+                    if not text:
+                        return None
+                    parsed = _dt.fromisoformat(text.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=_tz.utc)
+                    return parsed
+
+                span_start = _parse_wfa_date(start_date)
+                span_end = _parse_wfa_date(end_date) or _dt.now(_tz.utc)
+                if span_start is not None and span_end > span_start:
+                    span_days = (span_end - span_start).total_seconds() / 86400.0
+                    total_bars = max(int(span_days * 24 * 60) // minutes_per_bar, 1)
+                else:
+                    total_bars = (duration_days * 24 * 60) // minutes_per_bar
+            except Exception:  # noqa: BLE001 — unparseable dates fall back to stage days
+                total_bars = (duration_days * 24 * 60) // minutes_per_bar
+        else:
+            total_bars = (duration_days * 24 * 60) // minutes_per_bar
 
 
     
 
 
-    if total_bars is not None and int(total_bars) < 420:
-        return {"error": f"Insufficient data for walk-forward: {int(total_bars)} bars requested (need 420+)"}
-    resolved_total_bars = max(int(total_bars), 420)
-
-    # Cap total bars for walk-forward to prevent excessive computation.
-    # For sub-hourly timeframes on large date ranges, the bar count can
-    # explode (e.g. 5m over 2 years ≈ 210K bars).  The bar-by-bar slow
-    # path is O(n) per split so 50K bars keeps runtime reasonable.
-    _WFA_MAX_BARS = 50_000
-    if resolved_total_bars > _WFA_MAX_BARS:
-        log.warning(
-            "Walk-forward capping bars from %d to %d for %s (%s)",
-            resolved_total_bars, _WFA_MAX_BARS, strategy_id, resolved_timeframe,
-        )
-        resolved_total_bars = _WFA_MAX_BARS
-
     # P25-1: WFA knobs from pipeline config (versioned, explicit), with settings fallback.
+    # Resolved BEFORE the minimum-bars gate — the window sizing below needs them.
     try:
         from forven.policy import load_pipeline_config as _load_wfa_config
         wfa_cfg = _load_wfa_config().get("walk_forward", {})
@@ -10809,12 +10916,20 @@ def walk_forward(
         else settings.get("walkforward_folds", wfa_cfg.get("n_folds", 5))
     )
 
+    resolved_total_bars = int(total_bars)
+
     # Trade-frequency-aware window floor (S05925): a defaulted window must give
     # every OOS fold a judgeable trade sample (wfa_min_fold_trades), or the fold
     # pass rate degenerates to coin flips — the stage calendar window handed a
     # ~3-trades/month 4h strategy folds of 1-3 OOS trades. Raise (never shrink)
     # the defaulted window to the recommendation; explicit caller windows are
     # untouched. The resolver caps itself at the same _WFA_MAX_BARS ceiling.
+    #
+    # This sizing MUST run before the minimum-bars gate below: at 1d the stage
+    # calendar window is bars==days, so a 365-day default is 365 bars — the old
+    # order returned "need 420+" before the lift could size 1d to its multi-year
+    # window, making every 1d strategy structurally un-promotable (2026-07-11:
+    # all five persisted "365 bars requested" WFA failures were 1d).
     if window_defaulted:
         try:
             from forven.wfa_window import recommended_wfa_window
@@ -10836,6 +10951,30 @@ def walk_forward(
                 resolved_total_bars = _rec_bars
         except Exception as exc:  # noqa: BLE001 — sizing must never break the run
             log.warning("WFA window recommendation failed for %s: %s", strategy_id, exc)
+        # Belt-and-braces: even if the recommender fails open, a DEFAULTED window
+        # is lifted to the fold floor rather than erroring — only explicit caller
+        # windows may fail the minimum-bars gate.
+        if resolved_total_bars < 420:
+            log.info(
+                "WFA window lifted to the 420-bar fold floor for %s (%s, was %d)",
+                strategy_id, resolved_timeframe, resolved_total_bars,
+            )
+            resolved_total_bars = 420
+
+    if resolved_total_bars < 420:
+        return {"error": f"Insufficient data for walk-forward: {int(resolved_total_bars)} bars requested (need 420+)"}
+
+    # Cap total bars for walk-forward to prevent excessive computation.
+    # For sub-hourly timeframes on large date ranges, the bar count can
+    # explode (e.g. 5m over 2 years ≈ 210K bars).  The bar-by-bar slow
+    # path is O(n) per split so 50K bars keeps runtime reasonable.
+    _WFA_MAX_BARS = 50_000
+    if resolved_total_bars > _WFA_MAX_BARS:
+        log.warning(
+            "Walk-forward capping bars from %d to %d for %s (%s)",
+            resolved_total_bars, _WFA_MAX_BARS, strategy_id, resolved_timeframe,
+        )
+        resolved_total_bars = _WFA_MAX_BARS
 
     resolved_fee_bps = float(
         fee_bps if fee_bps is not None
@@ -11355,10 +11494,17 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
 
                      asset: str | None = None,
 
-                     resolved_timeframe: str | None = None) -> list[dict]:
+                     resolved_timeframe: str | None = None,
+
+                     include_funding: bool = False) -> list[dict]:
 
 
     """Run signal checker across a dataframe window and collect trades.
+
+    ``include_funding`` (backtest opt-in): when True, the kernel path accrues perp funding
+    IN-WALK (funding-aware kelly evidence) and stamps each trade so the caller's post-walk
+    ``_apply_funding_to_trades`` skips it. The legacy/slow paths don't fund in-walk, so the
+    post-walk pass still funds their trades. The scanner never sets this.
 
 
 
@@ -11390,6 +11536,7 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             trade_mode=trade_mode, execution_controls=execution_controls,
             initial_capital=initial_capital, strategy_type=strategy_type,
             symbol=asset, timeframe=resolved_timeframe,
+            include_funding=include_funding,
         )
     except RuntimeError as exc:
         if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
@@ -11400,6 +11547,9 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             _kernel_result, df, leverage=leverage,
             round_trip_drag=_kernel.round_trip_drag(fee_bps, slippage_bps, leverage),
             trade_mode=trade_mode,
+            # Same funding context the walk ran with (None when include_funding is off or
+            # the frame has no funding_rate), so the end-of-data close funds consistently.
+            funding=_kernel_result.funding,
         )
 
 
