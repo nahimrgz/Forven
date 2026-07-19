@@ -78,9 +78,14 @@ def _build_synthetic_ohlcv(rows: int = _SYNTHETIC_ROWS) -> pd.DataFrame:
     # non-zero values so a strategy that reads them doesn't divide-by-zero or
     # early-out to an all-False signal (which would hide a leak in those cols).
     df["funding_rate"] = rng.normal(loc=0.0001, scale=0.0002, size=n)
+    df["basis"] = rng.normal(loc=5.0, scale=2.0, size=n)
     df["open_interest"] = rng.uniform(low=1e6, high=5e6, size=n)
-    df["taker_buy_sell_ratio"] = rng.normal(loc=1.0, scale=0.15, size=n).clip(0.1, 5.0)
     df["ls_ratio"] = rng.normal(loc=1.0, scale=0.15, size=n).clip(0.1, 5.0)
+    df["long_pct"] = rng.uniform(low=0.45, high=0.55, size=n)
+    df["short_pct"] = 1.0 - df["long_pct"]
+    df["taker_buy_sell_ratio"] = rng.normal(loc=1.0, scale=0.15, size=n).clip(0.1, 5.0)
+    df["iv_btc"] = rng.uniform(low=0.3, high=0.8, size=n)
+    df["iv_eth"] = rng.uniform(low=0.35, high=0.9, size=n)
     df["long_liq_usd"] = rng.uniform(low=0.0, high=5e5, size=n)
     df["short_liq_usd"] = rng.uniform(low=0.0, high=5e5, size=n)
     df["liq_imbalance"] = rng.uniform(low=-1.0, high=1.0, size=n)

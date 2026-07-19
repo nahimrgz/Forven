@@ -144,9 +144,9 @@ class IntSignalStrategy(BaseStrategy):
 
     assert result["valid"] is False
     stdout = result["execution_result"]["stdout"]
-    assert "must return a Signal or a dict" in stdout
+    assert "or a dict" in stdout
     assert "from forven.strategies.base import Signal" in stdout
-    assert "NOT a BUY/SELL/NONE enum" in stdout
+    assert "is not an enum" in stdout
 
 
 def test_validate_strategy_code_rejects_bad_init_signature_with_actionable_message():

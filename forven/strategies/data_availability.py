@@ -361,6 +361,9 @@ def _present_columns(symbol: str, timeframe: str) -> frozenset[str]:
         specs = _available_enrichment_specs(symbol, timeframe, include_macro=False, exclude_streams={"funding", "oi"})
         for spec in specs:
             present.update(spec.output_columns)
+        
+        # Probe live market data series for funding/OI streams since they are not in the lake specs
+        present.update(_probe_market_data_columns(symbol))
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("enrichment-spec probe failed for %s/%s: %s", symbol, timeframe, exc)
         raise RuntimeError(
