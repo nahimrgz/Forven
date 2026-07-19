@@ -608,20 +608,18 @@ def _get_account_equity() -> float:
     return real if real is not None else _ACCOUNT_FALLBACK
 
 
-_PAPER_SANDBOX_INITIAL_CAPITAL = 10_000.0
+# _PAPER_SANDBOX_INITIAL_CAPITAL = 10_000.0
 
 
 def _get_paper_strategy_equity(strategy_id: str) -> float:
-    """Current paper-sandbox equity for a strategy: the $10k starting capital plus
-    its realized closed-trade PnL. Mirrors the "Capital" figure on the paper card
-    (``api_domains/paper.py``: initial_capital + total_pnl). Each paper strategy is
-    an ISOLATED sandbox, so its position must be sized as a % of THIS balance — not
-    the shared live/daemon equity (``_get_account_equity``), which is what produced
-    the piddly mis-sized paper positions.
+    """Current paper-sandbox equity for a strategy: the dynamic account equity plus
+    its realized closed-trade PnL. Each paper strategy mirrors live sizing behavior
+    based on the current real-time account equity.
     """
     sid = str(strategy_id or "").strip()
+    baseline = _get_account_equity()
     if not sid:
-        return _PAPER_SANDBOX_INITIAL_CAPITAL
+        return baseline
     try:
         with get_db() as conn:
             row = conn.execute(
@@ -637,8 +635,8 @@ def _get_paper_strategy_equity(strategy_id: str) -> float:
         realized = float((dict(row).get("realized") if row else 0.0) or 0.0)
     except Exception:
         realized = 0.0
-    equity = _PAPER_SANDBOX_INITIAL_CAPITAL + realized
-    return equity if equity > 0 else _PAPER_SANDBOX_INITIAL_CAPITAL
+    equity = baseline + realized
+    return equity if equity > 0 else baseline
 
 
 def _recent_strategy_returns(strategy_id: str, lookback: int = 200) -> list[float]:
@@ -4912,7 +4910,7 @@ def manage_positions(
                 _controls = _sizing.default_controls()
             _profile_initial_capital = (
                 _coerce_positive_float((p.get("execution_profile") or {}).get("initial_capital"))
-                or _PAPER_SANDBOX_INITIAL_CAPITAL
+                or _get_account_equity()
             )
             from forven.strategies.backtest import resolve_leverage as _resolve_leverage
             _leverage = _resolve_leverage(p)
@@ -5385,7 +5383,13 @@ def _load_deployed_strategies() -> dict:
                 load_diagnostics[sid] = diagnostic
                 continue
 
-            if stype not in SIGNAL_CHECKERS and resolved_runtime_type not in _TYPE_MAP:
+            from forven.strategies.sandbox_proxy import is_sandbox_only_type as _is_sandbox_only_type
+            is_sandbox = (
+                _is_sandbox_only_type(resolved_runtime_type)
+                or bool(row.get("sandbox_only"))
+                or (isinstance(runtime_meta, dict) and bool(runtime_meta.get("sandbox_only")))
+            )
+            if stype not in SIGNAL_CHECKERS and resolved_runtime_type not in _TYPE_MAP and not is_sandbox:
                 diagnostic["blocked_reason"] = f"runtime type '{resolved_runtime_type}' is not registered"
                 diagnostic["last_runtime_error"] = diagnostic["blocked_reason"]
                 diagnostic["execution_decision"] = "blocked"
@@ -5997,7 +6001,7 @@ def _kernel_close_recorded(
     # when its actual fill diverged from the armed level.
     kernel_exit_price = _coerce_positive_float(trade.get("expected_exit_price")) or exit_price
     pnl_pct_net = float(trade.get("pnl_pct") or 0.0)  # kernel net, equity-fraction
-    equity_at_entry = _coerce_positive_float(sd.get("kernel_equity_at_entry")) or _PAPER_SANDBOX_INITIAL_CAPITAL
+    equity_at_entry = _coerce_positive_float(sd.get("kernel_equity_at_entry")) or _get_account_equity()
     pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
     exit_reason = str(trade.get("exit_reason") or "signal")
     # FILL-NOW exit: a late hop-in's SIGNAL/time-stop exit is a decision the kernel just
@@ -6911,7 +6915,7 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # Sizing initial_capital MUST equal the confirmation backtest's (10k, since its
     # body.initial_capital is None). Reading execution_profile.initial_capital here
     # would diverge 'fixed'-mode sizing from the validated backtest.
-    initial_capital = _PAPER_SANDBOX_INITIAL_CAPITAL
+    initial_capital = 10000.0
     trade_mode = _resolve_kernel_trade_mode(strat, strategy_instance)
     strategy_type = str(strat.get("runtime_type") or strat.get("type") or "").strip() or None
 
