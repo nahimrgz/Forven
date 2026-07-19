@@ -354,10 +354,13 @@ def test_only_strategy_developer_role_gets_strategy_creation_tools(forven_db):
 
     assert "forven_create_strategy" in default_strategy_tools
     assert "register_strategy" in default_strategy_tools
+    assert "register_custom_strategy_from_notes" in default_strategy_tools
     assert "forven_create_strategy" in custom_strategy_tools
     assert "register_strategy" in custom_strategy_tools
+    assert "register_custom_strategy_from_notes" in custom_strategy_tools
     assert "forven_create_strategy" not in quant_tools
     assert "register_strategy" not in quant_tools
+    assert "register_custom_strategy_from_notes" not in quant_tools
 
 
 def test_strategy_developer_can_discover_and_inspect_youtube_benchmarks(monkeypatch, forven_db):

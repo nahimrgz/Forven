@@ -598,6 +598,80 @@ def _tool_register_strategy(params: dict) -> str:
 
 
 @register_tool(
+    name="register_custom_strategy_from_notes",
+    description=(
+        "Read a strategy module's Python code from a notes file in the workspace "
+        "(e.g., a .md or .txt file under notes/, memory/, narratives/, post_mortems/, "
+        "lessons/, agents/ with extension .md/.txt/.json), extract the first or largest "
+        "python code block, validate it via lint + sandbox test, write it to the custom/ "
+        "directory, and register the strategy type and container in the database."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "notes_path": {"type": "string", "description": "Workspace-relative path to the notes file (e.g., 'notes/H00388_strategy_v2_code.md')"},
+            "type_name": {"type": "string", "description": "Unique type name for the strategy (alphanumeric and underscores only)"},
+            "hypothesis_id": {"type": "string", "description": "Parent hypothesis ID for the strategy container"},
+            "crucible_id": {"type": "string", "description": "Optional parent crucible/hypothesis ID"},
+            "cited_skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Names of learned quant skills that informed this design."
+            }
+        },
+        "required": ["notes_path", "type_name", "hypothesis_id"]
+    },
+    permissions={"role:strategy-developer", None},
+)
+def _tool_register_custom_strategy_from_notes(params: dict) -> str:
+    """Read python code from a notes file and delegate to register_strategy."""
+    from forven.workspace import read_workspace, WorkspacePathError, safe_workspace_path
+    import re
+
+    notes_path = str(params.get("notes_path", "")).strip()
+    type_name = str(params.get("type_name", "")).strip()
+    hypothesis_id = str(params.get("hypothesis_id", "")).strip()
+    crucible_id = params.get("crucible_id")
+    cited_skills = params.get("cited_skills")
+
+    if not notes_path or not type_name or not hypothesis_id:
+        return "Error: 'notes_path', 'type_name', and 'hypothesis_id' are required"
+
+    try:
+        safe_workspace_path(notes_path)
+    except WorkspacePathError as exc:
+        return f"REJECTED: {exc} Do not retry."
+
+    content = read_workspace(notes_path, optional=True)
+    if content is None:
+        return f"Error: Notes file not found: {notes_path}"
+
+    pattern = re.compile(r"```python\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+    matches = pattern.findall(content)
+    if not matches:
+        alt_pattern = re.compile(r"```\s*(class\s+.*)\s*```", re.DOTALL)
+        alt_matches = alt_pattern.findall(content)
+        if alt_matches:
+            code = alt_matches[0].strip()
+        else:
+            if "class " in content or "import " in content:
+                code = content.strip()
+            else:
+                return f"Error: Could not find any Python code block (```python ... ```) in {notes_path}"
+    else:
+        code = max(matches, key=len).strip()
+
+    reg_params = {
+        "code": code,
+        "type_name": type_name,
+        "hypothesis_id": hypothesis_id,
+        "crucible_id": crucible_id,
+        "cited_skills": cited_skills,
+    }
+    return _tool_register_strategy(reg_params)
+
+
+@register_tool(
     name="lint_code",
     description="Lint Python code with ruff and return issues. Also attempts auto-fix.",
     input_schema={

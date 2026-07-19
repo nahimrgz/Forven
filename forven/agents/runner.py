@@ -1051,6 +1051,7 @@ _ARTIFACT_TOOLS: frozenset[str] = frozenset({
     "create_strategy",
     "forven_create_strategy",
     "register_strategy",
+    "register_custom_strategy_from_notes",
     "forven_register_strategy_file",
     "run_backtest",
     "forven_run_backtest",
@@ -1131,7 +1132,13 @@ def _research_task_already_performed_first_wave(task_display_id: str) -> bool:
     )
     attempted_follow_through = any(
         str(call.get("tool_name") or "").strip()
-        in {"forven_create_strategy", "register_strategy", "run_backtest", "forven_run_backtest"}
+        in {
+            "forven_create_strategy",
+            "register_strategy",
+            "register_custom_strategy_from_notes",
+            "run_backtest",
+            "forven_run_backtest",
+        }
         for call in tool_calls
     )
     attached_evidence = any(

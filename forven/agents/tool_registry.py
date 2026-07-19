@@ -521,6 +521,7 @@ _DEFAULT_CATEGORY_PATTERNS: list[tuple[str, str]] = [
     ("run_code", "codegen"),
     ("deepdive_write_strategy_code", "codegen"),
     ("register_strategy", "codegen"),
+    ("register_custom_strategy_from_notes", "codegen"),
     ("forven_register_strategy_file", "codegen"),
     ("assistant_register_strategy_file", "codegen"),
     # Catastrophic: tools with NO legitimate autonomous use. factory_reset

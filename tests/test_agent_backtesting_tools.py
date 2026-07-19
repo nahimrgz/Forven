@@ -618,3 +618,70 @@ def test_jbt_create_strategy_rejects_mismatched_hypothesis_and_crucible(forven_d
 
     assert "planner-approved crucible_id and hypothesis_id pair" in result["error"]
     assert created == []
+
+
+def test_register_custom_strategy_from_notes_success(forven_db, monkeypatch, tmp_path):
+    from forven.agents.tools_backtesting import _tool_register_custom_strategy_from_notes
+    import forven.workspace as ws_mod
+
+    _insert_strategy("s-from-notes", stage="paper")
+
+    # Set up temp workspace directories
+    ws_dir = tmp_path / "workspace"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "notes").mkdir(exist_ok=True)
+
+    monkeypatch.setattr(ws_mod, "WORKSPACE_DIR", ws_dir)
+    monkeypatch.setattr(ws_mod, "LEGACY_WORKSPACE_DIR", ws_dir)
+
+    monkeypatch.setattr(
+        "forven.selfheal.validate_strategy_code",
+        lambda code: {
+            "valid": True,
+            "code": code,
+            "lint_issues": [],
+            "lint_passed": True,
+            "execution_result": {"returncode": 0, "stdout": "ok", "stderr": "", "timed_out": False},
+        },
+    )
+    monkeypatch.setattr(tools_mod, "__file__", str(tmp_path / "agents" / "tools_backtesting.py"))
+
+    import forven.strategies.registry as registry_mod
+    registry_mod.reset()
+    monkeypatch.setattr(registry_mod, "reset", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_mod, "discover", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_mod, "_TYPE_MAP", {"notes_strat_s002": object()})
+    monkeypatch.setattr(
+        "forven.strategies.intake.register_custom_strategy_file",
+        lambda **_kwargs: {},
+    )
+
+    # Write a dummy markdown file in workspace
+    notes_content = """# My Strategy Notes
+Here is the code:
+```python
+from forven.strategies.base import BaseStrategy, Signal
+class NotesStrategy(BaseStrategy):
+    pass
+```
+"""
+    # Write directly to the workspace dir
+    notes_file = ws_dir / "notes" / "test_strat.md"
+    notes_file.write_text(notes_content, encoding="utf-8")
+
+    token = _current_strategy_id_var.set("s-from-notes")
+    try:
+        result = _tool_register_custom_strategy_from_notes(
+            {
+                "notes_path": "notes/test_strat.md",
+                "type_name": "notes_strat_s002",
+                "hypothesis_id": "HYP-123",
+            }
+        )
+    finally:
+        _current_strategy_id_var.reset(token)
+
+    assert "registered successfully" in result.lower()
+    assert Path(tmp_path / "strategies" / "custom" / "notes_strat_s002.py").exists()
+    assert "class NotesStrategy" in Path(tmp_path / "strategies" / "custom" / "notes_strat_s002.py").read_text(encoding="utf-8")
+
