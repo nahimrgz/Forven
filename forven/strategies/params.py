@@ -939,14 +939,27 @@ def is_known_runtime_type(
         return True
     try:
         # Lazy import to avoid circular deps (registry imports params).
-        from forven.strategies.registry import _TYPE_MAP, discover, resolve_runtime_type
+        from forven.strategies.registry import _TYPE_MAP, discover, resolve_runtime_type, IMPORTED_TYPE_PREFIX
+        from forven.strategies import imported
+        import pkgutil
+
+        def _imported_exists(t: str) -> bool:
+            if t.startswith(IMPORTED_TYPE_PREFIX):
+                modname = t[len(IMPORTED_TYPE_PREFIX):]
+                try:
+                    return any(modname == name for _, name, _ in pkgutil.iter_modules(imported.__path__))
+                except Exception:
+                    pass
+            return False
 
         discover()
         normalized = str(strategy_type).strip()
+        if _imported_exists(normalized):
+            return True
         if normalized in _TYPE_MAP:
             return True
         resolved, _meta = resolve_runtime_type(normalized, normalized)
-        if resolved and resolved in _TYPE_MAP:
+        if resolved and (_imported_exists(resolved) or resolved in _TYPE_MAP):
             return True
     except Exception:
         if require_runtime_class:
