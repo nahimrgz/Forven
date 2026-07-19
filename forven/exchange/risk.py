@@ -84,9 +84,11 @@ def _coerce_non_negative_float(value: object) -> float | None:
 def _get_risk_limits() -> dict[str, float]:
     """Return active risk limits based on execution mode, merged with user settings."""
     from forven import config as cfg
+    from forven.exchange.hyperliquid import resolve_configured_testnet
 
     mode = str(cfg.get_execution_mode() or "paper").strip().lower()
-    base_limits = dict(_MAINNET_LIMITS) if mode == "mainnet" else dict(_TESTNET_LIMITS)
+    is_mainnet = (mode == "mainnet") or (mode == "live" and not resolve_configured_testnet())
+    base_limits = dict(_MAINNET_LIMITS) if is_mainnet else dict(_TESTNET_LIMITS)
 
     # Override with user settings if they exist
     try:
@@ -124,7 +126,16 @@ def _get_risk_limits() -> dict[str, float]:
         if raw_risk_per_trade is None:
             raw_risk_per_trade = settings.get("max_position_size_pct")
         if raw_risk_per_trade is not None:
-            base_limits["max_risk_per_trade"] = float(raw_risk_per_trade) / 100.0
+            val = float(raw_risk_per_trade) / 100.0
+            limit = 0.01 if is_mainnet else 0.02
+            if val > limit:
+                log.warning(
+                    "max_risk_per_trade_pct / legacy max_position_size_pct override %.1f%% "
+                    "exceeds %.1f%% cap — clamping to %.1f%%",
+                    val * 100.0, limit * 100.0, limit * 100.0
+                )
+                val = limit
+            base_limits["max_risk_per_trade"] = val
     except Exception:
         pass
 
@@ -835,6 +846,26 @@ def _budget_pct_setting(settings: dict, key: str) -> float:
         value = float(raw) if raw is not None else float(_PORTFOLIO_BUDGET_DEFAULTS[key])
     except (TypeError, ValueError):
         value = float(_PORTFOLIO_BUDGET_DEFAULTS[key])
+
+    if key == "live_hard_max_per_trade_risk_pct":
+        from forven import config as cfg
+        from forven.exchange.hyperliquid import resolve_configured_testnet
+        mode = str(cfg.get_execution_mode() or "paper").strip().lower()
+        is_mainnet = (mode == "mainnet") or (mode == "live" and not resolve_configured_testnet())
+        limit = 1.0 if is_mainnet else 2.0
+
+        if raw is None and is_mainnet:
+            value = 1.0
+
+        if value > limit:
+            if raw is not None:
+                log.warning(
+                    "live_hard_max_per_trade_risk_pct override %.1f%% exceeds %.1f%% cap — "
+                    "clamping to %.1f%%",
+                    value, limit, limit
+                )
+            value = limit
+
     return max(value, 0.0)
 
 

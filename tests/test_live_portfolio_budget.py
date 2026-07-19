@@ -118,15 +118,15 @@ def test_budget_disabled_allows_everything(forven_db):
 
 def test_budget_caps_editable_via_settings(forven_db):
     _set_equity(10_000.0)
-    # operator raised both the total cap and the per-order hard cap
+    # operator raised the total cap, and we test at the hard cap of 2.0% (max allowed on paper)
     kv_set("forven:settings", {
         "live_max_total_open_risk_pct": 20.0,
-        "live_hard_max_per_trade_risk_pct": 15.0,
+        "live_hard_max_per_trade_risk_pct": 2.0,
     })
     with get_db() as conn:
         _insert_open(conn, "L1", "BTC", "long", 100.0, 90.0, stop=95.0)  # $450 at risk
-    ok, _ = risk.check_live_portfolio_budget("ETH", "long", add_risk_usd=1000.0, add_notional_usd=1000.0)
-    assert ok  # 1450 < 2000 total; 1000 < 1500 per-order
+    ok, _ = risk.check_live_portfolio_budget("ETH", "long", add_risk_usd=200.0, add_notional_usd=1000.0)
+    assert ok  # 650 < 2000 total; 200 <= 200 per-order
 
 
 # ------------------------------------------------- SIZE-CAP-1: per-order hard caps
@@ -153,12 +153,12 @@ def test_hard_notional_cap_blocks_runaway_size(forven_db):
 def test_hard_caps_editable_via_settings_section(forven_db):
     from forven import api_core
     api_core.put_settings_section("risk", {
-        "live_hard_max_per_trade_risk_pct": 4.0,
+        "live_hard_max_per_trade_risk_pct": 2.0,
         "live_hard_max_order_notional_pct": 50.0,
     })
     _set_equity(10_000.0)
-    ok, _ = risk.check_live_portfolio_budget("BTC", "long", add_risk_usd=350.0, add_notional_usd=1000.0)
-    assert ok  # 350 < 4% of 10k
+    ok, _ = risk.check_live_portfolio_budget("BTC", "long", add_risk_usd=200.0, add_notional_usd=1000.0)
+    assert ok  # 200 <= 2% of 10k
     ok, why = risk.check_live_portfolio_budget("BTC", "long", add_risk_usd=50.0, add_notional_usd=6_000.0)
     assert not ok and "notional cap" in why  # 6000 > 50% of 10k
 

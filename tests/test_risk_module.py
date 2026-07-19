@@ -34,9 +34,16 @@ class TestModeAwareRiskLimits:
         assert limits["max_risk_per_trade"] == 0.02
 
     def test_live_uses_testnet_limits(self):
-        with patch("forven.config.get_execution_mode", return_value="live"):
+        with patch("forven.config.get_execution_mode", return_value="live"), \
+             patch("forven.exchange.hyperliquid.resolve_configured_testnet", return_value=True):
             limits = _get_risk_limits()
         assert limits == _TESTNET_LIMITS
+
+    def test_live_uses_mainnet_limits_when_not_testnet(self):
+        with patch("forven.config.get_execution_mode", return_value="live"), \
+             patch("forven.exchange.hyperliquid.resolve_configured_testnet", return_value=False):
+            limits = _get_risk_limits()
+        assert limits == _MAINNET_LIMITS
 
     def test_mainnet_limits_are_tighter(self):
         with patch("forven.config.get_execution_mode", return_value="mainnet"):
@@ -757,7 +764,7 @@ class TestCloseAllPositionsPartialFailure:
         # mid alongside close_price (the padded IOC LIMIT). The booked price must be
         # the FILL — booking close_price fabricated off-market exits (E0001/E0002).
         fake_hl.close_position = lambda coin, size, side, **kwargs: {
-            "close_price": 51500, "exit_price": 50000, "mid": 49990,
+            "close_price": 51500, "exit_price": 50000, "mid": 49990, "filled_size": size,
         }
 
         with patch.dict(sys.modules, {"forven.exchange.hyperliquid": fake_hl}):
@@ -878,7 +885,7 @@ class TestCloseAllPositionsPartialFailure:
         }
         responses = [
             {"error": "temporary timeout"},
-            {"close_price": 1.29, "exit_price": 1.25, "mid": 1.249, "status": "ok"},
+            {"close_price": 1.29, "exit_price": 1.25, "mid": 1.249, "status": "ok", "filled_size": 3.0},
         ]
         calls: list[tuple[str, float, str]] = []
 
