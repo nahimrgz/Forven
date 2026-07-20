@@ -388,11 +388,41 @@ try {
     # --- Check Backend ---
     [array]$backendListeners = @(Get-ListeningPids -Port $BackendPort)
     $backendHealthy = Test-HttpHealthy -Url $HealthUrl
-    if ($backendRestartForced -or $backendListeners.Count -eq 0 -or -not $backendHealthy) {
+
+    # A listening backend that misses ONE 5s health probe is almost always mid-job
+    # (boot catch-up sweeps and gauntlet compute hold the GIL for seconds); killing
+    # it on the first miss caused restart storms (2026-07-19 06:15/06:20/06:21 and
+    # the 15:49 kill of a 4-minute-old backend). Each watchdog run is a separate
+    # scheduled-task process, so tolerance must persist in a counter file. A true
+    # zombie has NO listener and still restarts immediately.
+    $probeFailFile = Join-Path (Join-Path $RepoRoot ".tmp") "watchdog.backend_probe_failures"
+    $probeFailures = 0
+    if (Test-Path $probeFailFile) {
+        try { $probeFailures = [int]((Get-Content $probeFailFile -ErrorAction Stop) -join "").Trim() } catch {}
+    }
+    $probeFailureLimit = 3
+    $backendNeedsRestart = $backendRestartForced -or $backendListeners.Count -eq 0
+    if (-not $backendNeedsRestart) {
+        if ($backendHealthy) {
+            if ($probeFailures -ne 0) { Remove-Item -Path $probeFailFile -Force -ErrorAction SilentlyContinue }
+        } else {
+            $probeFailures += 1
+            if ($probeFailures -ge $probeFailureLimit) {
+                $backendNeedsRestart = $true
+            } else {
+                try { Set-Content -Path $probeFailFile -Value $probeFailures -ErrorAction Stop } catch {}
+                Write-Log ("Backend health probe failed (" + $probeFailures + "/" + $probeFailureLimit + ") but a listener is up - likely a heavy job; not restarting yet.")
+            }
+        }
+    }
+    if ($backendNeedsRestart) {
+        Remove-Item -Path $probeFailFile -Force -ErrorAction SilentlyContinue
         $msg = if ($backendRestartForced) {
             "Backend restart requested via sentinel - restarting"
+        } elseif ($backendListeners.Count -eq 0) {
+            "Backend DOWN (no listener, healthy=" + $backendHealthy + ") - restarting"
         } else {
-            "Backend DOWN (listeners=" + $backendListeners.Count + ", healthy=" + $backendHealthy + ") - restarting"
+            "Backend hung (" + $probeFailures + " consecutive failed probes with a live listener) - restarting"
         }
         Write-Log $msg
         Stop-BackendProcesses -ListenerPids $backendListeners
