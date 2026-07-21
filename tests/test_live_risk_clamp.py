@@ -56,10 +56,16 @@ class TestLiveRiskClampBackstop:
             _call_open(monkeypatch, size=1.0, equity=None)
         assert "fail closed" in str(err.value)
 
-    def test_unresolvable_cap_fails_closed(self, forven_db, monkeypatch):
+    def test_missing_cap_defaults_conservatively(self, forven_db, monkeypatch):
+        # Limits without max_risk_per_trade fall back to the 2% default cap
+        # (the pre-existing guard skipped the check entirely): 15 units = $30
+        # loss-at-stop vs $20 default budget -> refused; 5 units passes.
         with pytest.raises(RuntimeError) as err:
-            _call_open(monkeypatch, size=1.0, cap=None)
-        assert "fail closed" in str(err.value)
+            _call_open(monkeypatch, size=15.0, cap=None)
+        assert "loss-at-stop" in str(err.value)
+        with pytest.raises(RuntimeError) as err:
+            _call_open(monkeypatch, size=5.0, cap=None)
+        assert "REACHED_EXCHANGE" in str(err.value)
 
     def test_testnet_orders_are_exempt(self, forven_db, monkeypatch):
         # No real capital at risk on testnet — oversized opens still reach the

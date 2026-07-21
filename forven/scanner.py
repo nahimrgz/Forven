@@ -928,6 +928,14 @@ def _get_registered_position(trade_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+# LIVE-CLAMP-1: conservative per-trade risk cap applied when the configured
+# limits carry no max_risk_per_trade (the pre-existing guard treated a missing
+# cap as "skip the check"; an unbounded live order is worse than a 2% clamp).
+# Equity remaining unresolvable still fails closed - with no equity figure
+# there is nothing to bound against.
+_LIVE_PER_TRADE_RISK_CAP_DEFAULT = 0.02
+
+
 def _guard_open_trade_execution_intent(
     *,
     trade_id: str,
@@ -3675,11 +3683,13 @@ def _execute_direct(
                 _cap = _coerce_positive_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
             except Exception:
                 _cap = None
+            if not _cap:
+                _cap = _LIVE_PER_TRADE_RISK_CAP_DEFAULT
             _real_equity = _coerce_positive_float(_get_real_account_equity())
-            if not _cap or not _real_equity:
+            if not _real_equity:
                 raise RuntimeError(
                     f"refusing to open {trade_id}: live risk clamp cannot resolve "
-                    f"max_risk_per_trade ({_cap}) or real account equity ({_real_equity}) — fail closed"
+                    f"real account equity — fail closed"
                 )
             _stop_dist = (
                 abs(float(price) - float(stop_loss))
@@ -6745,11 +6755,10 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         _rc_cap = _coerce_positive_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
     except Exception:
         _rc_cap = None
-    if not _rc_cap or not _real_equity:
-        _why = (
-            f"live per-trade risk clamp cannot resolve max_risk_per_trade ({_rc_cap}) "
-            f"or real account equity ({_real_equity}) — fail closed"
-        )
+    if not _rc_cap:
+        _rc_cap = _LIVE_PER_TRADE_RISK_CAP_DEFAULT
+    if not _real_equity:
+        _why = "live per-trade risk clamp cannot resolve real account equity — fail closed"
         log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _why)
         _notify_live_open_blocked(strat_id, asset, _why, "risk_clamp_unresolved")
         return f"BLOCKED {asset} live — {_why}"
