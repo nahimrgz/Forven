@@ -213,6 +213,16 @@ async def _on_startup():
     except Exception as exc:
         log.warning("Research settings seeding failed: %s", exc)
     try:
+        # Orphaned-job sweep belongs HERE, once per API boot — never at module
+        # import, which spawn-context pool workers re-execute against the live
+        # job table, failing genuinely-running jobs mid-flight (see
+        # _cleanup_orphaned_running_jobs).
+        from forven.routers.robustness import _cleanup_orphaned_running_jobs
+
+        _cleanup_orphaned_running_jobs()
+    except Exception as exc:
+        log.warning("Orphaned running-job cleanup failed: %s", exc)
+    try:
         from forven.data_manager import assert_data_root_consistent
 
         # Launch hardening: don't silently continue on a split-brain data root.

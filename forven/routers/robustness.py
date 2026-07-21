@@ -230,7 +230,22 @@ def _cleanup_orphaned_running_jobs() -> None:
     tasks were still executing — those threads are gone but the DB rows
     still say 'running'. Optimization (and backtest) placeholder rows are
     included so orphaned jobs don't linger as ghost "Active Processes".
+
+    ONLY the main API process may run this, exactly once at startup (the
+    api_core._on_startup hook). It used to fire at module import, and this
+    module is imported by every spawn-context pool worker that pickles
+    _monte_carlo_bootstrap_worker / the regime-split worker — so every such
+    spawn swept the LIVE job table and marked genuinely-running jobs as
+    "Server restarted while job was running" mid-flight (the UI then showed
+    that error on every long run while the job actually completed fine).
     """
+    try:
+        import multiprocessing
+
+        if multiprocessing.parent_process() is not None:
+            return  # a pool/sandbox child must never sweep the live job table
+    except Exception:
+        pass
     try:
         from forven.db import get_db
         import json as _json
@@ -255,9 +270,6 @@ def _cleanup_orphaned_running_jobs() -> None:
                 log.info("Cleaned up orphaned running job: %s", row["result_id"])
     except Exception as exc:
         log.debug("Orphaned job cleanup skipped: %s", exc)
-
-
-_cleanup_orphaned_running_jobs()
 
 
 def _model_to_dict(model: BaseModel) -> dict:
