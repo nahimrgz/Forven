@@ -78,6 +78,34 @@ def test_trade_mode_unsupported_is_terminal_not_retryable():
     assert transient["retryable"] is True
 
 
+def test_interpreter_shutdown_is_infra_not_merit_failure():
+    """A run that died because the hosting process was tearing down says nothing
+    about the strategy. Its message often embeds a deterministic token (the
+    2026-07-19/20 zombie-backend incident produced 'Indicator execution failed
+    during in-sample: ... cannot schedule new futures after interpreter shutdown'
+    and archived five strategies as failed_gate) — the infra signature must win."""
+    from forven.gauntlet.tasks import _classify_exception
+
+    for msg in (
+        "Indicator execution failed during in-sample: failed to serialize input "
+        "frame: cannot schedule new futures after interpreter shutdown",
+        "cannot schedule new futures after shutdown",
+        "Event loop is closed",
+    ):
+        # RuntimeError and TypeError both occur in the wild; the infra signature
+        # must also beat the deterministic isinstance(TypeError) branch.
+        for exc in (RuntimeError(msg), TypeError(msg)):
+            verdict = _classify_exception(exc)
+            assert verdict["status"] == "blocked_runtime", msg
+            assert verdict["retryable"] is True, msg
+
+    # Control: a plain indicator failure without an infra signature is still a
+    # terminal strategy defect.
+    verdict = _classify_exception(ValueError("Indicator execution failed during in-sample: division by zero"))
+    assert verdict["status"] == "failed_gate"
+    assert verdict["retryable"] is False
+
+
 def test_quick_screen_pass_advances_to_gate(forven_db, monkeypatch):
     kv_set("forven:pipeline:settings", {"gauntlet_auto_quick_screen_enabled": True})
     created = create_lifecycle_strategy(
@@ -589,6 +617,83 @@ def test_run_walk_forward_drops_undersized_validation_window(forven_db, monkeypa
     )
     gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
     assert captured.get("start") == big_window["start"]
+
+
+def test_run_walk_forward_drops_window_starving_folds_at_measured_cadence(forven_db, monkeypatch):
+    """A dated window can clear the 420-bar floor yet still be structurally
+    unjudgeable: S07680 (2026-07-19/20) got ~118 days at 1h — ~2830 bars — but at
+    its measured ~2.5 trades/month the 5 × ~7-day OOS folds could never reach
+    wfa_min_fold_trades, so walk_forward FAILed by construction and both operator
+    revivals were re-archived off the same window. When the measured cadence
+    predicts fewer than wfa_min_fold_trades OOS trades per fold, the dated window
+    must be dropped in favor of the windowless full-history path. Without a
+    measured rate the dated window is kept (covered by the test above)."""
+    from datetime import datetime, timedelta, timezone
+
+    from forven.db import get_db
+    from forven.gauntlet import tasks as gtasks
+
+    sid = "S-WFWIN2"
+    now = datetime.now(timezone.utc)
+    # Canonical metrics carry the measured cadence: 26 trades over ~3.6 months
+    # (S07680's combined IS+OOS figures) ≈ 0.24 trades/day.
+    metrics = (
+        '{"in_sample": {"total_trades": 17, "backtest_months": 2.5},'
+        ' "out_of_sample": {"total_trades": 9, "backtest_months": 1.1}}'
+    )
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, metrics, "
+            "status, owner, stage, stage_changed_at, created_at, updated_at) "
+            "VALUES (?, ?, 'rsi_momentum', 'SOL/USDT', '1h', '{}', ?, 'gauntlet', 'brain', "
+            "'gauntlet', ?, ?, ?)",
+            (sid, sid, metrics, now.isoformat(), now.isoformat(), now.isoformat()),
+        )
+        conn.commit()
+
+    captured: dict = {}
+
+    def _fake_run_wf(body):
+        captured["start"] = body.start_date
+        captured["end"] = body.end_date
+        return {
+            "verdict": "PASS",
+            "splits": [
+                {"out_of_sample": {"sharpe": 1.0, "total_trades": 12}} for _ in range(5)
+            ],
+            "aggregate_oos": {"sharpe": 0.9, "total_trades": 60},
+        }
+
+    monkeypatch.setattr(gtasks, "_run_walk_forward", _fake_run_wf)
+    # ~118 days at 1h ≈ 2830 bars — passes the 420-bar floor, but expected OOS
+    # trades per fold = 0.24/day * 118d * 0.3 / 5 ≈ 1.7 < wfa_min_fold_trades (5).
+    starved_window = {
+        "start": (now - timedelta(days=118)).isoformat(),
+        "end": now.isoformat(),
+    }
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, starved_window)
+    )
+
+    workflow = {"id": "gw-test-wfwin2", "strategy_id": sid, "settings_snapshot_json": "{}"}
+    outcome = gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
+
+    assert captured.get("start") is None and captured.get("end") is None, (
+        f"fold-starving window must be dropped, got {captured}"
+    )
+    assert outcome["status"] == "passed"
+
+    # The same cadence with a window long enough to feed the folds is kept:
+    # 0.24/day * 1500d * 0.3 / 5 ≈ 21 expected trades/fold >= 5.
+    roomy_window = {
+        "start": (now - timedelta(days=1500)).isoformat(),
+        "end": now.isoformat(),
+    }
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, roomy_window)
+    )
+    gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
+    assert captured.get("start") == roomy_window["start"]
 
 
 def test_confirmation_backfills_canonical_metrics_when_blob_lacks_trade_count(forven_db, monkeypatch):

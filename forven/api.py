@@ -185,6 +185,48 @@ def _spawn_supervised_runtime_thread(
     return thread
 
 
+_zombie_reaper_started = False
+
+
+def _spawn_zombie_reaper() -> None:
+    """Force-exit the process if interpreter teardown wedges after the main thread dies.
+
+    When uvicorn's main thread exits (signal, crash, console event) a non-daemon
+    thread can block ``threading._shutdown`` forever. The process then lives on as
+    a zombie: no listener, executors poisoned ("cannot schedule new futures after
+    interpreter shutdown"), but still holding the runtime-worker and daemon file
+    locks — so the supervisor's replacement backend boots with NO background
+    loops. The 2026-07-18..20 outage was days of exactly this. A healthy shutdown
+    finishes well inside the grace window; if we are still alive after it, nothing
+    useful can ever run again, so hard-exit and let the supervisor restart clean.
+    """
+    global _zombie_reaper_started
+    if _zombie_reaper_started:
+        return
+    grace = _env_float("FORVEN_ZOMBIE_REAPER_GRACE_SECONDS", 45.0, minimum=0.0, maximum=600.0)
+    if grace <= 0:
+        log.info("Zombie reaper disabled (FORVEN_ZOMBIE_REAPER_GRACE_SECONDS<=0)")
+        return
+    main_thread = threading.main_thread()
+
+    def _watch() -> None:
+        main_thread.join()
+        threading.Event().wait(grace)
+        try:
+            log.critical(
+                "Main thread exited %.0fs ago but the process is still alive; "
+                "forcing exit so the supervisor can restart a working backend.",
+                grace,
+            )
+            logging.shutdown()
+        except Exception:
+            pass
+        os._exit(86)
+
+    threading.Thread(target=_watch, name="forven-zombie-reaper", daemon=True).start()
+    _zombie_reaper_started = True
+
+
 # Windows Proactor loop can intermittently reset accepted sockets under mixed
 # HTTP/WebSocket load. Use selector policy for API stability on Windows.
 if sys.platform.startswith("win"):
@@ -236,6 +278,8 @@ async def lifespan(_app: FastAPI):
     # Configure logging FIRST so every subsequent startup step, the scheduler
     # loop, and the agent workers emit observable log lines under any launcher.
     _configure_runtime_logging()
+
+    _spawn_zombie_reaper()
 
     # Surface missing/incompatible DECLARED dependencies at boot, under ANY
     # launcher. The shell launchers preflight before starting, but a direct
@@ -426,6 +470,139 @@ async def lifespan(_app: FastAPI):
     # pure control plane — used by the Playwright e2e harness to get a
     # deterministic, network-quiet backend. Never set this on a real install:
     # without a separate `forven daemon start` nothing trades or ticks.
+    def _start_runtime_workers() -> None:
+        # Caller must already hold the runtime worker lock. Factored out of the
+        # startup branch so the deferred-acquisition retry thread below can start
+        # the identical stack when the lock frees late.
+        nonlocal _scheduler_task, _agent_worker_task, _brain_worker_task, _daemon_task
+        from forven.scheduler import reset_scheduler_job_locks, run_scheduler_loop
+
+        recovered_job_locks = reset_scheduler_job_locks()
+        if recovered_job_locks:
+            log.info("API runtime worker cleared %d inherited scheduler job lock(s) at startup", recovered_job_locks)
+
+        agent_concurrency = _env_int("FORVEN_HEADLESS_AGENT_CONCURRENCY", 3, minimum=1, maximum=8)
+        brain_limit = _env_int("FORVEN_HEADLESS_BRAIN_LIMIT", 2, minimum=1, maximum=8)
+        runtime_thread_mode = _env_bool("FORVEN_API_RUNTIME_THREAD_MODE", True)
+        runtime_start_delay = _env_float("FORVEN_API_RUNTIME_START_DELAY_SECONDS", 5.0, minimum=0.0, maximum=60.0)
+        # BOOT-1: close the startup-recovery gate BEFORE the scheduler/scanner thread
+        # can run a live execution scan, so a stale recovery_active=False persisted by
+        # a cleanly-exited prior run can't let a live entry through during the boot
+        # window before the daemon's boot reconcile re-verifies the exchange.
+        try:
+            from forven.daemon import mark_boot_recovery_pending
+            mark_boot_recovery_pending()
+        except Exception:
+            log.warning("Could not stamp boot recovery gate", exc_info=True)
+        if runtime_thread_mode:
+            _runtime_threads.extend(
+                [
+                    _spawn_supervised_runtime_thread(
+                        "scheduler-loop",
+                        lambda: run_scheduler_loop(interval_seconds=30),
+                        initial_delay_seconds=runtime_start_delay,
+                    ),
+                    _spawn_supervised_runtime_thread(
+                        "headless-agent-loop",
+                        lambda: run_headless_agent_loop(poll_seconds=5.0, concurrency=agent_concurrency),
+                        initial_delay_seconds=runtime_start_delay,
+                    ),
+                    _spawn_supervised_runtime_thread(
+                        "headless-brain-loop",
+                        lambda: run_headless_brain_loop(poll_seconds=20.0, limit=brain_limit),
+                        initial_delay_seconds=runtime_start_delay,
+                    ),
+                ]
+            )
+        else:
+            _scheduler_task = _spawn_supervised_loop(
+                "scheduler-loop",
+                lambda: run_scheduler_loop(interval_seconds=30),
+            )
+            _agent_worker_task = _spawn_supervised_loop(
+                "headless-agent-loop",
+                lambda: run_headless_agent_loop(poll_seconds=5.0, concurrency=agent_concurrency),
+            )
+            _brain_worker_task = _spawn_supervised_loop(
+                "headless-brain-loop",
+                lambda: run_headless_brain_loop(poll_seconds=20.0, limit=brain_limit),
+            )
+
+        # Host the data/risk daemon in-process so a Discord-less install
+        # (Tauri shell only spawns `python -m forven.api`) still drives the
+        # market feed, price ticks, and daemon_state heartbeat. The daemon
+        # holds its own file lock so an external `forven daemon start` wins
+        # if it's already running.
+        try:
+            from forven.daemon import run_in_loop as run_daemon_in_loop
+            if runtime_thread_mode:
+                _runtime_threads.append(
+                    _spawn_supervised_runtime_thread(
+                        "daemon-loop",
+                        run_daemon_in_loop,
+                        initial_delay_seconds=runtime_start_delay,
+                    )
+                )
+            else:
+                _daemon_task = spawn(run_daemon_in_loop(), name="daemon-loop")
+            log.info(
+                "API runtime worker started: scheduler + headless agent loop "
+                "(concurrency=%d) + headless brain loop (limit=%d) + data/risk daemon "
+                "(thread_mode=%s, start_delay=%.1fs)",
+                agent_concurrency,
+                brain_limit,
+                runtime_thread_mode,
+                runtime_start_delay,
+            )
+        except Exception:
+            log.exception("Failed to start in-process daemon loop.")
+            # BOOT-1: no daemon will run its boot reconcile in this process, so
+            # release the startup-recovery gate we stamped above (else paper trading
+            # is wedged forever). Live still fails closed on missing real equity.
+            try:
+                from forven.daemon import clear_boot_recovery_pending
+                clear_boot_recovery_pending("daemon_unavailable")
+            except Exception:
+                log.warning("Could not release boot recovery gate after daemon-start failure", exc_info=True)
+            log.info(
+                "API runtime worker started: scheduler + headless agent loop "
+                "(concurrency=%d) + headless brain loop (limit=%d) (daemon unavailable, thread_mode=%s, start_delay=%.1fs)",
+                agent_concurrency,
+                brain_limit,
+                runtime_thread_mode,
+                runtime_start_delay,
+            )
+
+    _runtime_lock_retry_stop = threading.Event()
+
+    def _spawn_runtime_lock_retry_thread() -> None:
+        # The lock holder may be a zombie backend stuck in interpreter teardown
+        # (see _spawn_zombie_reaper): its listener is gone but its file locks are
+        # not. Once the reaper or the supervisor kills it the lock frees — but
+        # startup has already passed, and without this retry the replacement
+        # backend would serve a healthy-looking API forever with NO background
+        # loops (no scheduler, no gauntlet advancer, no data/risk daemon).
+        def _retry() -> None:
+            nonlocal _api_runtime_lock_held
+            while not _runtime_lock_retry_stop.wait(30.0):
+                if not acquire_runtime_worker_lock():
+                    continue
+                if _runtime_lock_retry_stop.is_set():
+                    release_runtime_worker_lock()
+                    return
+                _api_runtime_lock_held = True
+                try:
+                    _start_runtime_workers()
+                    log.warning(
+                        "Runtime worker lock acquired after startup; background "
+                        "loops are now running in this process."
+                    )
+                except Exception:
+                    log.exception("Deferred runtime worker start failed.")
+                return
+
+        threading.Thread(target=_retry, name="forven-runtime-lock-retry", daemon=True).start()
+
     try:
         if _env_bool("FORVEN_API_CONTROL_PLANE_ONLY", False):
             log.info(
@@ -434,105 +611,15 @@ async def lifespan(_app: FastAPI):
             )
         elif acquire_runtime_worker_lock():
             _api_runtime_lock_held = True
-            from forven.scheduler import reset_scheduler_job_locks, run_scheduler_loop
-
-            recovered_job_locks = reset_scheduler_job_locks()
-            if recovered_job_locks:
-                log.info("API runtime worker cleared %d inherited scheduler job lock(s) at startup", recovered_job_locks)
-
-            agent_concurrency = _env_int("FORVEN_HEADLESS_AGENT_CONCURRENCY", 3, minimum=1, maximum=8)
-            brain_limit = _env_int("FORVEN_HEADLESS_BRAIN_LIMIT", 2, minimum=1, maximum=8)
-            runtime_thread_mode = _env_bool("FORVEN_API_RUNTIME_THREAD_MODE", True)
-            runtime_start_delay = _env_float("FORVEN_API_RUNTIME_START_DELAY_SECONDS", 5.0, minimum=0.0, maximum=60.0)
-            # BOOT-1: close the startup-recovery gate BEFORE the scheduler/scanner thread
-            # can run a live execution scan, so a stale recovery_active=False persisted by
-            # a cleanly-exited prior run can't let a live entry through during the boot
-            # window before the daemon's boot reconcile re-verifies the exchange.
-            try:
-                from forven.daemon import mark_boot_recovery_pending
-                mark_boot_recovery_pending()
-            except Exception:
-                log.warning("Could not stamp boot recovery gate", exc_info=True)
-            if runtime_thread_mode:
-                _runtime_threads.extend(
-                    [
-                        _spawn_supervised_runtime_thread(
-                            "scheduler-loop",
-                            lambda: run_scheduler_loop(interval_seconds=30),
-                            initial_delay_seconds=runtime_start_delay,
-                        ),
-                        _spawn_supervised_runtime_thread(
-                            "headless-agent-loop",
-                            lambda: run_headless_agent_loop(poll_seconds=5.0, concurrency=agent_concurrency),
-                            initial_delay_seconds=runtime_start_delay,
-                        ),
-                        _spawn_supervised_runtime_thread(
-                            "headless-brain-loop",
-                            lambda: run_headless_brain_loop(poll_seconds=20.0, limit=brain_limit),
-                            initial_delay_seconds=runtime_start_delay,
-                        ),
-                    ]
-                )
-            else:
-                _scheduler_task = _spawn_supervised_loop(
-                    "scheduler-loop",
-                    lambda: run_scheduler_loop(interval_seconds=30),
-                )
-                _agent_worker_task = _spawn_supervised_loop(
-                    "headless-agent-loop",
-                    lambda: run_headless_agent_loop(poll_seconds=5.0, concurrency=agent_concurrency),
-                )
-                _brain_worker_task = _spawn_supervised_loop(
-                    "headless-brain-loop",
-                    lambda: run_headless_brain_loop(poll_seconds=20.0, limit=brain_limit),
-                )
-
-            # Host the data/risk daemon in-process so a Discord-less install
-            # (Tauri shell only spawns `python -m forven.api`) still drives the
-            # market feed, price ticks, and daemon_state heartbeat. The daemon
-            # holds its own file lock so an external `forven daemon start` wins
-            # if it's already running.
-            try:
-                from forven.daemon import run_in_loop as run_daemon_in_loop
-                if runtime_thread_mode:
-                    _runtime_threads.append(
-                        _spawn_supervised_runtime_thread(
-                            "daemon-loop",
-                            run_daemon_in_loop,
-                            initial_delay_seconds=runtime_start_delay,
-                        )
-                    )
-                else:
-                    _daemon_task = spawn(run_daemon_in_loop(), name="daemon-loop")
-                log.info(
-                    "API runtime worker started: scheduler + headless agent loop "
-                    "(concurrency=%d) + headless brain loop (limit=%d) + data/risk daemon "
-                    "(thread_mode=%s, start_delay=%.1fs)",
-                    agent_concurrency,
-                    brain_limit,
-                    runtime_thread_mode,
-                    runtime_start_delay,
-                )
-            except Exception:
-                log.exception("Failed to start in-process daemon loop.")
-                # BOOT-1: no daemon will run its boot reconcile in this process, so
-                # release the startup-recovery gate we stamped above (else paper trading
-                # is wedged forever). Live still fails closed on missing real equity.
-                try:
-                    from forven.daemon import clear_boot_recovery_pending
-                    clear_boot_recovery_pending("daemon_unavailable")
-                except Exception:
-                    log.warning("Could not release boot recovery gate after daemon-start failure", exc_info=True)
-                log.info(
-                    "API runtime worker started: scheduler + headless agent loop "
-                    "(concurrency=%d) + headless brain loop (limit=%d) (daemon unavailable, thread_mode=%s, start_delay=%.1fs)",
-                    agent_concurrency,
-                    brain_limit,
-                    runtime_thread_mode,
-                    runtime_start_delay,
-                )
+            _start_runtime_workers()
         else:
-            log.info("API runtime worker lock not acquired; another process owns background loops")
+            log.info(
+                "API runtime worker lock not acquired; another process owns "
+                "background loops — retrying every 30s in case the owner is a "
+                "dying process."
+            )
+            if _env_bool("FORVEN_API_RUNTIME_THREAD_MODE", True):
+                _spawn_runtime_lock_retry_thread()
     except Exception:
         log.exception("Failed to start API runtime worker.")
 
@@ -561,6 +648,10 @@ async def lifespan(_app: FastAPI):
             pass
 
     yield
+
+    # Stop the deferred runtime-lock retry so it can't grab the lock while
+    # we are tearing down.
+    _runtime_lock_retry_stop.set()
 
     # Signal the in-process daemon loop to exit so _price_consumer /
     # async_market_loop break out of their `while not shutdown.is_set()` waits
@@ -846,4 +937,94 @@ if __name__ == "__main__":
     bind_host = resolved_bind_host()
     # Fail closed: never expose an unauthenticated API beyond loopback.
     assert_safe_bind_host(bind_host)
-    uvicorn.run(app, host=bind_host, port=port, workers=1)
+
+    # CONSOLE-1: a SUPERVISED backend must not share the operator's console.
+    # Children spawned by start_all/watchdog inherit the console of the window
+    # that launched them, so an operator's Ctrl+C (or closing the start_all
+    # window) is ALSO delivered to the backend. One Ctrl+C triggers an unnoticed
+    # graceful shutdown; a second one hits uvicorn's force-exit, which skips the
+    # lifespan shutdown and leaves non-daemon threads wedging interpreter
+    # teardown (the 2026-07-21 10:16/10:27 reaper fires, on Selector loops, with
+    # no exception and no shutdown logs). Supervised runs are detectable by
+    # their redirected stderr (a file, not a terminal); dev runs in a real
+    # terminal keep their console so Ctrl+C still works. FORVEN_KEEP_CONSOLE=1
+    # is the escape hatch. Supervisors stop a detached backend via process
+    # termination, which is the crash-consistent path the boot reconcile
+    # already covers.
+    if (
+        sys.platform.startswith("win")
+        and os.environ.get("FORVEN_KEEP_CONSOLE", "").strip() != "1"
+    ):
+        try:
+            _stderr_is_tty = bool(sys.stderr and sys.stderr.isatty())
+        except Exception:
+            _stderr_is_tty = False
+        if not _stderr_is_tty:
+            try:
+                import ctypes
+
+                _k32 = ctypes.windll.kernel32
+                if _k32.FreeConsole():
+                    log.info(
+                        "Detached from the launcher console (supervised run) — "
+                        "operator console events can no longer reach this process."
+                    )
+                # CONSOLE-2: a console-LESS process makes every console-subsystem
+                # child (sandbox workers, multiprocessing backtest pools, taskkill,
+                # ruff, MCP servers) allocate a fresh VISIBLE console window — the
+                # "random python windows" regression CONSOLE-1 introduced. The
+                # multiprocessing pools can't pass creationflags, so the only
+                # complete fix is here at the parent: re-anchor on a PRIVATE
+                # console of our own and hide its window. Operator console events
+                # still cannot reach us (their console is no longer ours), and all
+                # children quietly inherit this hidden one. The AllocConsole window
+                # may flash for an instant at boot before ShowWindow hides it —
+                # once per backend start, not per child spawn.
+                if _k32.AllocConsole():
+                    _hwnd = _k32.GetConsoleWindow()
+                    if _hwnd:
+                        ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+                    log.info(
+                        "Re-anchored on a private hidden console — child processes "
+                        "inherit it instead of popping console windows."
+                    )
+                else:
+                    log.warning(
+                        "AllocConsole failed after detach — console-subsystem child "
+                        "processes will open visible console windows."
+                    )
+            except Exception:
+                log.warning("Could not detach from the launcher console", exc_info=True)
+
+    # LOOP-1: run the server on a loop WE create. uvicorn's loop factory
+    # hard-codes ProactorEventLoop on win32 (uvicorn>=0.49 asyncio_loop_factory),
+    # silently defeating the WindowsSelectorEventLoopPolicy this module sets for
+    # WS stability — the Proactor _call_connection_lost socket.shutdown race
+    # (ConnectionResetError WinError 10054 in a loop callback) can kill the serve
+    # loop under WebSocket churn, observed as the 2026-07-21 backend restart
+    # storm. asyncio.run() honors the policy, so the serve loop is a
+    # SelectorEventLoop here. Crashes are logged to the rotating api.log BEFORE
+    # the process dies — per-boot stderr truncation destroyed every prior
+    # traceback of this class.
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    _config = uvicorn.Config(app, host=bind_host, port=port, workers=1)
+    _server = uvicorn.Server(_config)
+
+    async def _serve() -> None:
+        log.info(
+            "uvicorn serve loop: %s", type(asyncio.get_running_loop()).__name__
+        )
+        await _server.serve()
+
+    try:
+        asyncio.run(_serve())
+    except (KeyboardInterrupt, SystemExit) as _exc:
+        log.warning("uvicorn serve loop stopped by %s", type(_exc).__name__)
+        raise
+    except BaseException:
+        log.critical(
+            "uvicorn serve loop crashed; exiting so the supervisor restarts a "
+            "working backend.", exc_info=True,
+        )
+        raise

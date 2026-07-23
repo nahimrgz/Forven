@@ -926,6 +926,14 @@ def _get_registered_position(trade_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+# LIVE-CLAMP-1: conservative per-trade risk cap applied when the configured
+# limits carry no max_risk_per_trade (the pre-existing guard treated a missing
+# cap as "skip the check"; an unbounded live order is worse than a 2% clamp).
+# Equity remaining unresolvable still fails closed - with no equity figure
+# there is nothing to bound against.
+_LIVE_PER_TRADE_RISK_CAP_DEFAULT = 0.02
+
+
 def _guard_open_trade_execution_intent(
     *,
     trade_id: str,
@@ -3662,6 +3670,40 @@ def _execute_direct(
             _halt_ok, _halt_reason = is_trading_allowed()
             if not _halt_ok:
                 raise RuntimeError(f"refusing to open {trade_id}: trading halted — {_halt_reason}")
+        # LIVE-CLAMP-1 backstop: no real-capital open may risk more than the
+        # per-trade cap of real account equity at its protective stop, whichever
+        # caller sized it — kernel mirror-parity sizing deliberately skips the
+        # risk-budget caps, so this is the final hard bound on a single order's
+        # loss-at-stop. Fail closed when the cap or real equity can't resolve.
+        # Sim and testnet orders are exempt (no real capital at risk).
+        if not is_sim_active() and not testnet:
+            try:
+                _cap = _coerce_positive_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
+            except Exception:
+                _cap = None
+            if not _cap:
+                _cap = _LIVE_PER_TRADE_RISK_CAP_DEFAULT
+            _real_equity = _coerce_positive_float(_get_real_account_equity())
+            if not _real_equity:
+                raise RuntimeError(
+                    f"refusing to open {trade_id}: live risk clamp cannot resolve "
+                    f"real account equity — fail closed"
+                )
+            _stop_dist = (
+                abs(float(price) - float(stop_loss))
+                if stop_loss is not None
+                else float(price) * 0.03  # no-stop conservative floor, mirrors the budget check
+            )
+            _loss_at_stop = float(size) * _stop_dist
+            _risk_budget_usd = float(_cap) * float(_real_equity)
+            # 2% slack + a cent so an order clamped exactly to the cap upstream
+            # cannot be re-refused on float noise.
+            if _loss_at_stop > _risk_budget_usd * 1.02 + 0.01:
+                raise RuntimeError(
+                    f"refusing to open {trade_id}: loss-at-stop ${_loss_at_stop:,.2f} "
+                    f"(size {float(size):g} x stop distance {_stop_dist:g}) exceeds the "
+                    f"per-trade cap {float(_cap):.2%} of real equity ${float(_real_equity):,.2f}"
+                )
         # B2: set + confirm leverage/margin mode on the routed account BEFORE the
         # entry, so the position uses the leverage our risk/stop math assumes
         # instead of the venue default (often 20-40x). Fail closed if it can't be
@@ -4336,7 +4378,10 @@ def manage_positions(
         account_equity = _get_account_equity()
 
     def _close_via_execution(trade, exit_price: float, pnl_pct: float, close_reason: str | None = None) -> bool:
-        if paper_test_local_execution:
+        # LANE-1: a paper-typed row must NEVER receive a real exchange close, even when
+        # the STRATEGY is live-stage (a promotion with an open paper position) — the
+        # order would reject on a flat wallet or reduce an unrelated real position.
+        if paper_test_local_execution or _recorded_row_execution_lane(trade) == "paper":
             # Simulate fill recording for paper trades
             _update_trade_fill(
                 trade_id=str(trade["id"]),
@@ -5383,13 +5428,17 @@ def _load_deployed_strategies() -> dict:
                 load_diagnostics[sid] = diagnostic
                 continue
 
-            from forven.strategies.sandbox_proxy import is_sandbox_only_type as _is_sandbox_only_type
-            is_sandbox = (
-                _is_sandbox_only_type(resolved_runtime_type)
-                or bool(row.get("sandbox_only"))
-                or (isinstance(runtime_meta, dict) and bool(runtime_meta.get("sandbox_only")))
-            )
-            if stype not in SIGNAL_CHECKERS and resolved_runtime_type not in _TYPE_MAP and not is_sandbox:
+            # Untrusted-origin (imported__*) types are executable by design via
+            # the sandbox worker proxy and NEVER appear in the parent _TYPE_MAP —
+            # blocking them here silently quarantined every dropzone import from
+            # paper execution (S06898/S07678/S07689, 2026-07-21). Exempt them iff
+            # the module file really exists (fabricated names still block).
+            from forven.strategies.registry import imported_module_exists as _imported_exists
+            if (
+                stype not in SIGNAL_CHECKERS
+                and resolved_runtime_type not in _TYPE_MAP
+                and not _imported_exists(resolved_runtime_type)
+            ):
                 diagnostic["blocked_reason"] = f"runtime type '{resolved_runtime_type}' is not registered"
                 diagnostic["last_runtime_error"] = diagnostic["blocked_reason"]
                 diagnostic["execution_decision"] = "blocked"
@@ -6380,6 +6429,14 @@ def _kernel_close_orphan(action, *, last_close: float, last_time: str) -> str | 
     row = (action.recorded or {}).get("_row")
     if row is None or not last_close or last_close <= 0:
         return None
+    # LANE-1: never locally flat-close a LIVE-typed row — the exchange position would
+    # survive the local "close" and sit unmanaged. Hold it for operator review.
+    if _recorded_row_execution_lane(row) == "live":
+        log.warning(
+            "KERNEL-CONVERGE: recorded OPEN %s (%s) is live-typed — never flat-closed "
+            "locally; held for operator review", row.get("asset"), row.get("id"),
+        )
+        return None
     # A LATE hop-in is owned by the re-anchored stop/target monitor, never the converge
     # path: flattening it at the last bar would bypass its real (re-anchored) stop and
     # close at an arbitrary current price. Leave it for _kernel_handle_late_entry_exits.
@@ -6412,6 +6469,14 @@ def _kernel_close_cross_asset_orphan(row: dict) -> str | None:
     trade_id = row.get("id")
     entry_price = _coerce_positive_float(row.get("fill_entry_price")) or _coerce_positive_float(row.get("entry_price"))
     if not trade_id or entry_price is None:
+        return None
+    # LANE-1: a live-typed row is a REAL position — a local flat-close would strand it
+    # on-exchange. Hold it (the live lane's cross-asset branch surfaces these).
+    if _recorded_row_execution_lane(row) == "live":
+        log.warning(
+            "KERNEL-CROSS-ASSET: recorded OPEN %s (%s) is live-typed — never flat-closed "
+            "locally; held for operator review", row.get("asset"), trade_id,
+        )
         return None
     # A late hop-in is owned by its own re-anchored stop monitor — never auto-flatten it here.
     if parse_trade_signal_data(row.get("signal_data")).get("late_entry"):
@@ -6581,6 +6646,51 @@ def _live_kernel_execution_enabled() -> bool:
     return _scanner_bool_setting("live_kernel_execution", True)
 
 
+# LANE-1: execution lanes for RECORDED trade rows. An action that targets an
+# existing row must follow the ROW's execution_type, not the strategy's current
+# stage: a strategy promoted to live with an open paper trade (or demoted to paper
+# with an open live one) otherwise gets the wrong applier — a REAL reduce-only
+# order fired at a local-only paper row (rejected while the wallet is flat, but
+# REDUCING an unrelated real position when one exists), or a real position
+# "closed" locally and stranded on the exchange.
+_PAPER_LANE_EXECUTION_TYPES = ("paper", "paper_challenger", "simulation")
+
+
+def _recorded_row_execution_lane(row) -> str | None:
+    """'paper' | 'live' for a recorded trade row; None for missing/unknown types
+    (legacy rows predate the stamp — those keep the strategy-lane behavior)."""
+    if not isinstance(row, dict):
+        return None
+    exec_type = str(row.get("execution_type") or "").strip().lower()
+    if exec_type in _PAPER_LANE_EXECUTION_TYPES:
+        return "paper"
+    if exec_type == "live":
+        return "live"
+    return None
+
+
+def _kernel_action_execution_lane(action) -> str | None:
+    rec = getattr(action, "recorded", None)
+    row = rec.get("_row") if isinstance(rec, dict) else None
+    return _recorded_row_execution_lane(row)
+
+
+def _kernel_row_dispatch(action, is_live: bool) -> str:
+    """'paper' | 'live' | 'hold' — which applier a close/backfill/refresh action gets.
+
+    The row's lane wins over the strategy's lane. The one asymmetry: a live-typed
+    row in the PAPER lane is HELD, not closed — the paper lane must never place a
+    real order (the paper-test "no real orders" contract), and a local close would
+    strand the exchange position, which is strictly worse than holding it for the
+    operator."""
+    row_lane = _kernel_action_execution_lane(action)
+    if row_lane == "paper" and is_live:
+        return "paper"
+    if row_lane == "live" and not is_live:
+        return "hold"
+    return "live" if is_live else "paper"
+
+
 def _is_live_kernel_stage(strat: dict) -> bool:
     stage = str(strat.get("stage") or strat.get("status") or "").strip().lower()
     return stage in ("live", "live_graduated", "deployed")
@@ -6706,12 +6816,69 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         _add_risk = abs(float(ref_price) - float(stop_price)) * float(units)
     else:
         _add_risk = _add_notional * 0.03  # no stop known — conservative floor (mirrors risk._BUDGET_NO_STOP_RISK_FRAC)
+    # LIVE-CLAMP-1: per-trade risk cap at live order entry. Kernel mirror-parity
+    # sizing deliberately skips the risk-budget caps (enforce_risk_caps=False
+    # above), so nothing else bounds a single order's loss-at-stop as a fraction
+    # of real equity — the notional ceiling and aggregate budget bound exposure,
+    # not per-trade risk. Scale units down so loss-at-stop <= max_risk_per_trade
+    # of REAL account equity; fail closed when the cap or equity can't resolve.
+    _real_equity = _coerce_positive_float(_get_real_account_equity())
+    try:
+        _rc_cap = _coerce_positive_float((get_risk_status().get("limits") or {}).get("max_risk_per_trade"))
+    except Exception:
+        _rc_cap = None
+    if not _rc_cap:
+        _rc_cap = _LIVE_PER_TRADE_RISK_CAP_DEFAULT
+    if not _real_equity:
+        _why = "live per-trade risk clamp cannot resolve real account equity — fail closed"
+        log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _why)
+        _notify_live_open_blocked(strat_id, asset, _why, "risk_clamp_unresolved")
+        return f"BLOCKED {asset} live — {_why}"
+    _risk_budget_usd = float(_rc_cap) * float(_real_equity)
+    _live_clamp_meta = None
+    if _add_risk > _risk_budget_usd + 1e-9:
+        _scale = _risk_budget_usd / _add_risk
+        _clamped_units = round(float(units) * _scale, 6)
+        if _clamped_units <= 0:
+            _why = (
+                f"per-trade risk clamp reduced size to zero (loss-at-stop "
+                f"${_add_risk:,.2f} vs cap ${_risk_budget_usd:,.2f})"
+            )
+            log.warning("[%s] BLOCKED %s live open — %s", strat_id, asset, _why)
+            _notify_live_open_blocked(strat_id, asset, _why, "risk_clamp")
+            return f"BLOCKED {asset} live — {_why}"
+        _live_clamp_meta = {
+            "planned_units": float(units),
+            "clamped_units": _clamped_units,
+            "loss_at_stop_usd": round(_add_risk, 4),
+            "cap_usd": round(_risk_budget_usd, 4),
+            "max_risk_per_trade": float(_rc_cap),
+        }
+        log.warning(
+            "[%s] LIVE-CLAMP-1: %s units %.6f -> %.6f (loss-at-stop $%.2f > cap $%.2f = %.2f%% of $%.2f)",
+            strat_id, asset, units, _clamped_units, _add_risk, _risk_budget_usd,
+            _rc_cap * 100, _real_equity,
+        )
+        try:
+            log_activity(
+                "warning", "scanner",
+                f"LIVE-CLAMP-1: {asset} ({strat_id}) size clamped to the per-trade "
+                f"risk cap ({_rc_cap:.2%} of real equity)",
+            )
+        except Exception:
+            pass
+        units = _clamped_units
+        _add_notional = float(units) * float(ref_price)
+        if stop_price:
+            _add_risk = abs(float(ref_price) - float(stop_price)) * float(units)
+        else:
+            _add_risk = _add_notional * 0.03
     # BOOK-BUDGET-1: the order draws on ONE wallet — pass the routed book and its
     # balance (sizing_equity was narrowed to exactly that above) so admission is
     # also checked against the wallet's own capacity, not just the aggregate.
     _pb_ok, _pb_why = check_live_portfolio_budget(
         asset, direction, add_risk_usd=_add_risk, add_notional_usd=_add_notional,
-        equity=_get_real_account_equity(),
+        equity=_real_equity,
         book=open_book,
         book_equity_usd=(float(sizing_equity) if (books_on and open_book) else None),
     )
@@ -6741,6 +6908,8 @@ def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity
         # fill (kernel_size_fraction above is the SCALED value actually deployed).
         "portfolio_risk_multiplier": round(portfolio_multiplier, 4),
     }
+    if _live_clamp_meta:
+        signal_data["live_risk_clamp"] = _live_clamp_meta
     # Pass book only when direction books are active so the books-off path keeps the
     # exact prior signature (book stays NULL = master wallet).
     _open_extra = {"book": open_book} if open_book is not None else {}
@@ -7274,14 +7443,40 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
                 msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage,
                                    current_price=hop_price, current_time=hop_time)
             elif a.kind in ("close", "backfill"):
-                msg = close_applier(
-                    strat_id, strat, a, current_price=hop_price, current_time=hop_time,
-                    funding_df=df, timeframe=timeframe,
-                )
+                # LANE-1: a close that targets a RECORDED row follows the ROW's
+                # execution lane, not the strategy's stage — a promotion/demotion
+                # with an open position would otherwise cross the paper/live order
+                # paths (a real reduce-only order fired at a paper row, or a real
+                # position closed locally and stranded).
+                _dispatch = _kernel_row_dispatch(a, is_live)
+                if _dispatch == "hold":
+                    log.warning(
+                        "[%s] kernel paper: recorded OPEN %s row is live-typed — a local close "
+                        "would strand the exchange position; held for operator review",
+                        strat_id, asset,
+                    )
+                    msg = f"HELD {asset} close — live-typed row in the paper lane (close it via the live flow)"
+                else:
+                    if is_live and _dispatch == "paper":
+                        log.warning(
+                            "[%s] kernel live: recorded %s row is paper-typed — routing close via "
+                            "the paper path (no real order)",
+                            strat_id, asset,
+                        )
+                    msg = (_kernel_close_live_trade if _dispatch == "live" else _kernel_close_paper_trade)(
+                        strat_id, strat, a, current_price=hop_price, current_time=hop_time,
+                        funding_df=df, timeframe=timeframe,
+                    )
             elif a.kind == "refresh":
                 # LIVE-TRAIL-1: the live refresh mirrors the kernel's ratcheted trailing
                 # stop onto the resting exchange order; the paper refresh is display-only.
-                msg = _kernel_refresh_live_trade(strat_id, a) if is_live else _kernel_refresh_paper_trade(a)
+                # LANE-1: same row-lane dispatch as closes — never touch a real resting
+                # order for a paper row, never locally re-stamp a live row from paper.
+                _dispatch = _kernel_row_dispatch(a, is_live)
+                if _dispatch == "hold":
+                    msg = None
+                else:
+                    msg = _kernel_refresh_live_trade(strat_id, a) if _dispatch == "live" else _kernel_refresh_paper_trade(a)
             elif a.kind == "orphan_close":
                 msg = _kernel_close_orphan(a, last_close=last_close, last_time=last_time)
             else:

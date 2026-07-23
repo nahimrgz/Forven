@@ -230,7 +230,22 @@ def _cleanup_orphaned_running_jobs() -> None:
     tasks were still executing — those threads are gone but the DB rows
     still say 'running'. Optimization (and backtest) placeholder rows are
     included so orphaned jobs don't linger as ghost "Active Processes".
+
+    ONLY the main API process may run this, exactly once at startup (the
+    api_core._on_startup hook). It used to fire at module import, and this
+    module is imported by every spawn-context pool worker that pickles
+    _monte_carlo_bootstrap_worker / the regime-split worker — so every such
+    spawn swept the LIVE job table and marked genuinely-running jobs as
+    "Server restarted while job was running" mid-flight (the UI then showed
+    that error on every long run while the job actually completed fine).
     """
+    try:
+        import multiprocessing
+
+        if multiprocessing.parent_process() is not None:
+            return  # a pool/sandbox child must never sweep the live job table
+    except Exception:
+        pass
     try:
         from forven.db import get_db
         import json as _json
@@ -255,9 +270,6 @@ def _cleanup_orphaned_running_jobs() -> None:
                 log.info("Cleaned up orphaned running job: %s", row["result_id"])
     except Exception as exc:
         log.debug("Orphaned job cleanup skipped: %s", exc)
-
-
-_cleanup_orphaned_running_jobs()
 
 
 def _model_to_dict(model: BaseModel) -> dict:
@@ -2144,117 +2156,149 @@ def _test_pass_margin(result_type: str, metrics: dict, config: dict) -> float:
     return 0.5
 
 
+def compute_composite_robustness_score(strategy_id: str) -> dict | None:
+    """Margin-weighted composite over the latest GENUINE artifact per test type.
+
+    The single scorer: the metrics-sync recalc below AND the gauntlet-status
+    readout both use it, so the status panel shows the LIVE score even for
+    paper/live strategies whose stored metrics are frozen — the frozen stamp
+    otherwise pins the panel at its pre-promotion value forever while the
+    per-test chips read the live artifacts. Returns ``None`` when the strategy
+    has no artifact rows at all; otherwise
+    ``{score, passed, canonical_total, avg_margin, measured_total, tests}``.
+    """
+    from forven.db import get_db
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT result_type, metrics_json, config_json
+               FROM backtest_results
+               WHERE strategy_id = ?
+                 AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+                 AND LOWER(TRIM(COALESCE(result_type, ''))) IN (
+                     'walk_forward', 'monte_carlo', 'param_jitter', 'cost_stress', 'regime_split'
+                 )
+               ORDER BY datetime(created_at) DESC""",
+            (strategy_id,),
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    from forven.policy import (
+        is_nonresult_validation_row,
+        is_nonresult_wfa_row,
+        load_pipeline_config,
+    )
+
+    gauntlet_cfg = load_pipeline_config().get("gauntlet", {})
+    min_trades = int(gauntlet_cfg.get("min_trades", 10) or 10)
+
+    # Deduplicate by result_type (keep the latest GENUINE verdict). A pending or
+    # errored/timed-out row is a NON-RESULT: skip it without claiming the type so
+    # an older genuine verdict can still surface — mirroring the paper gate's
+    # extractor. Counting an infra failure as `passed=False` here dragged
+    # composite_robustness_score/robustness_tests_passed and the brain then
+    # archived on a phantom merit fail (2026-07-11).
+    parsed = [
+        (
+            str(r["result_type"] or "").strip().lower(),
+            _parse_json_object(r["metrics_json"]),
+            _parse_json_object(r["config_json"]),
+        )
+        for r in rows
+    ]
+    # Mirror the paper-gate extractor's current-params preference: a re-run
+    # scored on since-changed params must not displace a current-params
+    # verdict here either (the two readers feed the same brain decisions).
+    current_hash = _current_params_hash(strategy_id)
+    if current_hash:
+        matching = [
+            p for p in parsed
+            if str((p[2] or {}).get("params_hash") or "").strip() == current_hash
+        ]
+        if matching:
+            parsed = matching + [p for p in parsed if p not in matching]
+
+    seen = set()
+    tests: list[dict] = []
+    for rt, metrics, config in parsed:
+        if rt in seen:
+            continue
+        if is_nonresult_validation_row(metrics, config):
+            continue
+        # A completed 0-fold/0-trade walk_forward measured nothing — same
+        # rule as the paper-gate extractor (policy.is_nonresult_wfa_row).
+        if rt == "walk_forward" and is_nonresult_wfa_row(metrics):
+            continue
+        seen.add(rt)
+        passed_result, reason = _validation_row_passed(
+            rt,
+            metrics,
+            config,
+            min_trades=min_trades,
+        )
+        margin = _test_pass_margin(rt, metrics, config) if passed_result else 0.0
+        tests.append({"type": rt, "passed": passed_result, "reason": reason, "margin": margin})
+
+    # NOTE: no early return when tests is empty — if every persisted row is a
+    # non-result the score below computes to 0 and OVERWRITES whatever stale
+    # composite was last written (matching the pre-fix net effect for the
+    # all-errored case; leaving a stale 100 standing would let the brain keep
+    # reading robustness no surviving evidence supports).
+
+    # Denominator = the canonical REQUIRED test set, NOT just the tests that happen
+    # to have a row. Counting only measured tests means a single passing test of N
+    # scores 100 (a partial run looks perfect and clears the floor). Using the
+    # required set (or all 5 when "enforce all" / required_tests is empty) makes
+    # unmeasured/failed required tests correctly pull the score down.
+    from forven.gauntlet.models import ROBUSTNESS_STEP_KEYS, normalize_step_key
+    from forven.gauntlet.settings import normalize_required_tests
+
+    required = normalize_required_tests(gauntlet_cfg.get("required_tests"))
+    canonical = set(required) if required else set(ROBUSTNESS_STEP_KEYS)
+    canonical_tests = [t for t in tests if normalize_step_key(str(t["type"])) in canonical]
+    passed = sum(1 for t in canonical_tests if t["passed"])
+    canonical_total = len(canonical)
+    total = len(tests)  # measured count, kept for logging only
+    # Margin-weighted, gate-safe composite: base = (passed/canonical_total)*100; a
+    # bounded bonus (capped just under one band step) then ranks already-passing
+    # strategies WITHIN their band without ever crossing into the next pass-count
+    # band. avg_margin is over PASSED canonical tests only.
+    if canonical_total > 0:
+        base = (passed / canonical_total) * 100.0
+        passed_margins = [float(t.get("margin") or 0.0) for t in canonical_tests if t["passed"]]
+        avg_margin = sum(passed_margins) / len(passed_margins) if passed_margins else 0.0
+        band_step = 100.0 / canonical_total
+        bonus = avg_margin * max(band_step - 0.1, 0.0)
+        score = round(min(base + bonus, 100.0), 2)
+    else:
+        avg_margin = 0.0
+        score = 0.0
+
+    return {
+        "score": score,
+        "passed": passed,
+        "canonical_total": canonical_total,
+        "avg_margin": avg_margin,
+        "measured_total": total,
+        "tests": tests,
+    }
+
+
 def _recalculate_robustness_score(strategy_id: str) -> None:
     """Recalculate composite robustness score from all test results and sync to strategy record."""
     try:
         from forven.db import get_db
 
-        with get_db() as conn:
-            rows = conn.execute(
-                """SELECT result_type, metrics_json, config_json
-                   FROM backtest_results
-                   WHERE strategy_id = ?
-                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-                     AND LOWER(TRIM(COALESCE(result_type, ''))) IN (
-                         'walk_forward', 'monte_carlo', 'param_jitter', 'cost_stress', 'regime_split'
-                     )
-                   ORDER BY datetime(created_at) DESC""",
-                (strategy_id,),
-            ).fetchall()
-
-        if not rows:
+        computed = compute_composite_robustness_score(strategy_id)
+        if computed is None:
             return
-
-        from forven.policy import (
-            is_nonresult_validation_row,
-            is_nonresult_wfa_row,
-            load_pipeline_config,
-        )
-
-        gauntlet_cfg = load_pipeline_config().get("gauntlet", {})
-        min_trades = int(gauntlet_cfg.get("min_trades", 10) or 10)
-
-        # Deduplicate by result_type (keep the latest GENUINE verdict). A pending or
-        # errored/timed-out row is a NON-RESULT: skip it without claiming the type so
-        # an older genuine verdict can still surface — mirroring the paper gate's
-        # extractor. Counting an infra failure as `passed=False` here dragged
-        # composite_robustness_score/robustness_tests_passed and the brain then
-        # archived on a phantom merit fail (2026-07-11).
-        parsed = [
-            (
-                str(r["result_type"] or "").strip().lower(),
-                _parse_json_object(r["metrics_json"]),
-                _parse_json_object(r["config_json"]),
-            )
-            for r in rows
-        ]
-        # Mirror the paper-gate extractor's current-params preference: a re-run
-        # scored on since-changed params must not displace a current-params
-        # verdict here either (the two readers feed the same brain decisions).
-        current_hash = _current_params_hash(strategy_id)
-        if current_hash:
-            matching = [
-                p for p in parsed
-                if str((p[2] or {}).get("params_hash") or "").strip() == current_hash
-            ]
-            if matching:
-                parsed = matching + [p for p in parsed if p not in matching]
-
-        seen = set()
-        tests: list[dict] = []
-        for rt, metrics, config in parsed:
-            if rt in seen:
-                continue
-            if is_nonresult_validation_row(metrics, config):
-                continue
-            # A completed 0-fold/0-trade walk_forward measured nothing — same
-            # rule as the paper-gate extractor (policy.is_nonresult_wfa_row).
-            if rt == "walk_forward" and is_nonresult_wfa_row(metrics):
-                continue
-            seen.add(rt)
-            passed_result, reason = _validation_row_passed(
-                rt,
-                metrics,
-                config,
-                min_trades=min_trades,
-            )
-            margin = _test_pass_margin(rt, metrics, config) if passed_result else 0.0
-            tests.append({"type": rt, "passed": passed_result, "reason": reason, "margin": margin})
-
-        # NOTE: no early return when tests is empty — if every persisted row is a
-        # non-result the score below computes to 0 and OVERWRITES whatever stale
-        # composite was last written (matching the pre-fix net effect for the
-        # all-errored case; leaving a stale 100 standing would let the brain keep
-        # reading robustness no surviving evidence supports).
-
-        # Denominator = the canonical REQUIRED test set, NOT just the tests that happen
-        # to have a row. Counting only measured tests means a single passing test of N
-        # scores 100 (a partial run looks perfect and clears the floor). Using the
-        # required set (or all 5 when "enforce all" / required_tests is empty) makes
-        # unmeasured/failed required tests correctly pull the score down.
-        from forven.gauntlet.models import ROBUSTNESS_STEP_KEYS, normalize_step_key
-        from forven.gauntlet.settings import normalize_required_tests
-
-        required = normalize_required_tests(gauntlet_cfg.get("required_tests"))
-        canonical = set(required) if required else set(ROBUSTNESS_STEP_KEYS)
-        canonical_tests = [t for t in tests if normalize_step_key(str(t["type"])) in canonical]
-        passed = sum(1 for t in canonical_tests if t["passed"])
-        canonical_total = len(canonical)
-        total = len(tests)  # measured count, kept for logging only
-        # Margin-weighted, gate-safe composite: base = (passed/canonical_total)*100; a
-        # bounded bonus (capped just under one band step) then ranks already-passing
-        # strategies WITHIN their band without ever crossing into the next pass-count
-        # band. avg_margin is over PASSED canonical tests only.
-        if canonical_total > 0:
-            base = (passed / canonical_total) * 100.0
-            passed_margins = [float(t.get("margin") or 0.0) for t in canonical_tests if t["passed"]]
-            avg_margin = sum(passed_margins) / len(passed_margins) if passed_margins else 0.0
-            band_step = 100.0 / canonical_total
-            bonus = avg_margin * max(band_step - 0.1, 0.0)
-            score = round(min(base + bonus, 100.0), 2)
-        else:
-            avg_margin = 0.0
-            score = 0.0
+        score = computed["score"]
+        passed = computed["passed"]
+        canonical_total = computed["canonical_total"]
+        avg_margin = computed["avg_margin"]
+        total = computed["measured_total"]
 
         # Sync to strategy record
         with get_db() as conn:
@@ -2278,6 +2322,24 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
                     metrics = json.loads(existing["metrics"] or "{}")
                 except Exception:
                     metrics = {}
+                # MCP/dropzone-registered strategies can reach the gauntlet with a
+                # robustness-only metrics blob: registration never stamps performance
+                # metrics, and the artifact-driven quick_screen->gauntlet fast-path
+                # (_reconcile_stage_after_validation) skips the sweep that would.
+                # The paper gate then fails closed with "no trade-count metric"
+                # despite every artifact being green (S07680/S07681/S07689/S07678,
+                # 2026-07-17). Mirror the confirmation-step backfill
+                # (gauntlet.tasks.run_confirmation_backtest): promote the latest
+                # plain-backtest metrics as the performance base, existing keys
+                # winning so validation bookkeeping is never erased.
+                from forven.policy import _resolve_full_sample_trade_count
+
+                if _resolve_full_sample_trade_count(metrics) is None:
+                    backfill = _latest_plain_backtest_metrics(conn, strategy_id)
+                    if backfill:
+                        merged = dict(backfill)
+                        merged.update(metrics)
+                        metrics = merged
                 metrics["composite_robustness_score"] = score
                 metrics["robustness_tests_passed"] = passed
                 metrics["robustness_tests_total"] = canonical_total
@@ -2306,6 +2368,45 @@ def _recalculate_robustness_score(strategy_id: str) -> None:
                 )
     except Exception as exc:
         log.warning("Failed to recalculate robustness score for %s: %s", strategy_id, exc)
+
+
+def _latest_plain_backtest_metrics(conn, strategy_id: str) -> dict:
+    """Latest plain-backtest metrics blob that carries a usable trade count.
+
+    Prefers rows on the strategy's stored timeframe (a probing run at another
+    TF must not become the canonical sample), falling back to any timeframe.
+    Returns {} when no candidate row has a trade-count signal.
+    """
+    from forven.policy import _resolve_full_sample_trade_count
+
+    strat = conn.execute(
+        "SELECT timeframe FROM strategies WHERE id = ?", (strategy_id,)
+    ).fetchone()
+    strat_tf = str((strat["timeframe"] if strat else "") or "").strip().lower()
+
+    rows = conn.execute(
+        """SELECT metrics_json, timeframe FROM backtest_results
+           WHERE strategy_id = ?
+             AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+             AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) IN ('backtest', '')
+           ORDER BY datetime(created_at) DESC
+           LIMIT 25""",
+        (strategy_id,),
+    ).fetchall()
+
+    fallback: dict = {}
+    for row in rows:
+        candidate = _parse_json_object(row["metrics_json"])
+        if not isinstance(candidate, dict) or not candidate:
+            continue
+        if _resolve_full_sample_trade_count(candidate) is None:
+            continue
+        row_tf = str(row["timeframe"] or "").strip().lower()
+        if strat_tf and row_tf == strat_tf:
+            return candidate
+        if not fallback:
+            fallback = candidate
+    return fallback
 
 
 def _canonicalize_required_validation_type(name: object) -> str:

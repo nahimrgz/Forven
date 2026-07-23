@@ -61,6 +61,42 @@ function Get-ListeningPids {
     return $result
 }
 
+function Get-BackendProcessIds {
+    # Every backend process for THIS repo, listener or not. A backend whose main
+    # thread died closes its listener but can survive as a zombie (background
+    # threads wedge interpreter teardown) while still holding the runtime-worker
+    # and daemon file locks - killing only the listening PIDs leaves it alive and
+    # the replacement backend then boots with no background loops.
+    $result = @()
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $cmd = [string]$_.CommandLine
+                $cmd -match "forven\.api" -and $cmd.ToLowerInvariant().Contains($RepoRoot.ToLowerInvariant())
+            }
+        foreach ($proc in @($procs)) {
+            if ($proc -and $proc.ProcessId) { $result += [int]$proc.ProcessId }
+        }
+    } catch {}
+    return @($result | Select-Object -Unique)
+}
+
+function Stop-BackendProcesses {
+    param([int[]]$ListenerPids)
+
+    $targets = @((@($ListenerPids) + @(Get-BackendProcessIds)) | Where-Object { $_ -and $_ -gt 0 } | Select-Object -Unique)
+    foreach ($procId in $targets) {
+        try {
+            Stop-Process -Id $procId -Force -ErrorAction Stop
+            Write-Log ("Stopped backend PID " + $procId)
+        } catch {
+            if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
+                Write-Log ("WARN: Could not stop backend PID " + $procId + ": " + $_.Exception.Message)
+            }
+        }
+    }
+}
+
 function Find-Python {
     $venvPy = Join-Path (Join-Path $RepoRoot ".venv") "Scripts\python.exe"
     if (Test-Path $venvPy) { return $venvPy }
@@ -335,19 +371,65 @@ try {
     }
     $watchdogOwnerLockHeld = $true
 
+    # --- Restart sentinel (self-update / operator-requested bounce) ---
+    # start_all's supervisor loop honors .tmp/restart.request; honor it here too
+    # so a restart requested while only the scheduled-task watchdog is running
+    # (no start_all console) still lands.
+    $restartSentinel = Join-Path (Join-Path $RepoRoot ".tmp") "restart.request"
+    $backendRestartForced = $false
+    if (Test-Path $restartSentinel) {
+        Write-Log "Restart sentinel found - bouncing backend to load new code."
+        try { Remove-Item -Path $restartSentinel -Force -ErrorAction Stop } catch {
+            Write-Log ("WARN: Could not remove restart sentinel: " + $_.Exception.Message)
+        }
+        $backendRestartForced = $true
+    }
+
     # --- Check Backend ---
     [array]$backendListeners = @(Get-ListeningPids -Port $BackendPort)
     $backendHealthy = Test-HttpHealthy -Url $HealthUrl
-    if ($backendListeners.Count -eq 0 -or -not $backendHealthy) {
-        $msg = "Backend DOWN (listeners=" + $backendListeners.Count + ", healthy=" + $backendHealthy + ") - restarting"
-        Write-Log $msg
-        foreach ($pid in $backendListeners) {
-            try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch {}
+
+    # A listening backend that misses ONE 5s health probe is almost always mid-job
+    # (boot catch-up sweeps and gauntlet compute hold the GIL for seconds); killing
+    # it on the first miss caused restart storms (2026-07-19 06:15/06:20/06:21 and
+    # the 15:49 kill of a 4-minute-old backend). Each watchdog run is a separate
+    # scheduled-task process, so tolerance must persist in a counter file. A true
+    # zombie has NO listener and still restarts immediately.
+    $probeFailFile = Join-Path (Join-Path $RepoRoot ".tmp") "watchdog.backend_probe_failures"
+    $probeFailures = 0
+    if (Test-Path $probeFailFile) {
+        try { $probeFailures = [int]((Get-Content $probeFailFile -ErrorAction Stop) -join "").Trim() } catch {}
+    }
+    $probeFailureLimit = 3
+    $backendNeedsRestart = $backendRestartForced -or $backendListeners.Count -eq 0
+    if (-not $backendNeedsRestart) {
+        if ($backendHealthy) {
+            if ($probeFailures -ne 0) { Remove-Item -Path $probeFailFile -Force -ErrorAction SilentlyContinue }
+        } else {
+            $probeFailures += 1
+            if ($probeFailures -ge $probeFailureLimit) {
+                $backendNeedsRestart = $true
+            } else {
+                try { Set-Content -Path $probeFailFile -Value $probeFailures -ErrorAction Stop } catch {}
+                Write-Log ("Backend health probe failed (" + $probeFailures + "/" + $probeFailureLimit + ") but a listener is up - likely a heavy job; not restarting yet.")
+            }
         }
+    }
+    if ($backendNeedsRestart) {
+        Remove-Item -Path $probeFailFile -Force -ErrorAction SilentlyContinue
+        $msg = if ($backendRestartForced) {
+            "Backend restart requested via sentinel - restarting"
+        } elseif ($backendListeners.Count -eq 0) {
+            "Backend DOWN (no listener, healthy=" + $backendHealthy + ") - restarting"
+        } else {
+            "Backend hung (" + $probeFailures + " consecutive failed probes with a live listener) - restarting"
+        }
+        Write-Log $msg
+        Stop-BackendProcesses -ListenerPids $backendListeners
         $backendLog = Join-Path $logRoot "unified_backend.log"
         $backendErr = Join-Path $logRoot "unified_backend.err.log"
         $proc = Start-Process -FilePath $python `
-            -ArgumentList @("-m","uvicorn","--app-dir",$RepoRoot,"forven.api:app","--host",$BackendHost,"--port",$BackendPort.ToString(),"--workers","1") `
+            -ArgumentList @("-m","forven.api","--port",$BackendPort.ToString()) `
             -WorkingDirectory $RepoRoot -RedirectStandardOutput $backendLog -RedirectStandardError $backendErr `
             -WindowStyle Hidden -PassThru
         Write-Log ("Backend started as PID " + $proc.Id)
@@ -448,6 +530,19 @@ if (-not $daemonAlive) {
             Where-Object { $_.CommandLine -match "forven.*daemon" }
         if ($daemonProcs) { $daemonAlive = $true }
     } catch {}
+}
+if (-not $daemonAlive -and (Test-Path $daemonLockFile)) {
+    # The backend hosts the daemon in-process (thread_mode): no standalone daemon
+    # process exists, but the live daemon keeps an open handle on the lock file.
+    # If we cannot open it exclusively, a daemon is alive somewhere. Without this
+    # probe the watchdog spawned a doomed duplicate daemon every cycle ("Another
+    # daemon instance is already running").
+    try {
+        $probe = [System.IO.File]::Open($daemonLockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $probe.Dispose()
+    } catch {
+        $daemonAlive = $true
+    }
 }
 if (-not $daemonAlive) {
     if (Test-Path $daemonLockFile) { Remove-Item $daemonLockFile -Force -ErrorAction SilentlyContinue }
