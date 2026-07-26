@@ -40,18 +40,24 @@ def _wrap_untrusted(payload: Any) -> str:
     """
     return _UNTRUSTED_PREFIX + json.dumps(payload) + _UNTRUSTED_SUFFIX
 
-from .context import _current_agent_id_var, _current_task_display_id_var
+from .context import (
+    _current_agent_id_var,
+    _current_task_display_id_var,
+    _current_tools_context_var,
+)
 from .tool_registry import register_tool
 
 from forven.db import get_db
 from forven.hypotheses import (
     HypothesisPoolFullError,
     add_hypothesis_artifact,
+    archive_hypothesis,
     create_hypothesis,
     get_hypothesis_spawn_stats,
     list_hypothesis_artifacts,
     record_data_gap,
     update_hypothesis,
+    update_hypothesis_status,
 )
 from forven.strategy_extrapolation import extrapolate_strategy_spec, record_extrapolation_gaps
 
@@ -793,7 +799,11 @@ def _tool_attach_hypothesis_artifact(params: dict) -> str:
     description=(
         "Enrich an existing hypothesis with refined fields extracted from its source "
         "artifacts. Only supplied fields overwrite; others stay untouched. Use this "
-        "after reading a cached artifact to turn a placeholder hypothesis into a real one."
+        "after reading a cached artifact to turn a placeholder hypothesis into a real one. "
+        "Lifecycle fields are NOT updatable here: to retire/close a hypothesis use "
+        "archive_hypothesis; to record a scientific verdict (proven/disproven) use "
+        "update_hypothesis_status. Renaming the title (e.g. an [ARCHIVED-*] prefix) "
+        "does NOT retire it — the dispatcher only reads status/manager_state."
     ),
     input_schema={
         "type": "object",
@@ -828,6 +838,155 @@ def _tool_update_hypothesis_fields(params: dict) -> str:
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc) or "update failed"})
     return json.dumps({"ok": True, "hypothesis": updated})
+
+
+def _acting_agent_label() -> str:
+    agent_id = str(_current_agent_id_var.get() or "").strip()
+    return f"agent:{agent_id}" if agent_id else "operator"
+
+
+def _lifecycle_context_blocked() -> str | None:
+    """Refuse lifecycle transitions from the research context.
+
+    Research tasks ingest the most untrusted content (blogs, READMEs, Reddit)
+    in the same turn these tools would be callable — a prompt-injected page
+    must not be able to retire hypotheses or flip verdicts. This is an in-tool
+    check (not a category deny) because the 'destructive' category must stay
+    allowed in research for the brain's legitimate strategy-archival cycles
+    (B-9/B-10), and list-hiding alone is not an authorization boundary.
+    """
+    if str(_current_tools_context_var.get() or "").strip() == "research":
+        return (
+            "hypothesis lifecycle actions are disabled in the research context "
+            "(untrusted-content ingestion). Perform retirements/verdicts from a "
+            "develop or scheduled task, or the operator UI."
+        )
+    return None
+
+
+@register_tool(
+    name="archive_hypothesis",
+    description=(
+        "Retire a hypothesis from the active pool (manager_state='archived'). This is "
+        "the ONLY way an agent can actually retire one — title prefixes like "
+        "[ARCHIVED-*] are cosmetic and the dispatcher ignores them. A reason is "
+        "required and is recorded for the outflow audit. Protected (proven) crucibles "
+        "are not archived directly: the call queues an operator approval instead and "
+        "returns approval_required=true."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "hypothesis_id": {"type": "string", "description": "Hypothesis id (HYP-...) or display id (Hxxxxx)"},
+            "reason": {"type": "string", "description": "Why this hypothesis is being retired (e.g. 'lane saturated', 'duplicate of H00123', 'mechanism disproven — see verdict memo')"},
+        },
+        "required": ["hypothesis_id", "reason"],
+    },
+    permissions={"brain", "role:strategy-developer", None},
+    # Removes work from the active pool — must be denied in the recovery AND
+    # research contexts (a prompt-injected research page must not be able to
+    # retire hypotheses).
+    category="destructive",
+)
+def _tool_archive_hypothesis(params: dict) -> str:
+    blocked = _lifecycle_context_blocked()
+    if blocked:
+        return json.dumps({"ok": False, "error": blocked})
+    hypothesis_id = str(params.get("hypothesis_id") or "").strip()
+    reason = str(params.get("reason") or "").strip()
+    if not hypothesis_id:
+        return json.dumps({"ok": False, "error": "hypothesis_id is required"})
+    if not reason:
+        return json.dumps({"ok": False, "error": "reason is required — an untagged archival is invisible in audits"})
+    try:
+        row = archive_hypothesis(hypothesis_id, reason=f"{_acting_agent_label()}: {reason}")
+    except ValueError as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc) or "archive failed"})
+    if row.get("approval_required"):
+        return json.dumps({
+            "ok": True,
+            "archived": False,
+            "approval_required": True,
+            "approval_id": row.get("approval_id"),
+            "note": "Protected crucible — archival queued for operator approval, not applied yet.",
+        })
+    return json.dumps({
+        "ok": True,
+        "archived": True,
+        "hypothesis_id": row.get("id"),
+        "manager_state": row.get("manager_state"),
+        "archived_at": row.get("archived_at"),
+    })
+
+
+@register_tool(
+    name="update_hypothesis_status",
+    description=(
+        "Record a scientific verdict on a hypothesis: transition status between "
+        "proposed/researching/proven/disproven with a mandatory verdict summary. "
+        "Writes the verdict memo and full audit trail. Marking 'disproven' removes it "
+        "from the dispatcher pool. To also retire it from the manager view, call "
+        "archive_hypothesis afterwards. Protected (proven) crucibles queue an operator "
+        "approval instead of transitioning directly."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "hypothesis_id": {"type": "string", "description": "Hypothesis id (HYP-...) or display id (Hxxxxx)"},
+            "new_status": {"type": "string", "enum": ["proposed", "researching", "proven", "disproven"]},
+            "verdict_summary": {"type": "string", "description": "Evidence-backed summary of why this transition is warranted"},
+            "evidence_id": {"type": "string", "description": "Optional reference to the backing evidence (result id, verdict batch, artifact id)"},
+        },
+        "required": ["hypothesis_id", "new_status", "verdict_summary"],
+    },
+    permissions={"brain", "role:strategy-developer", None},
+    # 'disproven' removes a hypothesis from the dispatcher pool — functionally
+    # archival, so it must carry the same context-deny category (the name
+    # doesn't match the archive_/delete_ auto-categorization prefixes).
+    category="destructive",
+)
+def _tool_update_hypothesis_status(params: dict) -> str:
+    blocked = _lifecycle_context_blocked()
+    if blocked:
+        return json.dumps({"ok": False, "error": blocked})
+    hypothesis_id = str(params.get("hypothesis_id") or "").strip()
+    new_status = str(params.get("new_status") or "").strip()
+    verdict_summary = str(params.get("verdict_summary") or "").strip()
+    if not hypothesis_id or not new_status:
+        return json.dumps({"ok": False, "error": "hypothesis_id and new_status are required"})
+    if not verdict_summary:
+        return json.dumps({"ok": False, "error": "verdict_summary is required — undocumented verdicts are invisible in audits"})
+    memo: dict[str, Any] = {"summary": verdict_summary, "source": "agent_tool"}
+    evidence_id = str(params.get("evidence_id") or "").strip()
+    if evidence_id:
+        memo["evidence_id"] = evidence_id
+    try:
+        row = update_hypothesis_status(
+            hypothesis_id,
+            new_status=new_status,
+            memo=memo,
+            by=_acting_agent_label(),
+        )
+    except ValueError as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc) or "status update failed"})
+    if row.get("approval_required"):
+        return json.dumps({
+            "ok": True,
+            "applied": False,
+            "approval_required": True,
+            "approval_id": row.get("approval_id"),
+            "note": "Protected crucible — transition queued for operator approval, not applied yet.",
+        })
+    return json.dumps({
+        "ok": True,
+        "applied": True,
+        "hypothesis_id": row.get("id"),
+        "status": row.get("status"),
+    })
 
 
 @register_tool(
