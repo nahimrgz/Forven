@@ -3808,7 +3808,7 @@ def update_strategy_params(strategy_id: str, params: dict, *, actor: str = "syst
     """
     with get_db() as conn:
         row = conn.execute(
-            "SELECT type, stage FROM strategies WHERE id = ?",
+            "SELECT type, runtime_type, stage FROM strategies WHERE id = ?",
             (strategy_id,),
         ).fetchone()
     if not row:
@@ -3822,7 +3822,15 @@ def update_strategy_params(strategy_id: str, params: dict, *, actor: str = "syst
         )
         return {"locked": True, "strategy_id": strategy_id, "stage": current_stage}
 
-    certification = certify_execution_strategy(row["type"], params if isinstance(params, dict) else {})
+    # Certify against the EXECUTABLE type: sandbox-only rows carry a bare
+    # `type` with no parent-registry class (D1) — certifying on it rejects
+    # every param update on an imported strategy.
+    from forven.api_core import resolve_execution_strategy_type
+
+    certification = certify_execution_strategy(
+        resolve_execution_strategy_type(row) or row["type"],
+        params if isinstance(params, dict) else {},
+    )
     certification_error = certification.format_error(context="params")
     if certification_error:
         raise ValueError(certification_error)

@@ -8424,7 +8424,10 @@ def update_strategy_default_params(
     ``None`` leaves the pin untouched.
     """
     with get_db() as conn:
-        row = conn.execute("SELECT id, type, params, stage FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, type, runtime_type, params, stage FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Strategy {strategy_id} not found")
 
@@ -8435,7 +8438,12 @@ def update_strategy_default_params(
     incoming_params = new_params if isinstance(new_params, dict) else {}
     merged_params = {**existing_params, **incoming_params}
 
-    certification = certify_execution_strategy(row["type"], merged_params)
+    # Certify against the EXECUTABLE type: sandbox-only rows carry a bare
+    # `type` with no parent-registry class (D1) — certifying on it 422s every
+    # param update on an imported strategy.
+    certification = certify_execution_strategy(
+        resolve_execution_strategy_type(row) or row["type"], merged_params
+    )
     certification_error = certification.format_error(context="params")
     if certification_error:
         raise HTTPException(status_code=422, detail=certification_error)

@@ -113,15 +113,54 @@ def _tool_write_strategy_code(new_source: str, rationale: str) -> str:
 
 
 def _update_default_params(*, params: dict, rationale: str, thread_id: str) -> str:
+    from forven.strategies.sizing import HONORED_EXECUTION_CONTROL_FIELDS
+
     sid = _require_strategy_id()
     with get_db() as conn:
         row = conn.execute("SELECT params FROM strategies WHERE id = ?", (sid,)).fetchone()
         if not row:
             raise ValueError(f"strategy {sid} not found")
         existing = _json.loads(row[0]) if row[0] else {}
-        unknown = set(params) - set(existing)
-        if unknown:
-            raise ValueError(f"unknown param key(s): {sorted(unknown)}")
+
+    outgoing = dict(params)
+
+    # execution_profile is exempt from the exists-already guard: the engine
+    # honors risk controls ONLY from this nested dict, and most strategies are
+    # minted without it — requiring it to pre-exist made it impossible to ever
+    # set a time stop / risk cap post-mint. Subkeys are validated against the
+    # honored list and deep-merged (a None value clears that field).
+    profile_update = outgoing.pop("execution_profile", None)
+    if "execution_profile" in params:
+        if profile_update is None:
+            # Mirror the sub-key semantics at the profile level: null wipes the
+            # whole profile (engine falls back to default 1%-risk sizing).
+            outgoing["execution_profile"] = {}
+        elif not isinstance(profile_update, dict):
+            raise ValueError(
+                "execution_profile must be an object mapping honored control "
+                f"fields to values (or null to clear the whole profile); "
+                f"honored fields: {sorted(HONORED_EXECUTION_CONTROL_FIELDS)}"
+            )
+        else:
+            unknown_controls = set(profile_update) - set(HONORED_EXECUTION_CONTROL_FIELDS)
+            if unknown_controls:
+                raise ValueError(
+                    f"unknown execution_profile field(s): {sorted(unknown_controls)}. "
+                    f"Honored fields: {sorted(HONORED_EXECUTION_CONTROL_FIELDS)}"
+                )
+            existing_profile = existing.get("execution_profile")
+            merged_profile = dict(existing_profile) if isinstance(existing_profile, dict) else {}
+            for key, value in profile_update.items():
+                if value is None:
+                    merged_profile.pop(key, None)
+                else:
+                    merged_profile[key] = value
+            outgoing["execution_profile"] = merged_profile
+
+    unknown = set(outgoing) - set(existing) - {"execution_profile"}
+    if unknown:
+        raise ValueError(f"unknown param key(s): {sorted(unknown)}")
+
     # Deepdive chat edits ARE an allowed user override. Route through the locked
     # setter as a USER actor so the param-lock (which freezes paper/live params
     # against automated writers) is bypassed for this genuine operator action and
@@ -129,21 +168,37 @@ def _update_default_params(*, params: dict, rationale: str, thread_id: str) -> s
     # only the changed keys preserves the prior merge-with-existing behaviour.
     from forven.api_core import update_strategy_default_params
 
-    update_strategy_default_params(sid, dict(params), actor="user")
+    update_strategy_default_params(sid, outgoing, actor="user")
     log_activity(
         level="info",
         source=f"deepdive_agent:{thread_id}",
-        message=f"updated {len(params)} param(s) for {sid}",
-        data={"strategy_id": sid, "changes": params, "rationale": rationale},
+        message=f"updated {len(outgoing)} param(s) for {sid}",
+        data={"strategy_id": sid, "changes": outgoing, "rationale": rationale},
     )
-    return f"updated {len(params)} param(s): {sorted(params)}"
+    message = f"updated {len(outgoing)} param(s): {sorted(outgoing)}"
+    inert_flat_keys = sorted(
+        key for key in outgoing if key != "execution_profile" and key in HONORED_EXECUTION_CONTROL_FIELDS
+    )
+    if inert_flat_keys:
+        message += (
+            f". WARNING: top-level {inert_flat_keys} are NOT honored by the "
+            "execution engine — only params['execution_profile'] is. Pass "
+            "{'execution_profile': {...}} if you want the engine to enforce them."
+        )
+    return message
 
 
 @register_tool(
     name="deepdive_update_default_params",
     description=(
         "Update the strategy's default params (merge — only provided keys change). "
-        "Keys must already exist in the strategy's params. Provide a rationale."
+        "Keys must already exist in the strategy's params, EXCEPT 'execution_profile': "
+        "pass {'execution_profile': {'time_stop_bars': 96, ...}} to create or deep-merge "
+        "the engine-honored risk controls (sizing_mode, fixed_size, risk_per_trade, "
+        "atr_stop_multiplier, kelly_multiplier, kelly_lookback, stop_loss_pct, "
+        "take_profit_pct, trailing_stop_pct, time_stop_bars); a null value clears a field. "
+        "Top-level risk keys (e.g. a flat time_stop_bars) are IGNORED by the engine — "
+        "only the nested execution_profile is enforced. Provide a rationale."
     ),
     input_schema={
         "type": "object",
