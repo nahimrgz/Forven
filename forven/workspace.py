@@ -138,8 +138,16 @@ def _workspace_roots() -> list[Path]:
     return roots
 
 
+# Reentrant: append_workspace calls write_workspace while already holding it.
+_APPEND_LOCK = threading.RLock()
+
+
 def write_workspace(filename: str, content: str):
-    """Write a workspace file (atomic)."""
+    """Write a workspace file (atomic).
+
+    Takes _APPEND_LOCK so a raw overwrite can't interleave with the
+    read-modify-write cycle in append_workspace and silently drop content.
+    """
     ensure_dirs()
 
     def _write(path: Path):
@@ -149,16 +157,14 @@ def write_workspace(filename: str, content: str):
         # replace is safer on Windows than rename for existing targets.
         tmp.replace(path)
 
-    _write(WORKSPACE_DIR / filename)
-    # Mirror writes to legacy workspace to keep `.judex` and `.forven` in sync.
-    if LEGACY_WORKSPACE_DIR and LEGACY_WORKSPACE_DIR != WORKSPACE_DIR:
-        try:
-            _write(LEGACY_WORKSPACE_DIR / filename)
-        except Exception:
-            pass
-
-
-_APPEND_LOCK = threading.Lock()
+    with _APPEND_LOCK:
+        _write(WORKSPACE_DIR / filename)
+        # Mirror writes to legacy workspace to keep `.judex` and `.forven` in sync.
+        if LEGACY_WORKSPACE_DIR and LEGACY_WORKSPACE_DIR != WORKSPACE_DIR:
+            try:
+                _write(LEGACY_WORKSPACE_DIR / filename)
+            except Exception:
+                pass
 
 
 def append_workspace(filename: str, content: str):

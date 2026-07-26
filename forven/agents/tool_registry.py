@@ -71,6 +71,9 @@ class ToolDef:
     # Defaults to 'general'. MCP tools registered via mcp_router set
     # category='mcp'; research / exchange / destructive tools set their own.
     category: str = "general"
+    # Per-tool overrides for _process_tool_output caps. Allowed keys:
+    # max_bytes, max_lines, max_chars_per_line. None → module defaults.
+    output_caps: dict[str, int] | None = None
 
 
 _REGISTRY: dict[str, ToolDef] = {}
@@ -91,6 +94,10 @@ _CONTEXT_DEFAULT_DENY: dict[str, frozenset[str]] = {
     # Research context: ingests the most untrusted content; never catastrophic,
     # and never arbitrary code execution (audit 2026-06-22, H4) — a prompt-injected
     # research page must not be able to reach run_code / raw-code writes.
+    # NOTE: 'destructive' stays ALLOWED here by design (B-9/B-10: brain research
+    # cycles legitimately archive strategies / transition stages); the hypothesis
+    # lifecycle tools instead carry their own in-tool research-context refusal
+    # (see tools_research._lifecycle_context_blocked).
     "research": frozenset({"catastrophic", "codegen"}),
     # Code-authoring autonomous tasks (develop_candidate) legitimately need codegen
     # (register_strategy) AND research (read the operator-seeded hypothesis
@@ -197,6 +204,7 @@ def register_tool(
     is_async: bool = False,
     run_in_thread: bool = True,
     category: str = "general",
+    output_caps: dict[str, int] | None = None,
 ) -> Callable:
     """Decorator that registers a tool handler in the global registry.
 
@@ -219,6 +227,18 @@ def register_tool(
             handler=adapter,
             permissions=perms,
             category=str(category or "general"),
+            # Coerce at registration time so a malformed cap fails fast at
+            # import, never at output-processing time (where an exception
+            # would skip redaction).
+            output_caps=(
+                {
+                    key: int(value)
+                    for key, value in output_caps.items()
+                    if key in ("max_bytes", "max_lines", "max_chars_per_line")
+                }
+                if output_caps
+                else None
+            ),
         )
         return fn  # return original — not the adapter
 
@@ -765,12 +785,26 @@ async def execute_tool(tool_name: str, tool_input: dict) -> str:
     # paths, permission denials, and successful tool returns. Errors are
     # the most likely vector for accidental secret leakage (stack traces
     # quoting env vars), so redaction is unconditional.
+    # Resolve per-tool caps in their own guard: a malformed output_caps entry
+    # must degrade to the defaults, never make the redaction call below raise.
+    caps: dict[str, int] = {}
+    try:
+        tool_def = _REGISTRY.get(tool_name)
+        if tool_def and tool_def.output_caps:
+            caps = {
+                key: int(value)
+                for key, value in tool_def.output_caps.items()
+                if key in ("max_bytes", "max_lines", "max_chars_per_line")
+            }
+    except Exception:
+        caps = {}
     try:
         result = _process_tool_output(
             result,
             tool_name=tool_name,
             task_display_id=current_task_display_id,
             agent_id=current_agent_id,
+            **caps,
         )
     except Exception as exc:
         log.warning("tool output post-processing failed for %s: %s", tool_name, exc)

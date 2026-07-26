@@ -306,19 +306,41 @@ async def _tool_run_shell(command: str) -> str:
         output += f"\nExit code: {proc.returncode}"
     return output or "(no output)"
 
+# Per-call read window. Larger files are paged via `offset` — never silently
+# sliced: an agent that reads a truncated file believing it is complete will
+# recompose and overwrite it (2026-07-23 #5246: 277KB of LESSONS.md lost).
+_READ_FILE_MAX_CHARS = 10_000
+
+
 @register_tool(
     name="read_file",
-    description="Read a file from the Forven workspace (~/.forven/workspace/). Provide path relative to workspace root.",
+    description=(
+        "Read a file from the Forven workspace (~/.forven/workspace/). Provide path relative "
+        f"to workspace root. Returns at most {_READ_FILE_MAX_CHARS} chars per call; larger "
+        "files carry an explicit TRUNCATED marker with the offset to pass on the next call "
+        "to read the following chunk. Never treat a marked partial read as the full file."
+    ),
     input_schema={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path relative to workspace root, e.g. 'LESSONS.md' or 'memory/2026-02-19.md'"},
+            "offset": {"type": "integer", "description": "Character offset to start reading from (default 0). Use the offset given in a previous TRUNCATED marker to continue reading a large file."},
         },
         "required": ["path"],
     },
+    # A chunk can legitimately be one long code/JSON line; the global
+    # per-line cap would corrupt it mid-line. Total size is already bounded
+    # by the pagination window, so relaxing these caps is safe.
+    output_caps={
+        "max_chars_per_line": _READ_FILE_MAX_CHARS + 600,
+        "max_lines": _READ_FILE_MAX_CHARS + 600,
+        # Sized from the window so bumping _READ_FILE_MAX_CHARS can never let
+        # the byte cap clip the TRUNCATED footer mid-marker.
+        "max_bytes": (_READ_FILE_MAX_CHARS + 600) * 4,
+    },
 )
-def _tool_read_file(path: str) -> str:
-    """Read a workspace file."""
+def _tool_read_file(path: str, offset: int = 0) -> str:
+    """Read a workspace file, paged in explicit chunks."""
     # H-S8: hardened path validation (catches symlink escapes too)
     from forven.workspace import WorkspacePathError, safe_workspace_path
     try:
@@ -328,7 +350,33 @@ def _tool_read_file(path: str) -> str:
     content = read_workspace(path, optional=True)
     if content is None:
         return f"File not found: {path}"
-    return content[:10000]
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        return (
+            f"Error: offset must be an integer (got {offset!r}). Use the exact "
+            "offset value from the previous TRUNCATED marker."
+        )
+    total = len(content)
+    if offset >= total > 0:
+        return (
+            f"Error: offset {offset} is beyond the end of {path} "
+            f"({total} chars total). Use an offset below {total}."
+        )
+    chunk = content[offset:offset + _READ_FILE_MAX_CHARS]
+    end = offset + len(chunk)
+    if offset == 0 and end >= total:
+        return content
+    header = f"[read_file: chars {offset}-{end} of {total} from {path}]\n"
+    if end < total:
+        footer = (
+            f"\n\n…[TRUNCATED: {total - end} chars remain. Call read_file with "
+            f"offset={end} for the next chunk. Do NOT treat this partial "
+            "content as the full file.]"
+        )
+    else:
+        footer = f"\n\n[end of file: {path}, {total} chars total]"
+    return header + chunk + footer
 
 # Allow-list for write_file tool (P1 pre-beta security): LLM may only write
 # to these workspace locations. Anything else is rejected even if the path
