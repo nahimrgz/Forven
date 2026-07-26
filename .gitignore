@@ -84,6 +84,9 @@ test-results/
 # Local workspace state
 .forven_home/
 ~/
+# Stray CWD-relative copy of ~/.forven/workspace (legacy-path resolution
+# writes here when a process runs with the repo as cwd)
+/workspace/
 .claude/settings.local.json
 .claude/settings.json
 .claude/launch.json
