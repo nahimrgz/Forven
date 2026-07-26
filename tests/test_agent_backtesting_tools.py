@@ -351,10 +351,15 @@ def test_register_strategy_persists_runtime_type_for_current_strategy(forven_db,
     registry_mod.reset()
     monkeypatch.setattr(registry_mod, "reset", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(registry_mod, "discover", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(registry_mod, "_TYPE_MAP", {"bb_fade_s00194": object()})
+    # No container id in the payload — the tool must fall back to the current
+    # strategy context and bind the namespaced runtime_type to it.
     monkeypatch.setattr(
         "forven.strategies.intake.register_custom_strategy_file",
-        lambda **_kwargs: {},
+        lambda **_kwargs: _sandbox_payload(
+            strategy_id="",
+            type_name="bb_fade_s00194",
+            runtime_type="imported__dropzone_bb_fade_s00194_abc123",
+        ),
     )
 
     token = _current_strategy_id_var.set("s-runtime-type")
@@ -377,7 +382,7 @@ def test_register_strategy_persists_runtime_type_for_current_strategy(forven_db,
             ("s-runtime-type",),
         ).fetchone()
 
-    assert row["runtime_type"] == "bb_fade_s00194"
+    assert row["runtime_type"] == "imported__dropzone_bb_fade_s00194_abc123"
     assert Path(tmp_path / "strategies" / "custom" / "bb_fade_s00194.py").exists()
 
 
@@ -650,10 +655,13 @@ def test_register_custom_strategy_from_notes_success(forven_db, monkeypatch, tmp
     registry_mod.reset()
     monkeypatch.setattr(registry_mod, "reset", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(registry_mod, "discover", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(registry_mod, "_TYPE_MAP", {"notes_strat_s002": object()})
     monkeypatch.setattr(
         "forven.strategies.intake.register_custom_strategy_file",
-        lambda **_kwargs: {},
+        lambda **_kwargs: _sandbox_payload(
+            strategy_id="S02600",
+            type_name="notes_strat_s002",
+            runtime_type="imported__dropzone_notes_strat_s002_abc123",
+        ),
     )
 
     # Write a dummy markdown file in workspace
@@ -684,4 +692,328 @@ class NotesStrategy(BaseStrategy):
     assert "registered successfully" in result.lower()
     assert Path(tmp_path / "strategies" / "custom" / "notes_strat_s002.py").exists()
     assert "class NotesStrategy" in Path(tmp_path / "strategies" / "custom" / "notes_strat_s002.py").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# register_strategy vs the sandboxed intake path (R2/R3).
+#
+# Sandbox-only (imported/dropzone) types are NEVER loaded into the parent
+# process's _TYPE_MAP — they only exist inside the isolated strategy worker.
+# Success/failure signaling must therefore come from the intake payload, not
+# from a parent-registry lookup, and the DB row's namespaced runtime_type
+# (imported__dropzone_*) must never be clobbered with the bare type_name or
+# execution paths fall back to prefix-matching onto prebuilt families.
+# ---------------------------------------------------------------------------
+
+_SANDBOX_REG_CODE = """
+from forven.strategies.base import BaseStrategy, Signal
+
+TYPE_NAME = "sandbox_reg_check"
+
+class SandboxRegCheck(BaseStrategy):
+    pass
+
+STRATEGY_CLASS = SandboxRegCheck
+"""
+
+
+def _sandbox_payload(**overrides) -> dict:
+    payload = {
+        "strategy_id": "S02501",
+        "module_name": "sandbox_reg_check",
+        "type_name": "sandbox_reg_check",
+        "asset": "BTC",
+        "certified": False,
+        "certification_error": None,
+        "file_name": "sandbox_reg_check.py",
+        "source": "agent_register",
+        "source_ref": "forven/strategies/imported/dropzone_sandbox_reg_check_abc123.py",
+        "stage": "quick_screen",
+        "session_id": None,
+        "lookahead_blocked": False,
+        "lookahead_reason": None,
+        "runtime_type": "imported__dropzone_sandbox_reg_check_abc123",
+        "sandbox_only": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _setup_register_env(monkeypatch, tmp_path, *, intake):
+    monkeypatch.setattr(
+        "forven.selfheal.validate_strategy_code",
+        lambda code: {
+            "valid": True,
+            "code": code,
+            "lint_issues": [],
+            "lint_passed": True,
+            "execution_result": {"returncode": 0, "stdout": "ok", "stderr": "", "timed_out": False},
+        },
+    )
+    monkeypatch.setattr(tools_mod, "__file__", str(tmp_path / "agents" / "tools_backtesting.py"))
+
+    import forven.strategies.registry as registry_mod
+
+    registry_mod.reset()
+    monkeypatch.setattr(registry_mod, "reset", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_mod, "discover", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_mod, "_TYPE_MAP", {})
+    monkeypatch.setattr("forven.strategies.intake.register_custom_strategy_file", intake)
+    return tmp_path / "strategies" / "custom" / "sandbox_reg_check.py"
+
+
+def test_register_strategy_sandbox_payload_reports_success(forven_db, monkeypatch, tmp_path):
+    _setup_register_env(monkeypatch, tmp_path, intake=lambda **_kwargs: _sandbox_payload())
+
+    result = _tool_register_strategy(
+        {
+            "code": _SANDBOX_REG_CODE,
+            "type_name": "sandbox_reg_check",
+            "hypothesis_id": "HYP-123",
+        }
+    )
+
+    assert "registered successfully" in result.lower()
+    assert "S02501" in result
+    assert "not found in registry" not in result
+
+
+def test_register_strategy_preserves_namespaced_runtime_type(forven_db, monkeypatch, tmp_path):
+    _insert_strategy("S02501", stage="quick_screen")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET runtime_type = ? WHERE id = ?",
+            ("imported__dropzone_sandbox_reg_check_abc123", "S02501"),
+        )
+    _setup_register_env(monkeypatch, tmp_path, intake=lambda **_kwargs: _sandbox_payload())
+
+    result = _tool_register_strategy(
+        {
+            "code": _SANDBOX_REG_CODE,
+            "type_name": "sandbox_reg_check",
+            "hypothesis_id": "HYP-123",
+        }
+    )
+
+    assert "registered successfully" in result.lower()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT runtime_type FROM strategies WHERE id = ?", ("S02501",)
+        ).fetchone()
+    assert row["runtime_type"] == "imported__dropzone_sandbox_reg_check_abc123"
+
+
+def test_register_strategy_persists_provenance_on_sandbox_success(forven_db, monkeypatch, tmp_path):
+    _insert_strategy("S02501", stage="quick_screen")
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO agent_tasks
+                (agent_id, type, title, description, input_data, display_id, status)
+            VALUES (?, 'develop_candidate', 'Develop candidate', 'Build a candidate strategy', ?, ?, 'running')
+            """,
+            (
+                "strategy-developer",
+                json.dumps(
+                    {
+                        "origin_mode": "crucible_planner",
+                        "action_kind": "develop_candidate",
+                        "crucible_id": "HYP-123",
+                        "hypothesis_id": "HYP-123",
+                    }
+                ),
+                "T0103",
+            ),
+        )
+    _setup_register_env(monkeypatch, tmp_path, intake=lambda **_kwargs: _sandbox_payload())
+
+    tokens = set_tool_context("strategy-developer", "T0103")
+    try:
+        result = _tool_register_strategy(
+            {
+                "code": _SANDBOX_REG_CODE,
+                "type_name": "sandbox_reg_check",
+                "hypothesis_id": "HYP-123",
+            }
+        )
+    finally:
+        reset_tool_context(tokens)
+
+    assert "registered successfully" in result.lower()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT origin_agent_id, origin_task_id FROM strategies WHERE id = ?",
+            ("S02501",),
+        ).fetchone()
+    assert row["origin_agent_id"] == "strategy-developer"
+    assert row["origin_task_id"] == "T0103"
+
+
+def test_register_strategy_end_to_end_through_real_sandbox_intake(forven_db, monkeypatch):
+    """Full tool→intake→DB path with only the worker subprocess mocked.
+
+    Exercises the real _register_custom_strategy_sandboxed flow: parent-side
+    security scan, custom/→imported/ move, container creation, and the tool's
+    payload-based success signaling (the parent _TYPE_MAP never contains
+    sandbox-only types, so the old check misreported every registration).
+    """
+    import glob
+    import os
+
+    type_name = "e2e_sbx_regcheck_p0a"
+    code = f'''
+from forven.strategies.base import BaseStrategy, Signal
+
+TYPE_NAME = "{type_name}"
+
+
+class E2ESbxRegCheck(BaseStrategy):
+    @property
+    def name(self):
+        return "e2e sandbox pipeline check"
+
+    @property
+    def asset(self):
+        return "BTC"
+
+    @property
+    def strategy_type(self):
+        return TYPE_NAME
+
+    @property
+    def default_params(self):
+        return {{"window": 20}}
+
+    def generate_signal(self, df):
+        return Signal()
+
+
+STRATEGY_CLASS = E2ESbxRegCheck
+'''
+
+    monkeypatch.setattr(
+        "forven.selfheal.validate_strategy_code",
+        lambda c: {
+            "valid": True,
+            "code": c,
+            "lint_issues": [],
+            "lint_passed": True,
+            "execution_result": {"returncode": 0, "stdout": "ok", "stderr": "", "timed_out": False},
+        },
+    )
+    worker_meta = {
+        "ok": True,
+        "type_name": type_name,
+        "default_params": {"window": 20},
+        "canonical_params": {"window": 20},
+        "asset": "BTC",
+        "certified": False,
+        "cert_error": None,
+        "lookahead_blocked": False,
+        "lookahead_reason": None,
+    }
+    # Only the out-of-process worker is mocked (subprocess spawn); everything
+    # else — security scan, move, DB registration — runs for real.
+    monkeypatch.setattr(
+        "forven.sandbox.strategy_worker.validate_custom_module_isolated",
+        lambda *a, **k: dict(worker_meta),
+    )
+    monkeypatch.setattr(
+        "forven.strategies.intake.validate_custom_module_isolated",
+        lambda *a, **k: dict(worker_meta),
+        raising=False,
+    )
+
+    from forven.strategies import custom as custom_pkg
+    from forven.strategies import imported as imported_pkg
+
+    custom_dir = os.path.dirname(custom_pkg.__file__)
+    imported_dir = os.path.dirname(imported_pkg.__file__)
+    leftover_patterns = [
+        os.path.join(custom_dir, f"{type_name}.py"),
+        os.path.join(imported_dir, f"dropzone_{type_name}_*.py"),
+    ]
+
+    def _cleanup():
+        for pattern in leftover_patterns:
+            for path in glob.glob(pattern):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO hypotheses "
+            "(id,title,market_thesis,mechanism,target_assets,target_timeframes,lane,"
+            " source_type,status,manager_state,novelty_score,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                "HYP-e2e-p0a",
+                "e2e sandbox pipeline check",
+                "thesis",
+                "mechanism",
+                json.dumps(["BTC"]),
+                json.dumps(["1h"]),
+                "momentum",
+                "agent",
+                "researching",
+                "active",
+                0.5,
+            ),
+        )
+
+    _cleanup()
+    try:
+        result = _tool_register_strategy(
+            {
+                "code": code,
+                "type_name": type_name,
+                "hypothesis_id": "HYP-e2e-p0a",
+            }
+        )
+
+        assert "registered successfully as" in result, result
+        assert "not found in registry" not in result
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, type, runtime_type, sandbox_only FROM strategies WHERE type = ?",
+                (type_name,),
+            ).fetchone()
+        assert row is not None
+        assert row["id"] in result
+        assert row["runtime_type"].startswith("imported__dropzone_")
+        assert row["runtime_type"] != type_name  # the prefix-match clobber trap
+        assert bool(row["sandbox_only"])
+
+        # The module must have moved out of custom/ into the sandboxed
+        # imported/ package.
+        assert not os.path.exists(os.path.join(custom_dir, f"{type_name}.py"))
+        assert glob.glob(os.path.join(imported_dir, f"dropzone_{type_name}_*.py"))
+    finally:
+        _cleanup()
+
+
+def test_register_strategy_failure_removes_dead_custom_file(forven_db, monkeypatch, tmp_path):
+    def _failing_intake(**_kwargs):
+        raise ValueError(
+            "Strategy 'sandbox_reg_check' is already registered as S02400 "
+            "(stage=quick_screen, still active)"
+        )
+
+    custom_file = _setup_register_env(monkeypatch, tmp_path, intake=_failing_intake)
+
+    result = _tool_register_strategy(
+        {
+            "code": _SANDBOX_REG_CODE,
+            "type_name": "sandbox_reg_check",
+            "hypothesis_id": "HYP-123",
+        }
+    )
+
+    assert result.startswith("Error")
+    assert "already registered as S02400" in result
+    assert "File saved but registry reload failed" not in result
+    assert not custom_file.exists()
 

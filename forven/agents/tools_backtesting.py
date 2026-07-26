@@ -547,7 +547,7 @@ def _tool_register_strategy(params: dict) -> str:
     # custom discovery pass. If discovery sees it first, TYPE_NAME is already in
     # the runtime map and targeted DB registration rejects it as a duplicate.
     try:
-        from forven.strategies.registry import reset, discover, _TYPE_MAP
+        from forven.strategies.registry import reset, discover
         from forven.strategies.intake import register_custom_strategy_file
         reset()
 
@@ -560,41 +560,83 @@ def _tool_register_strategy(params: dict) -> str:
             # can't orphan the develop_candidate task from its strategy.
             origin_task_id=provenance.get("origin_task_id"),
         )
-        discover()
-        if type_name not in _TYPE_MAP:
-            return f"Warning: file saved to {filepath} but type '{type_name}' not found in registry. Ensure the module exports TYPE_NAME = '{type_name}' and STRATEGY_CLASS."
+    except Exception as e:
+        # An unregistered module left in custom/ blocks the type_name slot and
+        # makes every auto-intake sweep re-fail on the same dead file.
+        # INVARIANT this cleanup depends on: when intake raises, the module is
+        # back at `filepath` (the sandboxed path restores a moved file on
+        # registration failure) — intake must never raise AFTER the DB row is
+        # committed and the file has landed in imported/, or this delete would
+        # misreport a successful registration as failed.
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except OSError:
+            pass
+        return (
+            f"Error: registration of '{type_name}' failed: {e}. "
+            "The unregistered module file was removed from custom/; fix the code and retry."
+        )
 
-        registered_strategy_id = str(registration.get("strategy_id") or "").strip()
-        current_strategy_id = str(_current_strategy_id_var.get() or "").strip()
-        target_strategy_id = registered_strategy_id or current_strategy_id
+    # Sandbox-only (imported) types are never loaded into this process's
+    # registry, so the intake payload — not a parent _TYPE_MAP lookup — is the
+    # source of truth for success.
+    registered_strategy_id = str(registration.get("strategy_id") or "").strip()
+    registered_runtime_type = str(registration.get("runtime_type") or "").strip()
+    current_strategy_id = str(_current_strategy_id_var.get() or "").strip()
+    target_strategy_id = registered_strategy_id or current_strategy_id
+    caveats: list[str] = []
+    try:
+        discover()
         if target_strategy_id:
-            with get_db() as conn:
-                conn.execute(
-                    """
-                    UPDATE strategies
-                    SET runtime_type = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (type_name, datetime.now(timezone.utc).isoformat(), target_strategy_id),
-                )
+            if registered_runtime_type:
+                # The row already carries the namespaced runtime_type
+                # (imported__dropzone_*); never overwrite it with the bare
+                # type_name or execution paths fall back to prefix-matching
+                # onto prebuilt families.
+                with get_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE strategies
+                        SET runtime_type = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            registered_runtime_type,
+                            datetime.now(timezone.utc).isoformat(),
+                            target_strategy_id,
+                        ),
+                    )
             _persist_strategy_provenance(target_strategy_id, provenance)
             cited_skills = params.get("cited_skills")
             _persist_task_strategy_link(
                 target_strategy_id,
                 cited_skills if isinstance(cited_skills, list) else [],
             )
-        if registered_strategy_id:
-            return (
-                f"Strategy type '{type_name}' registered successfully as "
-                f"{registered_strategy_id} for hypothesis {hypothesis_id}."
-            )
-        return (
+    except Exception as e:
+        caveats.append(f"post-registration bookkeeping failed: {e}")
+
+    certification_error = str(registration.get("certification_error") or "").strip()
+    if certification_error:
+        caveats.append(f"certification: {certification_error}")
+
+    if registered_strategy_id:
+        message = (
+            f"Strategy type '{type_name}' registered successfully as "
+            f"{registered_strategy_id} for hypothesis {hypothesis_id} "
+            f"(stage={registration.get('stage') or 'research_only'}"
+            + (f", runtime_type={registered_runtime_type}" if registered_runtime_type else "")
+            + "). Use run_backtest with this strategy to validate it."
+        )
+    else:
+        message = (
             f"Strategy type '{type_name}' registered successfully for hypothesis {hypothesis_id}, "
             "but no strategy container id was returned."
         )
-    except Exception as e:
-        return f"File saved but registry reload failed: {e}. The strategy may still work on next restart."
+    if caveats:
+        message += " NOTE: " + " | ".join(caveats)
+    return message
 
 
 @register_tool(
